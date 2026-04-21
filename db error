@@ -1,3 +1,34 @@
+#core/database.py
+
+from sqlalchemy.ext.asyncio import create_async_engine,AsyncSession,async_sessionmaker
+from api.core.settings import get_settings
+from sqlmodel import SQLModel
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
+DATABASE_URL = get_settings().database_url
+
+
+engine=create_async_engine(
+    DATABASE_URL,
+    echo=False, #set true only in dev 
+    future=True,
+    pool_pre_ping=True,
+    pool_size=20,
+    max_overflow=30)
+
+AsyncSessionFactory=async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    autoflush=False,
+    autocommit=False,
+    expire_on_commit=False)
+
+async def init_db() -> None:
+    async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+
+
 # envy.py
 
 from logging.config import fileConfig
