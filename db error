@@ -1,5 +1,64 @@
-Traceback (most recent call last):
-  File "/app/.venv/bin/alembic", line 8, in <module>
+# envy.py
+
+from logging.config import fileConfig
+from sys import prefix
+import sys
+from pathlib import Path
+
+from sqlalchemy import create_engine
+from sqlalchemy import engine_from_config,pool
+from alembic import context
+from sqlmodel import SQLModel
+from api.core.settings import get_settings
+# import all your databases here
+from api.home.models import Home,Country,Offices
+
+# project root
+project_root= Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
+
+
+# configure alembic
+config = context.config
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+        
+# get all db url from setting
+settings = get_settings()
+config.set_main_option("sqlalchemy.url", settings.database_url)
+
+
+#set metadata for migration
+target_metadata = SQLModel.metadata
+
+# create db engine
+connectable = create_engine(
+    settings.database_url,
+    poolclass=pool.NullPool,
+    pool_pre_ping=True,
+    echo=False,
+)
+# run migration
+with connectable.connect() as connection:
+    context.configure(
+        connection = connection,
+        target_metadata = target_metadata,
+        compare_type = True,
+        compare_server_default= True,
+        #version_table_schema= target_metadata.schema,
+        render_as_batch= True,
+        
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+
+
+
+
+
+ File "/app/.venv/bin/alembic", line 8, in <module>
     sys.exit(main())
              ^^^^^^
   File "/app/.venv/lib/python3.12/site-packages/alembic/config.py", line 1033, in main
@@ -20,20 +79,52 @@ Traceback (most recent call last):
     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "<frozen importlib._bootstrap_external>", line 999, in exec_module
   File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
-  File "/app/alembic/env.py", line 13, in <module>
-    from api.home.models import Home,Country,Offices,Team
-  File "/app/api/home/models.py", line 31, in <module>
-    class Offices(BaseModel,table=True):
-  File "/app/.venv/lib/python3.12/site-packages/sqlmodel/main.py", line 565, in __new__
-    col = get_column_from_field(v)
-          ^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlmodel/main.py", line 763, in get_column_from_field
-    return Column(sa_type, *args, **kwargs)  # type: ignore
+  File "/app/alembic/env.py", line 41, in <module>
+    with connectable.connect() as connection:
+         ^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 3285, in connect
+    return self._connection_cls(self)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 143, in __init__
+    self._dbapi_connection = engine.raw_connection()
+                             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 3309, in raw_connection
+    return self.pool.connect()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 447, in connect
+    return _ConnectionFairy._checkout(self)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/sql/schema.py", line 2174, in __init__
-    self._extra_kwargs(**dialect_kwargs)
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/sql/schema.py", line 2256, in _extra_kwargs
-    self._validate_dialect_kwargs(kwargs)
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/sql/base.py", line 611, in _validate_dialect_kwargs
-    raise TypeError(
-TypeError: Additional arguments should be named <dialectname>_<argument>, got 'ondelete'
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 1264, in _checkout
+    fairy = _ConnectionRecord.checkout(pool)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 711, in checkout
+    rec = pool._do_get()
+          ^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/impl.py", line 306, in _do_get
+    return self._create_connection()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 388, in _create_connection
+    return _ConnectionRecord(self)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 673, in __init__
+    self.__connect()
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 899, in __connect
+    with util.safe_reraise():
+         ^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/util/langhelpers.py", line 224, in __exit__
+    raise exc_value.with_traceback(exc_tb)
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 895, in __connect
+    self.dbapi_connection = connection = pool._invoke_creator(self)
+                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/engine/create.py", line 661, in connect
+    return dialect.connect(*cargs, **cparams)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/engine/default.py", line 630, in connect
+    return self.loaded_dbapi.connect(*cargs, **cparams)  # type: ignore[no-any-return]  # NOQA: E501
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/dialects/postgresql/asyncpg.py", line 955, in connect
+    await_only(creator_fn(*arg, **kw)),
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/util/_concurrency_py3k.py", line 123, in await_only
+    raise exc.MissingGreenlet(
+sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_only() here. Was IO attempted in an unexpected place? (Background on this error at: https://sqlalche.me/e/20/xd2s)
