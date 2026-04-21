@@ -1,3 +1,72 @@
+#main.py
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from redis.asyncio import Redis
+from api.core.settings import DevSettings, get_settings, Prod
+from contextlib import asynccontextmanager
+from fastapi_mail import FastMail
+#from fastapi_limiter import FastAPILimiter
+from api.core.mail import mail_config
+from typing import cast
+from api.home.routes import router as home_router
+#from src.ecommerce.products.routes import router as products_router
+from api.core.database import AsyncSessionFactory,init_db,engine
+
+
+@asynccontextmanager
+async def lifespan(app:FastAPI):
+    # DATABASE
+    await init_db()
+    app.state.db_sessionmaker = AsyncSessionFactory
+    # REDIS
+    settings=get_settings()
+    app.state.redis = Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=10,
+        retry_on_timeout=True,
+        retry_on_error=True,
+        health_check_interval=30,
+        max_connection=50,
+    )
+    pong = app.state.redis.ping() # text connection
+    if not pong:
+        raise RuntimeError("redis connection failed")
+ 
+    # EMAIL
+  
+    #app.state.mail = FastMail(mail_config)
+    
+    #logger.info("email is active")
+    #logger.info("all service running")
+    # crown db
+   
+    yield
+    
+    # CLOSED IN REVERSE ORDER
+    await app.state.redis.close()
+    await app.state.redis.connection_pool.disconnect()
+    await engine.dispose()
+
+
+app = FastAPI(title="ecommerce",lifespan=lifespan)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+
+
+#routes
+app.include_router(home_router)
+
 #core/database.py
 
 from sqlalchemy.ext.asyncio import create_async_engine,AsyncSession,async_sessionmaker
