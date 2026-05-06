@@ -1,3 +1,47 @@
+[alembic]
+script_location = alembic
+file_template=%%(year)d%%(month).2d%%(day).2dd_%%(hour).2d%%(minute).2d-%%(rev)s_%%(slug)s
+prepend_sys_path = .
+timezone = UTC
+
+compare_type = true
+compare_server_default = true
+render_as_batch = true
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = INFO
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = INFO
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+###
 INFO  [sqlalchemy.engine.Engine] select pg_catalog.version()cript_location
 INFO  [sqlalchemy.engine.Engine] [raw sql] ()cript_location
 INFO  [sqlalchemy.engine.Engine] select current_schema()cript_location
