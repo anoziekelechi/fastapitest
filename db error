@@ -1,56 +1,4 @@
-[alembic]
-script_location = alembic
-#sqlalchemy.url= postgresql+asyncpg://%(POSTGRES_USER)s%(POSTGRES_PASSWORD)s@%(POSTGRES_HOST)s:%(POSTGRES_PORT)s/%(POSTGRES_DB)s
-
-file_template=%%(year)d%%(month).2d%%(day).2dd_%%(hour).2d%%(minute).2d-%%(rev)s_%%(slug)S
-prepend_sys_path = .
-timezone = UTC
-
-compare_type = true
-compare_server_default = true
-render_as_batch = true
-
-[loggers]
-keys = root,sqlalchemy,alembic
-
-[handlers]
-keys = console
-
-[formatters]
-keys = generic
-
-[logger_root]
-level = INFO
-handlers = console
-qualname =
-
-[logger_sqlalchemy]
-level = INFO
-handlers =
-qualname = sqlalchemy.engine
-
-[logger_alembic]
-level = INFO
-handlers =
-qualname = alembic
-
-[handler_console]
-class = StreamHandler
-args = (sys.stderr,)
-level = NOTSET
-formatter = generic
-
-[formatter_generic]
-format = %(levelname)-5.5s [%(name)s] %(message)script_location
-datefmt = %H:%M:%S
-
-
-
-
-
-
-###
-NFO  [sqlalchemy.engine.Engine] select pg_catalog.version()cript_location
+INFO  [sqlalchemy.engine.Engine] select pg_catalog.version()cript_location
 INFO  [sqlalchemy.engine.Engine] [raw sql] ()cript_location
 INFO  [sqlalchemy.engine.Engine] select current_schema()cript_location
 INFO  [sqlalchemy.engine.Engine] [raw sql] ()cript_location
@@ -62,23 +10,18 @@ INFO  [sqlalchemy.engine.Engine] BEGIN (implicit)cript_location
 INFO  [sqlalchemy.engine.Engine] SELECT pg_catalog.pg_class.relname 
 FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace 
 WHERE pg_catalog.pg_class.relname = $1::VARCHAR AND pg_catalog.pg_class.relkind = ANY (ARRAY[$2::VARCHAR, $3::VARCHAR, $4::VARCHAR, $5::VARCHAR, $6::VARCHAR]) AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid) AND pg_catalog.pg_namespace.nspname != $7::VARCHARcript_location
-INFO  [sqlalchemy.engine.Engine] [generated in 0.00016s] ('alembic_version', 'r', 'p', 'f', 'v', 'm', 'pg_catalog')cript_location
+INFO  [sqlalchemy.engine.Engine] [generated in 0.00017s] ('alembic_version', 'r', 'p', 'f', 'v', 'm', 'pg_catalog')cript_location
+INFO  [sqlalchemy.engine.Engine] SELECT alembic_version.version_num 
+FROM alembic_versioncript_location
+INFO  [sqlalchemy.engine.Engine] [generated in 0.00008s] ()cript_location
 INFO  [sqlalchemy.engine.Engine] SELECT pg_catalog.pg_class.relname 
 FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace 
 WHERE pg_catalog.pg_class.relname = $1::VARCHAR AND pg_catalog.pg_class.relkind = ANY (ARRAY[$2::VARCHAR, $3::VARCHAR, $4::VARCHAR, $5::VARCHAR, $6::VARCHAR]) AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid) AND pg_catalog.pg_namespace.nspname != $7::VARCHARcript_location
-INFO  [sqlalchemy.engine.Engine] [cached since 0.03739s ago] ('alembic_version', 'r', 'p', 'f', 'v', 'm', 'pg_catalog')cript_location
-INFO  [sqlalchemy.engine.Engine] 
-CREATE TABLE alembic_version (
-        version_num VARCHAR(32) NOT NULL, 
-        CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
-)
-
-cript_location
-INFO  [sqlalchemy.engine.Engine] [no key 0.00006s] ()cript_location
+INFO  [sqlalchemy.engine.Engine] [cached since 0.03061s ago] ('alembic_version', 'r', 'p', 'f', 'v', 'm', 'pg_catalog')cript_location
 INFO  [sqlalchemy.engine.Engine] SELECT pg_catalog.pg_class.relname 
 FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace 
 WHERE pg_catalog.pg_class.relkind = ANY (ARRAY[$1::VARCHAR, $2::VARCHAR]) AND pg_catalog.pg_class.relpersistence != $3::CHAR AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid) AND pg_catalog.pg_namespace.nspname != $4::VARCHARcript_location
-INFO  [sqlalchemy.engine.Engine] [generated in 0.00017s] ('r', 'p', 't', 'pg_catalog')cript_location
+INFO  [sqlalchemy.engine.Engine] [generated in 0.00009s] ('r', 'p', 't', 'pg_catalog')cript_location
 INFO  [alembic.autogenerate.compare] Detected added table 'countries'cript_location
 INFO  [alembic.autogenerate.compare] Detected added index 'ix_countries_name' on '('name',)'cript_location
 INFO  [alembic.autogenerate.compare] Detected added table 'home'cript_location
