@@ -1,239 +1,41 @@
-# core/settings.py
-from pydantic import SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
-import os
-from typing import Union
-from pathlib import Path
-from sqlmodel import Field
-from enum import StrEnum
-from functools import lru_cache
-
-
-class AppMode(StrEnum):
-    DEVELOPMENT = "development"
-    PRODUCTION = "production"
-    TESTING = "testing"
-
-class BaseAppSettings(BaseSettings):
-    # DTABASE SETTINGS
-    app_mode:AppMode = Field(default=AppMode.DEVELOPMENT, alias="APP_MODE")
-    postgres_user:str =Field(..., alias=" POSTGRES_USER")
-    postgres_password:SecretStr =Field(..., alias="POSTGRES_PASSWORD")
-    postgres_host: str = Field(..., alias="POSTGRES_HOST")
-    postgres_db:str = Field(..., alias=" POSTGRES_DB")
-    postgres_port:int = Field(..., alias="POSTGRES_PORT")
-    # ____ EMAIL SETTINGS ____
-    mail_username:str= Field(..., alias="MAIL_USERNAME")
-    mail_password:SecretStr = Field(...,alias="MAIL_PASSWORD")
-    mail_server:str = Field(..., alias="MAIL_SERVER")
-    mail_from:str = Field(..., alias="MAIL_FROM")
-    mail_port:int = Field(..., alias="MAIL_PORT")
-    #mail_starttls: bool = Field(...,alias="MAIL_STARTTLS")
-   # mail_ssl_tls:bool = Field(..., alias="MAIL_SSL_TLS")
-    #___REDIS ___
-    redis_url : str = Field(..., alias="REDIS_URL")
-    image_dev:str = "development/"
-    image_pro:str = "production/"
-    
-    def is_production(self) -> bool:
-        return self.app_mode == AppMode.PRODUCTION
-    @property
-    def database_url(self) -> str:
-        return f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password.get_secret_value()}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
-        
-    @property
-    def image_prefix(self) -> str:
-         return self.image_pro if self.is_production() else self.image_dev
- # DEV SETTING
-class DevSettings(BaseAppSettings):
-    model_config = SettingsConfigDict(
-    env_file = str(Path(__file__).parent.parent.parent.parent / ".env.development"),
-    env_file_encoding='utf-8',
-    extra="ignore",
-    case_sensitive=False,
-    )
-    
-class Prod(BaseAppSettings):
-    aws_region: str = Field(..., alias="AWS_REGION")
-   
-    model_config = SettingsConfigDict(
-    env_file = None, #None, #lets docker injects
-    env_file_encoding='utf-8',
-    extra="ignore",
-    case_sensitive=False,
-    )
-    
-    
-@lru_cache()
-def get_settings() -> BaseAppSettings:
-#def get_settings() -> Union[DevSettings,Prod]:
-    env = os.getenv("APP_MODE", "development").lower()
-    if env == "development":
-        return  DevSettings()
-    else:
-        return Prod()
-
-#main.py
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from redis.asyncio import Redis
-from api.core.settings import DevSettings, get_settings, Prod
-from contextlib import asynccontextmanager
-from fastapi_mail import FastMail
-#from fastapi_limiter import FastAPILimiter
-from api.core.mail import mail_config
-from typing import cast
-from api.home.routes import router as home_router
-#from src.ecommerce.products.routes import router as products_router
-from api.core.database import AsyncSessionFactory,init_db,engine
-
-
-@asynccontextmanager
-async def lifespan(app:FastAPI):
-    # DATABASE
-    await init_db()
-    app.state.db_sessionmaker = AsyncSessionFactory
-    # REDIS
-    settings=get_settings()
-    app.state.redis = Redis.from_url(
-        settings.redis_url,
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_timeout=10,
-        retry_on_timeout=True,
-        retry_on_error=True,
-        health_check_interval=30,
-        max_connection=50,
-    )
-    pong = app.state.redis.ping() # text connection
-    if not pong:
-        raise RuntimeError("redis connection failed")
- 
-    # EMAIL
-  
-    #app.state.mail = FastMail(mail_config)
-    
-    #logger.info("email is active")
-    #logger.info("all service running")
-    # crown db
-   
-    yield
-    
-    # CLOSED IN REVERSE ORDER
-    await app.state.redis.close()
-    await app.state.redis.connection_pool.disconnect()
-    await engine.dispose()
-
-
-app = FastAPI(title="ecommerce",lifespan=lifespan)
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
+NFO  [sqlalchemy.engine.Engine] select pg_catalog.version()cript_location
+INFO  [sqlalchemy.engine.Engine] [raw sql] ()cript_location
+INFO  [sqlalchemy.engine.Engine] select current_schema()cript_location
+INFO  [sqlalchemy.engine.Engine] [raw sql] ()cript_location
+INFO  [sqlalchemy.engine.Engine] show standard_conforming_stringscript_location
+INFO  [sqlalchemy.engine.Engine] [raw sql] ()cript_location
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.cript_location
+INFO  [alembic.runtime.migration] Will assume transactional DDL.cript_location
+INFO  [sqlalchemy.engine.Engine] BEGIN (implicit)cript_location
+INFO  [sqlalchemy.engine.Engine] SELECT pg_catalog.pg_class.relname 
+FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace 
+WHERE pg_catalog.pg_class.relname = $1::VARCHAR AND pg_catalog.pg_class.relkind = ANY (ARRAY[$2::VARCHAR, $3::VARCHAR, $4::VARCHAR, $5::VARCHAR, $6::VARCHAR]) AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid) AND pg_catalog.pg_namespace.nspname != $7::VARCHARcript_location
+INFO  [sqlalchemy.engine.Engine] [generated in 0.00016s] ('alembic_version', 'r', 'p', 'f', 'v', 'm', 'pg_catalog')cript_location
+INFO  [sqlalchemy.engine.Engine] SELECT pg_catalog.pg_class.relname 
+FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace 
+WHERE pg_catalog.pg_class.relname = $1::VARCHAR AND pg_catalog.pg_class.relkind = ANY (ARRAY[$2::VARCHAR, $3::VARCHAR, $4::VARCHAR, $5::VARCHAR, $6::VARCHAR]) AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid) AND pg_catalog.pg_namespace.nspname != $7::VARCHARcript_location
+INFO  [sqlalchemy.engine.Engine] [cached since 0.03739s ago] ('alembic_version', 'r', 'p', 'f', 'v', 'm', 'pg_catalog')cript_location
+INFO  [sqlalchemy.engine.Engine] 
+CREATE TABLE alembic_version (
+        version_num VARCHAR(32) NOT NULL, 
+        CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
 )
 
-
-
-#routes
-app.include_router(home_router)
-
-#core/database.py
-
-from sqlalchemy.ext.asyncio import create_async_engine,AsyncSession,async_sessionmaker
-from api.core.settings import get_settings
-from sqlmodel import SQLModel
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
-
-DATABASE_URL = get_settings().database_url
-
-
-engine=create_async_engine(
-    DATABASE_URL,
-    echo=False, #set true only in dev 
-    future=True,
-    pool_pre_ping=True,
-    pool_size=20,
-    max_overflow=30)
-
-AsyncSessionFactory=async_sessionmaker(
-    bind=engine,
-    class_=AsyncSession,
-    autoflush=False,
-    autocommit=False,
-    expire_on_commit=False)
-
-async def init_db() -> None:
-    async with engine.begin() as conn:
-            await conn.run_sync(SQLModel.metadata.create_all)
-
-
-# envy.py
-
-from logging.config import fileConfig
-from sys import prefix
-import sys
-from pathlib import Path
-
-from sqlalchemy import create_engine
-from sqlalchemy import engine_from_config,pool
-from alembic import context
-from sqlmodel import SQLModel
-from api.core.settings import get_settings
-# import all your databases here
-from api.home.models import Home,Country,Offices
-
-# project root
-project_root= Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(project_root))
-
-
-# configure alembic
-config = context.config
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
-        
-# get all db url from setting
-settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.database_url)
-
-
-#set metadata for migration
-target_metadata = SQLModel.metadata
-
-# create db engine
-connectable = create_engine(
-    settings.database_url,
-    poolclass=pool.NullPool,
-    pool_pre_ping=True,
-    echo=False,
-)
-# run migration
-with connectable.connect() as connection:
-    context.configure(
-        connection = connection,
-        target_metadata = target_metadata,
-        compare_type = True,
-        compare_server_default= True,
-        #version_table_schema= target_metadata.schema,
-        render_as_batch= True,
-        
-    )
-    with context.begin_transaction():
-        context.run_migrations()
-
-
-
-
-
-
-
- File "/app/.venv/bin/alembic", line 8, in <module>
+cript_location
+INFO  [sqlalchemy.engine.Engine] [no key 0.00006s] ()cript_location
+INFO  [sqlalchemy.engine.Engine] SELECT pg_catalog.pg_class.relname 
+FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace 
+WHERE pg_catalog.pg_class.relkind = ANY (ARRAY[$1::VARCHAR, $2::VARCHAR]) AND pg_catalog.pg_class.relpersistence != $3::CHAR AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid) AND pg_catalog.pg_namespace.nspname != $4::VARCHARcript_location
+INFO  [sqlalchemy.engine.Engine] [generated in 0.00017s] ('r', 'p', 't', 'pg_catalog')cript_location
+INFO  [alembic.autogenerate.compare] Detected added table 'countries'cript_location
+INFO  [alembic.autogenerate.compare] Detected added index 'ix_countries_name' on '('name',)'cript_location
+INFO  [alembic.autogenerate.compare] Detected added table 'home'cript_location
+INFO  [alembic.autogenerate.compare] Detected added index 'ix_home_config_type' on '('config_type',)'cript_location
+INFO  [alembic.autogenerate.compare] Detected added table 'offices'cript_location
+INFO  [alembic.autogenerate.compare] Detected added index 'ix_offices_email' on '('email',)'cript_location
+INFO  [sqlalchemy.engine.Engine] COMMITcript_location
+Traceback (most recent call last):
+  File "/app/.venv/bin/alembic", line 8, in <module>
     sys.exit(main())
              ^^^^^^
   File "/app/.venv/lib/python3.12/site-packages/alembic/config.py", line 1033, in main
@@ -242,64 +44,18 @@ with connectable.connect() as connection:
     self.run_cmd(cfg, options)
   File "/app/.venv/lib/python3.12/site-packages/alembic/config.py", line 957, in run_cmd
     fn(
-  File "/app/.venv/lib/python3.12/site-packages/alembic/command.py", line 309, in revision
-    script_directory.run_env()
-  File "/app/.venv/lib/python3.12/site-packages/alembic/script/base.py", line 545, in run_env
-    util.load_python_file(self.dir, "env.py")
-  File "/app/.venv/lib/python3.12/site-packages/alembic/util/pyfiles.py", line 116, in load_python_file
-    module = load_module_py(module_id, path)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/alembic/util/pyfiles.py", line 136, in load_module_py
-    spec.loader.exec_module(module)  # type: ignore
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "<frozen importlib._bootstrap_external>", line 999, in exec_module
-  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
-  File "/app/alembic/env.py", line 41, in <module>
-    with connectable.connect() as connection:
-         ^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 3285, in connect
-    return self._connection_cls(self)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 143, in __init__
-    self._dbapi_connection = engine.raw_connection()
-                             ^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/engine/base.py", line 3309, in raw_connection
-    return self.pool.connect()
-           ^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 447, in connect
-    return _ConnectionFairy._checkout(self)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 1264, in _checkout
-    fairy = _ConnectionRecord.checkout(pool)
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 711, in checkout
-    rec = pool._do_get()
-          ^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/impl.py", line 306, in _do_get
-    return self._create_connection()
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 388, in _create_connection
-    return _ConnectionRecord(self)
-           ^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 673, in __init__
-    self.__connect()
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 899, in __connect
-    with util.safe_reraise():
-         ^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/util/langhelpers.py", line 224, in __exit__
-    raise exc_value.with_traceback(exc_tb)
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/pool/base.py", line 895, in __connect
-    self.dbapi_connection = connection = pool._invoke_creator(self)
-                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/engine/create.py", line 661, in connect
-    return dialect.connect(*cargs, **cparams)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/engine/default.py", line 630, in connect
-    return self.loaded_dbapi.connect(*cargs, **cparams)  # type: ignore[no-any-return]  # NOQA: E501
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/dialects/postgresql/asyncpg.py", line 955, in connect
-    await_only(creator_fn(*arg, **kw)),
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/util/_concurrency_py3k.py", line 123, in await_only
-    raise exc.MissingGreenlet(
-sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_only() here. Was IO attempted in an unexpected place? (Background on this error at: https://sqlalche.me/e/20/xd2s)
+  File "/app/.venv/lib/python3.12/site-packages/alembic/command.py", line 316, in revision
+    scripts = [script for script in revision_context.generate_scripts()]
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/alembic/autogenerate/api.py", line 650, in generate_scripts
+    yield self._to_script(generated_revision)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/alembic/autogenerate/api.py", line 555, in _to_script
+    return self.script_directory.generate_revision(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/alembic/script/base.py", line 698, in generate_revision
+    path = self._rev_path(version_path, revid, message, create_date)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/.venv/lib/python3.12/site-packages/alembic/script/base.py", line 774, in _rev_path
+    self.file_template
+ValueError: unsupported format character 'S' (0x53) at index 68
