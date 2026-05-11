@@ -1,3 +1,5 @@
+import phonenumbers
+
 field_validator('phone_number')
     @classmethod
     def validate_phone_number(cls, v: str | None) -> str | None:
