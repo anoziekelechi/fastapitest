@@ -21,10 +21,10 @@ class BaseAppSettings(BaseSettings):
     #app_name: str = Field(default="E-COMMERCE API", alias="APP_NAME")
     #debug: bool = Field(default=False,alias="DEBUG") # production mode
      # DTABASE SETTINGS
-    postgres_user:str =Field(..., alias=" POSTGRES_USER")
+    postgres_user:str =Field(..., alias="POSTGRES_USER")
     postgres_password:SecretStr =Field(..., alias="POSTGRES_PASSWORD")
     postgres_host: str = Field(..., alias="POSTGRES_HOST")
-    postgres_db:str = Field(..., alias=" POSTGRES_DB")
+    postgres_db:str = Field(..., alias="POSTGRES_DB")
     postgres_port:int = Field(..., alias="POSTGRES_PORT")
     # ____ EMAIL SETTINGS ____
     mail_username:str= Field(..., alias="MAIL_USERNAME")
@@ -33,19 +33,19 @@ class BaseAppSettings(BaseSettings):
     mail_from:str = Field(..., alias="MAIL_FROM")
     mail_port:int = Field(..., alias="MAIL_PORT")
     # CORS SETTING
-    #cors_origin: list[str] = Field(default=["http://localhost:3000"],alias="CORS_ORIGIN")
+    cors_origin: list[str] = Field(default=["http://localhost:3000"],alias="CORS_ORIGIN")
     #___REDIS ___
     redis_url : str = Field(..., alias="REDIS_URL")
     image_dev_prefix: str = Field(default="development/",alias="IMAGE_DEV_PREFIX")
     image_prod_prefix: str = Field(default="production/", alias="IMAGE_PROD_PREFIX")
     
-    # VALIDATORS CORS
-    # @field_validator("cors_origin", mode="before")
-    # @classmethod
-    # def parse_cors_origins(cls, v):
-    #     if isinstance(v, str):
-    #         return [origin.strip() for origin in v.split(',')]
-    #     return v
+    #VALIDATORS CORS
+    @field_validator("cors_origin", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v):
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(',')]
+        return v
     
     def is_production(self) -> bool:
         return self.app_mode == AppMode.PRODUCTION
