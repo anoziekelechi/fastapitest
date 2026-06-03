@@ -128,3 +128,21 @@ class Team(BaseModel,table=True):
     user: User = Relationship(back_populates="team")
 
     
+#my country model
+
+class Country(BaseModel,table=True):
+    __tablename__ = "countries"  # type: ignore
+    name:str = Field(
+        sa_column=Column(String(30),nullable=False,unique=True, index=True)
+    )
+       
+    currency_code:str = Field(
+        sa_column=Column(String(3),nullable=False),min_length=3, max_length=3,
+    )
+   
+    whatsapp:int| None = Field(default=None, gt=0)
+     # LINK BACK TO offices
+    office: List["Offices"] = Relationship(back_populates="country")
+    
+       # LINK BACK TO USERS
+   users: List["User"] = Relationship(back_populates="country")
