@@ -1,242 +1,223 @@
-import uuid
-from pathlib import Path
-from botocore.exceptions import ClientError
-from api.core.settings import get_settings
-from api.core.cloudflare_r2 import r2_client
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional
+from fastapi import HTTPException, status, UploadFile, Depends
+from sqlmodel import Session, select
+from api.home.schemas import HomeResponse
+from api.home.models import Home
+from api.dependency import get_db
+from api.core.file_storage import handle_file_update, get_public_url,validate_image_file_securely
 
-import magic
-from fastapi import HTTPException, UploadFile, status
-from typing import Set,Optional
+# db: AsyncSession = Depends(get_db),
 
+LOGO_MAX_SIZE = 5 * 1024 * 1024   # 5 MiB
+HERO_MAX_SIZE = 8 * 1024 * 1024   # 8 MiB
 
-ALLOWED_MIME_TYPES: Set[str] = {
-    "image/jpeg",
-    "image/png",
-    "image/svg",
-               
-}
+class HomeImage:
+    LOGO = "logo"
+    BANNER ="banner"
 
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MiB
-
-
-async def validate_image_file_securely(file: UploadFile) -> str:
+async def setup_home_logic(
+    sitename: str,
+    db: AsyncSession = Depends(get_db),
+    aboutus: Optional[str] = None,
+    intro: Optional[str] = None,
+    logo_key: Optional[UploadFile] = None,
+    banner_key: Optional[UploadFile] = None,
+   
+) -> HomeResponse:
     """
-    Validates file type using libmagic (real content, not just extension)
-    Also checks size early.
-    Returns detected mime type on success.
+    Create or update MAIN home configuration
+    Returns response with public image URLs
     """
-    if file.size and file.size > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File too large. Maximum allowed: {MAX_FILE_SIZE // (1024*1024)}MB"
-        )
+    stmt = select(Home).where(Home.config_type == "MAIN")
+    current = (await db.execute(stmt)).scalars().first()
+    #current = db.exec(stmt).first()
 
-    # Read minimal header for type detection
-    header_bytes = await file.read(4096)  # increased to 4KB for better AVIF detection
-    await file.seek(0)  # critical: rewind!
-
-    try:
-        detected = magic.from_buffer(header_bytes, mime=True)
-    except Exception as e:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Could not determine file type: {str(e)}"
-        )
-
-    if detected not in ALLOWED_MIME_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type: {detected} (file: {file.filename})"
-        )
-
-    return detected
-
-
-def generate_image_key(prefix:str, original_name:str | None) -> str:
-    if original_name is None:
-        base_name = "unnamed"
-        extension=".jpeg"
-    else:
-        path =Path(original_name)
-        base_name = path.stem
-        extension = path.suffix.lower() or ".jpg"
-        
-    short_id = uuid.uuid4().hex[:8]
-    if base_name:
-        unique_name=f"{base_name}-{short_id}{extension}"
-    else:
-        unique_name=f"image-{short_id}{extension}"
-    return f"{prefix}/{unique_name}"
-        
-    # path =Path(original_name)
-    # stem = path.stem
-    # ext = path.suffix.lower() or ".jpg"
-    # short_id = uuid.uuid4().hex[:8]
-    # return f"{prefix}/{stem}-{short_id}{ext}"
-
-
-async def upload_to_s3(
-    file,
-    key: str,
-    content_type: str | None = None
-) -> str:
-    """
-    Returns the final S3 key that was used (with prefix)
-    """
-    # Add environment-specific prefix
-    prefixed_key = f"{get_settings().image_prefix}{key}"
-
-    try:
-        s3_client.upload_fileobj(
-            file,
-            get_settings().AWS_BUCKET_NAME,
-            prefixed_key,
-            ExtraArgs={
-                "ContentType": content_type or "image/jpeg",
-                "ACL": "public-read",
-                "CacheControl": "max-age=31536000, public"  # 1 year
-            }
-        )
-        return prefixed_key  # ← return it so you can save correct key in DB
-
-    except ClientError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"S3 upload failed: {e.__class__.__name__}"
-        ) from e
-  
-  
-def delete_from_s3(key: str | None) -> None:
-    """Best-effort delete from S3"""
-    if not key:
-        return
-    try:
-        s3_client.delete_object(Bucket=get_settings().AWS_BUCKET_NAME, Key=key)
-    except Exception:
-        pass  # silent fail - log in production
-
-
-def get_public_url(key: str | None) -> str | None:
-    """
-    Generate permanent public URL.
-    Uses CDN domain if configured, otherwise direct S3 URL.
-    """
-    if not key:
-        return None
-
-    if get_settings().CDN_DOMAIN:
-        return f"https://{get_settings().CDN_DOMAIN}/{key}"
-    
-    # Fallback: direct S3 public URL
-    region = "us-east-1"  # ← take from config if possible
-    bucket=get_settings().AWS_BUCKET_NAME
-    #else
-    return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
-
-
-
-
-
-async def handle_file_update(
-    file: Optional[UploadFile],
-    current_key: Optional[str],
-    prefix: str,                     # e.g. "home/logo", "home/hero"
-    max_size: int,
-    validator=validate_image_file_securely,  # default validator
-) -> Optional[str]:
-    """
-    Handle file upload/update flow:
-    - Validates the file
-    - Uploads to S3 with environment-specific prefix (dev/prod)
-    - Deletes old file if exists
-    - Returns the final stored key (with prefix) or keeps current if no new file
-
-    Returns:
-        str | None: final S3 key to store in database
-    """
-    if not file:
-        # No new file uploaded → keep existing key
-        return current_key
-
-    # 1. Early size validation (cheap check)
-    if file.size and file.size > max_size:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File too large (maximum allowed: {max_size // (1024 * 1024)}MB)"
-        )
-
-    # 2. Secure content-type validation using libmagic
-    await validator(file)
-
-    # 3. Generate base key (without environment prefix yet)
-    base_key = generate_image_key(prefix, file.filename)
-
-    # 4. Add environment-specific prefix (development/ or production/)
-    env_prefix = get_settings().image_prefix   # 'development/' or 'production/'
-    final_key = f"{env_prefix}{base_key}"
-    #development/logo/uuid.jpg
-
-    # 5. Upload to S3 with public-read
-    try:
-        await upload_to_s3(
-            file=file.file,
-            key=final_key,
-            content_type=file.content_type
-        )
-    except HTTPException as exc:
-        # Re-raise the same exception from upload_to_s3
-        raise exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"File upload failed: {exc.__class__.__name__}"
-        ) from exc
-
-    # 6. Best-effort cleanup of previous file
-    delete_from_s3(current_key)
-
-    # 7. Return the final key (with env prefix) to be stored in DB
-    return final_key
-
-
-
-
-#####mime.py
-
-import magic
-from fastapi import HTTPException, UploadFile
-
-ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/svg"}
-
-async def validate_file_securely(file: UploadFile):
-    # Read first 2KB for magic byte detection
-    header = await file.read(2048)
-    await file.seek(0) # Always rewind!
-    
-    detected_mime = magic.from_buffer(header, mime=True)
-    
-    if detected_mime not in ALLOWED_MIME_TYPES:
-        raise HTTPException(
-            status_code=415, 
-            detail=f"File {file.filename} is an invalid type: {detected_mime}"
-        )
-    return detected_mime
-#### cloudflare_r2.py
-
-import boto3
-from botocore.config import Config
-from api.core import settings
-from api.core.settings import get_settings
-
-
-r2_client = boto3.client(
-    service_name="s3",
-    endpoint_url=settings.r2_endpoint_url,
-    aws_access_key_id=settings.R2_ACCESS_KEY_ID,
-    aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
-    config=Config(
-        signature_version="s3v4",
-        retries={"max_attempt": 3},
+    # Handle file updates (with env-specific prefix)
+    new_logo_key = await handle_file_update(
+        file=logo_key,
+        current_key=current.logo_key if current else None,
+        prefix= HomeImage.LOGO,
+        max_size=LOGO_MAX_SIZE,
+        validator=validate_image_file_securely,
     )
+
+    new_banner_key = await handle_file_update(
+        file=banner_key,
+        current_key=current.banner_key if current else None,
+        prefix= HomeImage.BANNER,
+        max_size=HERO_MAX_SIZE,
+        validator=validate_image_file_securely,
+    )
+
+    try:
+        if current is None:
+            # First time creation
+            record = Home(
+                config_type="MAIN",
+                sitename=sitename,
+                aboutus=aboutus,
+                intro=intro,
+                logo_key=new_logo_key,
+                banner_key=new_banner_key,
+            )
+            db.add(record)
+        else:
+            # Partial update
+            current.sitename = sitename
+
+            if aboutus is not None:
+                current.aboutus = aboutus
+            if intro is not None:
+                current.intro = intro
+
+            # Only update file keys if new file was provided
+            if logo_key is not None:
+                current.logo_key = new_logo_key
+            if banner_key is not None:
+                current.banner_key = new_banner_key
+
+            record = current
+
+        db.commit()
+        db.refresh(record)
+
+        return HomeResponse(
+            sitename=record.sitename, # other homeresponse
+            logo_url=get_public_url(record.logo_key),
+            image_url=get_public_url(record.banner_key),
+        )
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save home configuration: {str(e)}"
+        ) from e
+
+
+def get_home_settings_logic(db: AsyncSession = Depends(get_db)) -> HomeResponse:
+    """
+    Fetch the MAIN home configuration with public URLs
+    """
+    stmt = select(Home).where(Home.config_type == "MAIN")
+    home = db.exec(stmt).first()
+
+    if not home:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Home page settings not yet configured"
+        )
+
+    return HomeResponse(
+        sitename=home.sitename,
+        logo_url=get_public_url(home.logo_key),
+        image_url=get_public_url(home.banner_key),
+    )
+
+
+
+
+
+
+
+
+
+#####
+
+#my model
+
+class Home(BaseModel, table=True):
+    __tablename__ = "home" # type: ignore
+    config_type:str = Field(
+        sa_column=Column(String(50),nullable=False,unique=True,index=True),
+        min_length=2,max_length=50
+        )                        
+    sitename: str = Field(
+        sa_column=Column(String(50),nullable=False),min_length=7,max_length=50
+    )
+    intro:  str | None  = Field(default=None,sa_column=Column(Text,nullable=True))
+    aboutus:str | None = Field(default=None,sa_column=Column(Text,nullable=True))
+    mission:str | None  = Field(default=None,sa_column=Column(Text,nullable=True))
+    vision:str | None  = Field(default=None,sa_column=Column(Text,nullable=True))
+    logo_key: str | None = Field(default=None,sa_column=Column(String(255),nullable=True))
     
-)
+    banner_key: str | None = Field(default=None,sa_column=Column(String(255),nullable=True))
+    
+###
+import uuid
+from typing import Annotated
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException
+from sqlmodel import Session, select
+
+router = APIRouter()
+
+@router.post("/home/setup", status_code=201)
+async def setup_home(
+    sitename: Annotated[str, Form()],
+    logo: Annotated[UploadFile, File()],
+    image: Annotated[UploadFile, File()],
+    session: Session = Depends(get_session)
+):
+    # 1. Secure Validation
+    await validate_file_securely(logo)
+    await validate_file_securely(image)
+
+    # 2. Check if the "MAIN" singleton record already exists
+    statement = select(Home).where(Home.config_type == "MAIN")
+    home = session.exec(statement).first()
+    
+    # 3. Prepare unique S3 Keys
+    logo_key = f"home/logo-{uuid.uuid4()}"
+    image_key = f"home/hero-{uuid.uuid4()}"
+
+    try:
+        # 4. Stream uploads to S3 (Efficient for 2025)
+        s3_client.upload_fileobj(logo.file, BUCKET_NAME, logo_key)
+        s3_client.upload_fileobj(image.file, BUCKET_NAME, image_key)
+
+        if not home:
+            # CREATE: New record with the unique config_type
+            home = Home(
+                sitename=sitename, 
+                config_type="MAIN", # Enforces the singleton via DB constraint
+                logo_key=logo_key, 
+                image_key=image_key
+            )
+            session.add(home)
+        else:
+            #delete old images
+            if home.logo_key:
+                s3_client.delete_object(Bucket=BUCKET_NAME, Key=home.logo_key)
+            if home.image_key:
+                s3_client.delete_object(Bucket=BUCKET_NAME, Key=home.image_key)
+            
+            # UPDATE: Replace fields on the existing "MAIN" record
+            home.sitename = sitename
+            home.logo_key = logo_key
+            home.image_key = image_key
+        
+        session.commit()
+        session.refresh(home)
+        return {"message": "Home settings updated", "config_type": home.config_type}
+
+    except Exception as e:
+        session.rollback()
+        # Optionally delete uploaded S3 files here if the DB commit fails
+        raise HTTPException(status_code=500, detail="Failed to save settings")
+    
+    
+@app.get("/home", response_model=HomeResponse)
+def get_home_settings(session: Session = Depends(get_session)):
+    # Always fetch the one marked "MAIN"
+    statement = select(Home).where(Home.config_type == "MAIN")
+    home = session.exec(statement).first()
+    
+    if not home:
+        raise HTTPException(status_code=404, detail="Settings not initialized")
+
+    return HomeResponse(
+        sitename=home.sitename,
+        logo_url=get_s3_url(home.logo_key), # Helper function for presigned URL
+        image_url=get_s3_url(home.image_key)
+    )
