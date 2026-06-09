@@ -221,3 +221,22 @@ async def validate_file_securely(file: UploadFile):
             detail=f"File {file.filename} is an invalid type: {detected_mime}"
         )
     return detected_mime
+#### cloudflare_r2.py
+
+import boto3
+from botocore.config import Config
+from api.core import settings
+from api.core.settings import get_settings
+
+
+r2_client = boto3.client(
+    service_name="s3",
+    endpoint_url=settings.r2_endpoint_url,
+    aws_access_key_id=settings.R2_ACCESS_KEY_ID,
+    aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
+    config=Config(
+        signature_version="s3v4",
+        retries={"max_attempt": 3},
+    )
+    
+)
