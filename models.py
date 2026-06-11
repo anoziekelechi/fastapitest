@@ -1,98 +1,68 @@
-from sqlalchemy import table
+from __future__ import annotations
+from typing import TYPE_CHECKING
+from sqlalchemy import Column, Text, Integer, ForeignKey,String
 from api.core.base import BaseModel
 from sqlmodel import Field,Relationship,UniqueConstraint
-from pydantic import PositiveInt, EmailStr
+from pydantic import  EmailStr
 from pydantic_extra_types.phone_numbers import PhoneNumber
 from typing import List
-from hashlib import md5
 
-
-# base
-
-def utc_now() -> datetime:
-    """Return current UTC datetime (timezone-aware)."""
-    return datetime.now(timezone.utc)
-
-
-def timezone_column(onupdate=None) ->Callable[[],Column]:
-    """
-    Returns a fresh Column object for each model to prevent 
-    'Column already assigned to table' error.
-    """
-    return lambda: Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-        onupdate=onupdate,
-    )
-
-
-class BaseModel(SQLModel):
-    """Abstract base model with timezone-aware timestamps."""
-    
-    __abstract__ = True
-    
-    id: int | None = Field(default=None, primary_key=True)
-    
-    # Created at
-    created_at: datetime = Field(
-        default_factory=utc_now,
-        sa_column=timezone_column(),                    # No onupdate
-    )
-    
-    # Updated at
-    updated_at: datetime = Field(
-        default_factory=utc_now,
-        sa_column=timezone_column(onupdate=func.now()), # With onupdate
-    )
-
-
-
-
-
+if TYPE_CHECKING:
+    from api.models.users import User
 
 
 class Home(BaseModel, table=True):
-    config_type:str = Field(default="MAIN",unique=True,index=True,nullable=False)
-    sitename: str = Field(...,max_length=50)
-    intro:  str  = Field(..., sa_type="TEXT")
-    aboutus:str  = Field(..., sa_type="TEXT")
-    mission:str  = Field(..., sa_type="TEXT")
-    vission:str   = Field(..., sa_type="TEXT")
-    logo_key: str | None = None
-    banner_key: str | None = None
+    __tablename__ = "home" # type: ignore
+    config_type:str = Field(
+        sa_column=Column(String(50),nullable=False,unique=True,index=True),
+        min_length=2,max_length=50
+        )                        
+    sitename: str = Field(
+        sa_column=Column(String(50),nullable=False),min_length=7,max_length=50
+    )
+    intro:  str | None  = Field(default=None,sa_column=Column(Text,nullable=True))
+    aboutus:str | None = Field(default=None,sa_column=Column(Text,nullable=True))
+    mission:str | None  = Field(default=None,sa_column=Column(Text,nullable=True))
+    vision:str | None  = Field(default=None,sa_column=Column(Text,nullable=True))
+    logo_key: str | None = Field(default=None,sa_column=Column(String(255),nullable=True))
+    
+    banner_key: str | None = Field(default=None,sa_column=Column(String(255),nullable=True))
     
     
   
 class Country(BaseModel,table=True):
-    name:str = Field(..., unique=True, index=True, max_length=30)
-    currency_code:str = Field(..., min_length=3, max_length=3)
-    whatsapp: PositiveInt 
+    __tablename__ = "countries"  # type: ignore
+    name:str = Field(
+        sa_column=Column(String(30),nullable=False,unique=True, index=True)
+    )
+       
+    currency_code:str = Field(
+        sa_column=Column(String(3),nullable=False),min_length=3, max_length=3,
+    )
+   
+    whatsapp:int| None = Field(default=None, gt=0)
      # LINK BACK TO offices
-    office: List["Offices"] = Relationship(back_populates="country")
+    office: list["Offices"] = Relationship(back_populates="country") # also use list
+    
+       # LINK BACK TO USERS
+    users: list["User"] = Relationship(back_populates="country")
     
     
     
     
 class Offices(BaseModel,table=True):
+    __tablename__ = "offices"  # type: ignore
     # FK LINKING TO COUNTRY TABLE
-    country_id: int = Field (foreign_key="country.id", sa_column_kwargs={"ondelete":"CASCADE"})
-    address:str = Field(..., sa_type="TEXT")
-    whatsapp:PositiveInt | None = None
-    phone_number:PhoneNumber | None = None #install "pydantic-extra-types[phonenumbers]"
-    email: EmailStr | None = Field(default=None,index=True,unique=True)
+    country_id: int = Field (
+        sa_column=Column(
+            Integer,
+            ForeignKey("countries.id", ondelete="CASCADE"),
+            nullable= False
+        )
+    )
+    address:str | None = Field(default=None,sa_column=Column(Text, nullable=True))
+    whatsapp:int| None = Field(default=None, gt=0)
+    phone_number:str | None = Field(default=None,sa_column=Column(String(20),nullable=True))
+    email: EmailStr | None = Field(default=None,sa_column=Column(String(50),index=True,unique=True))
     # Relationship to access country data directly
     country: Country| None = Relationship(back_populates="country")
-    
-    
-    
-class Team(BaseModel,table=True):
-    surname:str = Field(...,max_length=50)
-    othernames:str = Field(...,max_length=50)
-    position:str = Field(...,max_length=50)
-    email: EmailStr = Field(..., index=True,unique=True)
-    
-    @property
-    def avatar(self,size=128):
-        digest=md5(self.email.lower().encode('utf-8')).hexdigest()
-        return f"https://www.gravatar.com/avatar/{digest}?d=identicon&s=(size)"
