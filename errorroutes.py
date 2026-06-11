@@ -1,5 +1,4 @@
- Traceback (most recent call last):
-backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/clsregistry.py", line 516, in _resolve_name
+ File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/clsregistry.py", line 516, in _resolve_name
 backend-1  |     rval = d[token]
 backend-1  |            ~^^^^^^^
 backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/util/_collections.py", line 345, in __missing__
@@ -8,7 +7,7 @@ backend-1  |                       ^^^^^^^^^^^^^^^^^
 backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/clsregistry.py", line 484, in _access_cls
 backend-1  |     return self.fallback[key]
 backend-1  |            ~~~~~~~~~~~~~^^^^^
-backend-1  | KeyError: "list['Offices']"
+backend-1  | KeyError: 'Country | None'
 backend-1  | 
 backend-1  | The above exception was the direct cause of the following exception:
 backend-1  | 
@@ -135,26 +134,30 @@ backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/mapp
 backend-1  |     prop.init()
 backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/interfaces.py", line 595, in init
 backend-1  |     self.do_init()
-backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/relationships.py", line 1655, in do_init
-backend-1  |     self._setup_entity()
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/relationships.py", line 1660, in do_init
+backend-1  |     self._generate_backref()
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/relationships.py", line 2144, in _generate_backref
+backend-1  |     self._add_reverse_property(self.back_populates)
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/relationships.py", line 1612, in _add_reverse_property
+backend-1  |     other._setup_entity()
 backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/relationships.py", line 1865, in _setup_entity
 backend-1  |     self._clsregistry_resolve_name(argument)(),
 backend-1  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/clsregistry.py", line 520, in _resolve_name
 backend-1  |     self._raise_for_name(name, err)
-backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/clsregistry.py", line 491, in _raise_for_name
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/clsregistry.py", line 501, in _raise_for_name
 backend-1  |     raise exc.InvalidRequestError(
-backend-1  | sqlalchemy.exc.InvalidRequestError: When initializing mapper Mapper[Country(countries)], expression "relationship("list['Offices']")" seems to be using a generic class as the argument to relationship(); please state the generic argument using an annotation, e.g. "office: Mapped[list['Offices']] = relationship()"
+backend-1  | sqlalchemy.exc.InvalidRequestError: When initializing mapper Mapper[Offices(offices)], expression 'Country | None' failed to locate a name ('Country | None'). If this is a class name, consider adding this relationship() to the <class 'api.models.home.Offices'> class after both dependent classes have been defined.
 Gracefully stopping... (press Ctrl+C again to force)
 [+] Stopping 1/1
- ✔ Container ecommerce-backend-1  Stopped                                                    1.1s 
+ ✔ Container ecommerce-backend-1  Stopped                                                    0.9s 
 anoziekelechi@Anozies-MacBook-Pro Ecommerce % docker compose restart backend
 WARN[0000] The "POSTGRES_DB" variable is not set. Defaulting to a blank string. 
 WARN[0000] The "POSTGRES_USER" variable is not set. Defaulting to a blank string. 
 [+] Restarting 1/1
- ✔ Container ecommerce-backend-1  Started                                                                                                               0.3s 
+ ✔ Container ecommerce-backend-1  Started                                                    0.2s 
 anoziekelechi@Anozies-MacBook-Pro Ecommerce % 
-anoziekelechi@Anozies-MacBook-Pro Ecommerce % docker compose up backend              
+anoziekelechi@Anozies-MacBook-Pro Ecommerce % docker compose up backend     
 WARN[0000] The "POSTGRES_DB" variable is not set. Defaulting to a blank string. 
 WARN[0000] The "POSTGRES_USER" variable is not set. Defaulting to a blank string. 
 [+] Running 3/3
@@ -165,7 +168,7 @@ Attaching to backend-1
 Gracefully stopping... (press Ctrl+C again to force)
 [+] Stopping 1/1
  ✔ Container ecommerce-backend-1  Stopped                                                    0.7s 
-anoziekelechi@Anozies-MacBook-Pro Ecommerce % docker compose up backend
+anoziekelechi@Anozies-MacBook-Pro Ecommerce % docker compose up backend     
 WARN[0000] The "POSTGRES_DB" variable is not set. Defaulting to a blank string. 
 WARN[0000] The "POSTGRES_USER" variable is not set. Defaulting to a blank string. 
 [+] Running 3/3
@@ -184,9 +187,7 @@ backend-1  | INFO:api.main:redis connected successfully -><coroutine object Redi
 backend-1  | INFO:api.main:Email service running
 backend-1  | INFO:api.main:All services running
 backend-1  | INFO:     Application startup complete.
-backend-1  | INFO:     192.168.65.1:53162 - "GET /home HTTP/1.1" 307 Temporary Redirect
-backend-1  | INFO:     192.168.65.1:53162 - "GET /home/ HTTP/1.1" 200 OK
-backend-1  | INFO:     192.168.65.1:39638 - "GET /home/home1 HTTP/1.1" 500 Internal Server Error
+backend-1  | INFO:     192.168.65.1:18768 - "GET /home/home1 HTTP/1.1" 500 Internal Server Error
 backend-1  | ERROR:    Exception in ASGI application
 backend-1  | Traceback (most recent call last):
 backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/clsregistry.py", line 516, in _resolve_name
@@ -339,6 +340,3 @@ backend-1  |     self._raise_for_name(name, err)
 backend-1  |   File "/app/.venv/lib/python3.12/site-packages/sqlalchemy/orm/clsregistry.py", line 501, in _raise_for_name
 backend-1  |     raise exc.InvalidRequestError(
 backend-1  | sqlalchemy.exc.InvalidRequestError: When initializing mapper Mapper[Offices(offices)], expression 'Country | None' failed to locate a name ('Country | None'). If this is a class name, consider adding this relationship() to the <class 'api.models.home.Offices'> class after both dependent classes have been defined.
-
-
-v View in Docker Desktop   o View Config   w Enable Watch
