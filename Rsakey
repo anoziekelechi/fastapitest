@@ -1,0 +1,22 @@
+# Generate Private Key (2048-bit)
+openssl genpkey -algorithm RSA -out private_key.pem -pkeyopt rsa_keygen_bits:2048
+
+# Extract Public Key from Private Key
+openssl rsa -pubout -in private_key.pem -out public_key.pem
+
+
+# Add Private Key to .env
+echo 'PRIVATE_KEY="'$(cat private_key.pem | tr -d '\n')'"' >> .env
+
+# Add Public Key to .env
+echo 'PUBLIC_KEY="'$(cat public_key.pem | tr -d '\n')'"' >> .env
+
+echo "✅ JWT RS256 keys successfully added to .env file!"
+
+# check end of ur .env
+tail -n 5 .env
+tail -n 10 .env
+# add to gitignore
+private_key.pem
+public_key.pem
+*.pem
