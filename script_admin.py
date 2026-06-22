@@ -1,8 +1,14 @@
+
 """
-Create the first admin user.
+Create admin users.
 
 Usage:
     docker compose exec backend python scripts/create_admin.py
+
+Rules:
+    - Maximum 2 admin accounts allowed at any time
+    - If 2 admins already exist, creation is blocked
+    - This ensures there is always a backup admin for business continuity
 
 Equivalent to Django's `python manage.py createsuperuser`.
 """
@@ -14,7 +20,7 @@ from pathlib import Path
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 
-from sqlmodel import select
+from sqlmodel import select, func
 
 from api.core.database import AsyncSessionFactory
 from api.core.security import hash_password
@@ -23,9 +29,16 @@ from api.home.models import Country
 from api.users.schemas import validate_password, validate_name
 
 
-# Default country shown when you just hit Enter (seeded via migration)
+# =========================================================================
+# CONFIGURATION
+# =========================================================================
 DEFAULT_COUNTRY_NAME = "Liberia"
+MAX_ADMINS = 2
 
+
+# =========================================================================
+# PROMPTS
+# =========================================================================
 
 def prompt_email() -> str:
     """Prompt for email, validate format."""
@@ -69,7 +82,7 @@ def prompt_name(field_label: str) -> str:
 async def prompt_country_id() -> int:
     """
     Prompt for country by NAME (case-insensitive).
-    Pressing Enter accepts DEFAULT_COUNTRY_NAME if it exists.
+    Pressing Enter accepts DEFAULT_COUNTRY_NAME.
     """
     async with AsyncSessionFactory() as db:
         result = await db.execute(select(Country).order_by(Country.name))
@@ -104,34 +117,82 @@ async def prompt_country_id() -> int:
         return match.id
 
 
+# =========================================================================
+# DATABASE CHECKS
+# =========================================================================
+
+async def get_admin_count(db) -> int:
+    """Return current number of admin accounts."""
+    result = await db.execute(
+        select(func.count(User.id)).where(User.is_admin == True)
+    )
+    return result.scalar() or 0
+
+
+async def get_existing_admins(db) -> list[User]:
+    """Return list of existing admin accounts."""
+    result = await db.execute(
+        select(User)
+        .where(User.is_admin == True)
+        .order_by(User.created_at)
+    )
+    return result.scalars().all()
+
+
 async def email_exists(db, email: str) -> bool:
     """Check if email is already registered."""
     result = await db.execute(select(User).where(User.email == email))
     return result.scalars().first() is not None
 
 
-async def any_admin_exists(db) -> bool:
-    """Check if an admin already exists."""
-    result = await db.execute(select(User).where(User.is_admin == True).limit(1))
-    return result.scalars().first() is not None
-
+# =========================================================================
+# MAIN
+# =========================================================================
 
 async def create_admin() -> None:
-    """Interactive prompt to create the first admin user."""
+    """Interactive prompt to create an admin user."""
     print("=" * 50)
     print("  CREATE ADMIN USER")
     print("=" * 50)
     print()
     
     async with AsyncSessionFactory() as db:
-        if await any_admin_exists(db):
-            print("⚠️  An admin user already exists.")
-            confirm = input("Create another admin anyway? [y/N]: ").strip().lower()
+        
+        # Check current admin count
+        admin_count = await get_admin_count(db)
+        existing_admins = await get_existing_admins(db)
+        
+        # Show existing admins for visibility
+        if existing_admins:
+            print(f"Current admin(s): {admin_count}/{MAX_ADMINS}")
+            for admin in existing_admins:
+                status = "🟢 active" if not admin.disabled else "🔴 disabled"
+                print(f"  - {admin.email} ({status})")
+            print()
+        
+        # Hard block at MAX_ADMINS
+        if admin_count >= MAX_ADMINS:
+            print("=" * 50)
+            print("  ❌ Cannot create admin account at this moment.")
+            print(f"     Maximum of {MAX_ADMINS} admin accounts already exist.")
+            print()
+            print("  To add a new admin you must first:")
+            print("  1. Disable an existing admin via the admin panel")
+            print("  2. Or contact your database administrator")
+            print("=" * 50)
+            sys.exit(1)
+        
+        # Warn if this is the second (last available) slot
+        if admin_count == MAX_ADMINS - 1:
+            print(f"⚠️  This will be admin {MAX_ADMINS}/{MAX_ADMINS} (the last slot).")
+            print("   After this, no more admins can be created until one is removed.\n")
+            confirm = input("Continue? [y/N]: ").strip().lower()
             if confirm != "y":
                 print("Aborted.")
                 return
             print()
         
+        # Collect input
         email = prompt_email()
         
         if await email_exists(db, email):
@@ -143,6 +204,7 @@ async def create_admin() -> None:
         country_id = await prompt_country_id()
         password = prompt_password()
         
+        # Create admin
         admin = User(
             surname=surname,
             othernames=othernames,
@@ -159,11 +221,14 @@ async def create_admin() -> None:
         await db.commit()
         await db.refresh(admin)
         
+        remaining = MAX_ADMINS - (admin_count + 1)
+        
         print()
         print("=" * 50)
         print(f"  ✅ Admin created successfully")
-        print(f"     ID:    {admin.id}")
-        print(f"     Email: {admin.email}")
+        print(f"     ID:        {admin.id}")
+        print(f"     Email:     {admin.email}")
+        print(f"     Slots left: {remaining}/{MAX_ADMINS}")
         print("=" * 50)
 
 
