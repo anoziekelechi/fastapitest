@@ -1,8 +1,6 @@
 
 
 
-### updated latest admin routes,logics,schema 
-
 """Admin schemas."""
 import re
 from datetime import datetime
@@ -120,8 +118,13 @@ class UserAction(BaseModel):
     @classmethod
     def normalize_email(cls, v: str) -> str:
         return v.lower().strip()
+        
+    
+    
+    
 
 
+##logics 
 
 
 """Admin business logic."""
@@ -448,6 +451,8 @@ async def enable_user(
 
 
 
+#routes
+
 """Admin routes - require admin authentication."""
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -612,14 +617,6 @@ async def enable_user_route(
 ) -> dict:
     """Re-enable a disabled user account."""
     return await enable_user(data=data, db=db)
-
-
-
-        
-    
-    
-    
-    
 
 
     
