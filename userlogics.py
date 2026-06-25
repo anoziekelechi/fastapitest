@@ -1,3 +1,10 @@
+Argument of type "int | None" cannot be assigned to parameter "user_id" of type "int" in function "create_access_token"
+  Type "int | None" is not assignable to type "int"
+    "None" is not assignable to "int"PylancereportArgumentType
+(variable) user: User
+
+
+
 """
 User business logic.
 
