@@ -1,7 +1,84 @@
-Argument of type "int | None" cannot be assigned to parameter "user_id" of type "int" in function "create_access_token"
-  Type "int | None" is not assignable to type "int"
-    "None" is not assignable to "int"PylancereportArgumentType
-(variable) user: User
+#route
+@router.put(
+    "/profile/names",
+    response_model=ReadUser,
+    status_code=status.HTTP_200_OK,
+    summary="Update user names",
+    dependencies=[Depends(require_csrf)],   # ✅ CSRF on mutations
+)
+async def update_names(
+    data: UpdateNames,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: ReadUser = Depends(get_authenticated_user),
+) -> ReadUser:
+    """
+    Update surname and/or othernames.
+    
+    - Requires authentication (access_token cookie)
+    - Requires CSRF token in X-CSRF-Token header
+    - At least one field must be provided
+    - Skips fields that match current values
+    """
+    return await update_user_names(
+        data=data,
+        db=db,
+        current_user=current_user,
+    )
+
+#logics
+async def update_user_names(
+    data: UpdateNames,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> ReadUser:
+    """
+    Update authenticated user's surname and/or othernames.
+    
+    - At least one field must be provided
+    - Only updates fields that differ from current values
+    - Requires authentication (enforced at route level)
+    """
+    if data.surname is None and data.othernames is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field (surname or othernames) must be provided"
+        )
+    
+    user = await get_user_by_id(db, current_user.id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    updated_fields = []
+    
+    if data.surname is not None:
+        if data.surname == user.surname:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New surname is the same as current surname"
+            )
+        user.surname = data.surname
+        updated_fields.append("surname")
+    
+    if data.othernames is not None:
+        if data.othernames == user.othernames:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New othernames is the same as current othernames"
+            )
+        user.othernames = data.othernames
+        updated_fields.append("othernames")
+    
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    
+    logger.info(f"User {current_user.id} updated: {', '.join(updated_fields)}")
+    
+    return ReadUser.model_validate(user)
+
 
 
 
