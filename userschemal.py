@@ -1,60 +1,56 @@
-#api/uswes/schema.py 
 
-async def reset_password(
-    data: ResetPassword,
-    db: AsyncSession,
-    redis: Redis,
-    current_user: ReadUser | None = None,
-) -> dict:
-
-# Invalidate ALL existing refresh tokens for this user
-    # Forces re-login on all devices (security best practice after password reset)
-    existing_tokens = await redis.smembers(f"user_refresh:{user_id}")
-    if existing_tokens:
-        for token in existing_tokens:
-            try:
-                # Decode each token to get its jti for blacklisting
-                import jwt as pyjwt
-                payload = pyjwt.decode(
-                    token,
-                    settings.public_key,
-                    algorithms=[settings.algorithm],
-                    options={"verify_exp": False},  # May already be expired
-                )
-                jti = payload.get("jti")
-                if jti:
-                    await redis.set(
-                        f"blacklist:refresh:{jti}",
-                        "1",
-                        ex=int(
-                            timedelta(
-                                days=settings.refresh_token_expire_days
-                            ).total_seconds()
-                        )
-                    )
-            except Exception:
-                continue  # Skip malformed tokens
+// Ecommerce/ecommerce.code-workspace
+{
+    "folders": [
+        {
+            "name": "Backend",
+            "path": "backend"
+        },
+        {
+            "name": "Frontend",
+            "path": "frontend"
+        }
+    ],
+    "settings": {
+        // Python interpreter
+        "python.defaultInterpreterPath": "${workspaceFolder:Backend}/.venv/bin/python",
         
-        # Delete the entire active tokens set
-        await redis.delete(f"user_refresh:{user_id}")
-    
-    logger.info(
-        f"Password reset successful for user_id={user_id}. "
-        f"All refresh tokens invalidated."
-    )
-    
-    return {
-        "message": "Password reset successful. "
-                   "Please login with your new password."
-                }
+        // Tell Pylance where source code lives
+        "python.analysis.extraPaths": [
+            "${workspaceFolder:Backend}"
+        ],
+        
+        // Type checking level
+        "python.analysis.typeCheckingMode": "basic",
+        "python.analysis.useLibraryCodeForTypes": true,
+        "python.analysis.autoSearchPaths": true,
+        
+        // Auto format on save (optional but recommended)
+        "editor.formatOnSave": true,
+        "[python]": {
+            "editor.defaultFormatter": "ms-python.black-formatter",
+            "editor.formatOnSave": true
+        },
+        
+        // Terminal opens in backend by default
+        "terminal.integrated.cwd": "${workspaceFolder:Backend}"
+    }
+}
 
 
- 
 
 
-    
-"Set[Unknown]" is not awaitable
-  "Set[Unknown]" is incompatible with protocol "Awaitable[_T_co@Awaitable]"
-    "__await__" is not presentPylancereportGeneralTypeIssues
-(parameter) redis: Redis
-redis: Redis client
+
+1. Create ecommerce.code-workspace in Ecommerce/ root
+
+2. Open it:
+   File → Open Workspace from File → ecommerce.code-workspace
+
+3. Select Python interpreter (one time only):
+   Ctrl+Shift+P → "Python: Select Interpreter"
+   → Choose: ./backend/.venv/bin/python
+
+4. Reload Pylance:
+   Ctrl+Shift+P → "Pylance: Restart Language Server"
+
+5. Done! ✅ Pylance errors should be gone
