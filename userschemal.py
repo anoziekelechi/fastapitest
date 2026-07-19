@@ -1,4 +1,6 @@
 
+failed to read /Users/anoziekelechi/Ecommerce/.env.development: line 1: unexpected character "/" in variable name "//frontend "
+
 // Ecommerce/ecommerce.code-workspace
 {
     "folders": [
