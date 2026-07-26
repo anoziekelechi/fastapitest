@@ -1,4 +1,20 @@
 
+from typing import Annotated 
+from typing import TypeAlias
+from fastapi import Depends, Request, HTTPException
+from redis.asyncio import Redis
+
+
+async def get_redis(request: Request) ->Redis:
+    if not hasattr(request.app.state, "redis") or request.app.state.redis is None:
+        raise HTTPException(status_code=503, detail="Redis service not available")
+    return request.app.state.redis
+
+RedisDep: TypeAlias =Annotated[Redis, Depends(get_redis)]
+
+
+
+
 #api/users/logics.py
 
 """
