@@ -1,35 +1,6 @@
-import boto3
-from botocore.config import Config
-from api.core import settings
-from api.core.settings import get_settings
-
-settings = get_settings()
-
-get_r2_client = boto3.client(
-    service_name="s3",
-    endpoint_url=settings.r2_endpoint_url,
-    aws_access_key_id=settings.r2_access_key_id,
-    aws_secret_access_key=settings.r2_secret_access_key,
-    config=Config(
-        signature_version="s3v4",
-        retries={"max_attempts": 3, "mode": "standard"},
-        connect_timeout=10,
-        read_timeout=30,
-    )
-    
-)
-
-r2_client= get_r2_client() 
-
-
-
-
-
-
-
-
-
-
+INFO:     Will watch for changes in these directories: ['/app']
+backend-1  | INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+backend-1  | INFO:     Started reloader process [1] using WatchFiles
 backend-1  | Process SpawnProcess-1:
 backend-1  | Traceback (most recent call last):
 backend-1  |   File "/usr/local/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
@@ -55,6 +26,8 @@ backend-1  |     config.load()
 backend-1  |   File "/app/.venv/lib/python3.12/site-packages/uvicorn/config.py", line 439, in load
 backend-1  |     self.loaded_app = import_from_string(self.app)
 backend-1  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/uvicorn/importer.py", line 22, in import_from_string
+backend-1  |     raise exc from None
 backend-1  |   File "/app/.venv/lib/python3.12/site-packages/uvicorn/importer.py", line 19, in import_from_string
 backend-1  |     module = importlib.import_module(module_str)
 backend-1  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -69,13 +42,9 @@ backend-1  |   File "<frozen importlib._bootstrap_external>", line 999, in exec_
 backend-1  |   File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
 backend-1  |   File "/app/api/main.py", line 9, in <module>
 backend-1  |     from api.home.routes import router as home_router
-backend-1  |   File "/app/api/home/routes.py", line 7, in <module>
-backend-1  |     from api.home.logics import setup_home_logic, get_home_settings_logic
-backend-1  |   File "/app/api/home/logics.py", line 8, in <module>
-backend-1  |     from api.core.file_storage import (
-backend-1  |   File "/app/api/core/file_storage.py", line 6, in <module>
-backend-1  |     from api.core.cloudflare_r2 import r2_client
-backend-1  |   File "/app/api/core/cloudflare_r2.py", line 22, in <module>
-backend-1  |     r2_client= get_r2_client()
-backend-1  |              ^^^^^^^^^^^^^^^
-backend-1  | TypeError: 'S3' object is not callable
+backend-1  |   File "/app/api/home/routes.py", line 15, in <module>
+backend-1  |     from api.users.logics import get_current_user, require_admin
+backend-1  |   File "/app/api/users/logics.py", line 19, in <module>
+backend-1  |     from fast_mail import FastMail
+backend-1  | ModuleNotFoundError: No module named 'fast_mail'
+
