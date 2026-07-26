@@ -1,0 +1,81 @@
+import boto3
+from botocore.config import Config
+from api.core import settings
+from api.core.settings import get_settings
+
+settings = get_settings()
+
+get_r2_client = boto3.client(
+    service_name="s3",
+    endpoint_url=settings.r2_endpoint_url,
+    aws_access_key_id=settings.r2_access_key_id,
+    aws_secret_access_key=settings.r2_secret_access_key,
+    config=Config(
+        signature_version="s3v4",
+        retries={"max_attempts": 3, "mode": "standard"},
+        connect_timeout=10,
+        read_timeout=30,
+    )
+    
+)
+
+r2_client= get_r2_client() 
+
+
+
+
+
+
+
+
+
+
+backend-1  | Process SpawnProcess-1:
+backend-1  | Traceback (most recent call last):
+backend-1  |   File "/usr/local/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+backend-1  |     self.run()
+backend-1  |   File "/usr/local/lib/python3.12/multiprocessing/process.py", line 108, in run
+backend-1  |     self._target(*self._args, **self._kwargs)
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/uvicorn/_subprocess.py", line 80, in subprocess_started
+backend-1  |     target(sockets=sockets)
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 67, in run
+backend-1  |     return asyncio_run(self.serve(sockets=sockets), loop_factory=self.config.get_loop_factory())
+backend-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend-1  |   File "/usr/local/lib/python3.12/asyncio/runners.py", line 195, in run
+backend-1  |     return runner.run(main)
+backend-1  |            ^^^^^^^^^^^^^^^^
+backend-1  |   File "/usr/local/lib/python3.12/asyncio/runners.py", line 118, in run
+backend-1  |     return self._loop.run_until_complete(task)
+backend-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend-1  |   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 71, in serve
+backend-1  |     await self._serve(sockets)
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/uvicorn/server.py", line 78, in _serve
+backend-1  |     config.load()
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/uvicorn/config.py", line 439, in load
+backend-1  |     self.loaded_app = import_from_string(self.app)
+backend-1  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend-1  |   File "/app/.venv/lib/python3.12/site-packages/uvicorn/importer.py", line 19, in import_from_string
+backend-1  |     module = importlib.import_module(module_str)
+backend-1  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend-1  |   File "/usr/local/lib/python3.12/importlib/__init__.py", line 90, in import_module
+backend-1  |     return _bootstrap._gcd_import(name[level:], package, level)
+backend-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend-1  |   File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+backend-1  |   File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+backend-1  |   File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
+backend-1  |   File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
+backend-1  |   File "<frozen importlib._bootstrap_external>", line 999, in exec_module
+backend-1  |   File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+backend-1  |   File "/app/api/main.py", line 9, in <module>
+backend-1  |     from api.home.routes import router as home_router
+backend-1  |   File "/app/api/home/routes.py", line 7, in <module>
+backend-1  |     from api.home.logics import setup_home_logic, get_home_settings_logic
+backend-1  |   File "/app/api/home/logics.py", line 8, in <module>
+backend-1  |     from api.core.file_storage import (
+backend-1  |   File "/app/api/core/file_storage.py", line 6, in <module>
+backend-1  |     from api.core.cloudflare_r2 import r2_client
+backend-1  |   File "/app/api/core/cloudflare_r2.py", line 22, in <module>
+backend-1  |     r2_client= get_r2_client()
+backend-1  |              ^^^^^^^^^^^^^^^
+backend-1  | TypeError: 'S3' object is not callable
