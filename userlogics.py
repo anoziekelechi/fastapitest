@@ -1,3 +1,27 @@
+    try:
+        app.state.redis = Redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=10,
+            retry_on_timeout=True,
+            retry_on_error=True,
+            health_check_interval=30,
+            max_connections=50,
+        )
+        # Test connection
+        pong =  app.state.redis.ping() # text connection
+        if not pong:
+             raise RuntimeError("redis connection failed")
+        logger.info(f"redis connected successfully ->{pong}")
+    except Exception as e:
+        logger.error(f"redis connection fail: {e}")
+        raise RuntimeError("redis connection failed")
+
+
+
+
+
 
 from typing import Annotated 
 from typing import TypeAlias
