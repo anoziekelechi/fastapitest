@@ -1,37 +1,44 @@
+# """
+# Security utilities.
 
-"""
-Security utilities.
+# Token Strategy:
+# - Access token:  HttpOnly cookie (JS cannot read)
+# - Refresh token: HttpOnly cookie (JS cannot read)
+# - CSRF token:    Regular cookie (JS CAN read - needed to send in header)
 
-Token Strategy:
-- Access token:  HttpOnly cookie (JS cannot read)
-- Refresh token: HttpOnly cookie (JS cannot read)
-- CSRF token:    Regular cookie (JS CAN read - needed to send in header)
+# Why CSRF token?
+# - HttpOnly cookies are sent automatically by browser
+# - Attacker can trick browser into sending cookies (CSRF attack)
+# - CSRF token in header proves the request came from YOUR frontend
+# - Because HttpOnly cookies are unreadable by JS, attacker
+#   cannot get the CSRF token to include in their forged request
+# """
 
-Why CSRF token?
-- HttpOnly cookies are sent automatically by browser
-- Attacker can trick browser into sending cookies (CSRF attack)
-- CSRF token in header proves the request came from YOUR frontend
-- Because HttpOnly cookies are unreadable by JS, attacker
-  cannot get the CSRF token to include in their forged request
-"""
+# api/core/auth.py
 import json
 import secrets
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
-
+from redis.asyncio import Redis
+from fastapi_mail import FastMail
+from api.models.users import User
+from api.users.logics import get_authenticated_user
 import jwt
-from passlib.context import CryptContext
+from passlib.context import CryptContext 
 from fastapi import HTTPException, Request, status, Response, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from api.core.settings import get_settings
 from api.core.redis import RedisDep
+from api.core.mail import MailDep
 from api.users.schemas import (
     TokenPayload,
     RefreshTokenPayload,
+    TokenData,
     TokenResponse,
     CSRFData,
+    ReadUser,
 )
 
 
@@ -44,6 +51,21 @@ settings = get_settings()
 # ✅ Removed: oauth2_scheme - not needed with HttpOnly cookies!
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+
+
+# PASSWORD UTILITIES
+# =============================================================================
+
+def hash_password(password: str) -> str:
+    """Hash a plain text password using bcrypt."""
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify plain password against bcrypt hash."""
+    return pwd_context.verify(plain_password, hashed_password)
 
 
 # =============================================================================
@@ -121,23 +143,30 @@ def clear_auth_cookies(response: Response) -> None:
     response.delete_cookie(CSRF_TOKEN_COOKIE)
 
 
-# =============================================================================
-# PASSWORD UTILITIES
-# =============================================================================
-
-def hash_password(password: str) -> str:
-    """Hash a plain text password using bcrypt."""
-    return pwd_context.hash(password)
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify plain password against bcrypt hash."""
-    return pwd_context.verify(plain_password, hashed_password)
-
 
 # =============================================================================
 # TOKEN CREATION
 # =============================================================================
+async def create_token_response(
+    user_id: int,
+    redis: Redis,
+) -> TokenData:                    # ← Returns TokenData, not TokenResponse
+    access_token = create_access_token(user_id)
+    refresh_token = await create_refresh_token(user_id, redis)
+    csrf_token = await generate_csrf_token(user_id, redis)
+    
+    return TokenData(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        csrf_token=csrf_token,
+    )
+ 
+
+
+
+
+
+
 
 def create_access_token(user_id: int) -> str:
     """
@@ -169,7 +198,8 @@ def create_access_token(user_id: int) -> str:
 
 async def create_refresh_token(
     user_id: int,
-    redis: RedisDep,
+    redis: Redis,
+    #mail: FastMail
 ) -> str:
     """
     Create signed JWT refresh token and store in Redis.
@@ -211,29 +241,7 @@ async def create_refresh_token(
     return token
 
 
-async def create_token_response(
-    user_id: int,
-    redis: RedisDep,
-) -> TokenResponse:
-    """
-    Create all tokens for login response.
-    
-    Args:
-        user_id: User's database ID
-        redis: Redis client
-        
-    Returns:
-        TokenResponse: All tokens
-    """
-    access_token = create_access_token(user_id)
-    refresh_token = await create_refresh_token(user_id, redis)
-    csrf_token = await generate_csrf_token(user_id, redis)
-    
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        csrf_token=csrf_token,
-    )
+
 
 
 # =============================================================================
@@ -265,26 +273,6 @@ async def get_access_token_from_cookie(request: Request) -> str:
     return token
 
 
-async def get_refresh_token_from_cookie(request: Request) -> str:
-    """
-    Extract refresh token from HttpOnly cookie.
-    
-    Args:
-        request: FastAPI request
-        
-    Returns:
-        str: JWT refresh token
-        
-    Raises:
-        HTTPException: If cookie missing
-    """
-    token = request.cookies.get(REFRESH_TOKEN_COOKIE)
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token missing",
-        )
-    return token
 
 
 # =============================================================================
@@ -327,7 +315,7 @@ def decode_access_token(token: str) -> TokenPayload:
 
 async def validate_refresh_token(
     refresh_token: str,
-    redis: RedisDep,
+    redis: Redis,
 ) -> int:
     """
     Validate refresh token with replay protection.
@@ -414,7 +402,7 @@ async def validate_refresh_token(
 
 async def revoke_refresh_token(
     refresh_token: str,
-    redis: RedisDep,
+    redis: Redis,
 ) -> None:
     """Revoke a single refresh token."""
     try:
@@ -438,7 +426,7 @@ async def revoke_refresh_token(
 
 async def revoke_all_user_tokens(
     user_id: int,
-    redis: RedisDep,
+    redis: Redis,
 ) -> None:
     """Revoke ALL refresh tokens for user (logout everywhere)."""
     redis_key = f"user_refresh:{user_id}"
@@ -469,7 +457,7 @@ async def revoke_all_user_tokens(
 
 async def generate_csrf_token(
     user_id: int,
-    redis: RedisDep,
+    redis: Redis,
 ) -> str:
     """Generate and store CSRF token in Redis."""
     csrf_token = secrets.token_urlsafe(32)
@@ -494,9 +482,10 @@ async def generate_csrf_token(
 
 
 async def verify_csrf_token(
+    redis: Redis,
     user_id: int,
     csrf_token: str,
-    redis: RedisDep,
+    #redis: RedisDep,
 ) -> bool:
     """Verify CSRF token against Redis."""
     key = f"csrf:{user_id}:{csrf_token}"
@@ -523,7 +512,7 @@ async def verify_csrf_token(
 
 async def csrf_protection(
     request: Request,
-    redis: RedisDep,
+    redis: Redis,
     user_id: int,
 ) -> None:
     """
@@ -548,36 +537,23 @@ async def csrf_protection(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid or expired CSRF token"
         )
+        
 
-
-# =============================================================================
-# DEPENDENCIES
-# =============================================================================
-
-async def get_current_user_id(
-    token: str = Depends(get_access_token_from_cookie),
-) -> int:
+async def require_csrf(
+    request: Request,
+    redis: Redis,
+    current_user: ReadUser = Depends(get_authenticated_user),
+) -> None:
     """
-    Dependency: Get current authenticated user ID.
+    Dependency: Require valid CSRF token.
     
     Usage:
-        @router.get("/profile")
-        async def profile(user_id: int = Depends(get_current_user_id)):
+        @router.post("/sensitive")
+        async def sensitive(_: None = Depends(require_csrf)):
             ...
     """
-    payload = decode_access_token(token)
-    return payload.sub
-
-
-async def get_user_by_id(db: AsyncSession, user_id: int):
-    """Fetch user by ID."""
-    from api.users.models import User
-    result = await db.execute(select(User).where(User.id == user_id))
-    return result.scalars().first()
-
-
-async def get_user_by_email(db: AsyncSession, email: str):
-    """Fetch user by email."""
-    from api.users.models import User
-    result = await db.execute(select(User).where(User.email == email))
-    return result.scalars().first()
+    await csrf_protection(
+        request=request,
+        redis=redis,
+        user_id=current_user.id,
+    )
