@@ -1,149 +1,33 @@
-7"""Email sending utilities with retry logic."""
-import logging
-import smtplib
-import socket
-
-from fastapi_mail import FastMail, MessageSchema, MessageType
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
-
-logger = logging.getLogger(__name__)
-
-
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=2, min=2, max=30),
-    retry=retry_if_exception_type((
-        ConnectionError,
-        TimeoutError,
-        socket.timeout,
-        smtplib.SMTPConnectError,
-        smtplib.SMTPServerDisconnected,
-        smtplib.SMTPException,
-        # ✅ NOT SMTPAuthenticationError - retrying bad credentials is pointless
-    )),
-    before_sleep=lambda rs: logger.warning(
-        f"Email send failed (attempt {rs.attempt_number}). "
-        f"Retrying in {rs.next_action.sleep:.1f}s..."
-    ),
-    reraise=True,
-)
-async def send_email(
-    recipient: str,
-    subject: str,
-    body: str,
-    mailer: FastMail,
-) -> None:
+async def get_home_settings_logic(db: AsyncSession) -> ReadHome:
     """
-    Send email with automatic retry on transient failures.
-    
-    Args:
-        recipient: Recipient email address
-        subject: Email subject
-        body: Email body (plain text)
-        mailer: FastMail instance (from app.state)
-        
-    Raises:
-        Exception: After all retries exhausted (caller should log/handle)
+    Fetch the MAIN home configuration with public URLs
     """
-    message = MessageSchema(
-        subject=subject,
-        recipients=[recipient],
-        body=body,
-        subtype=MessageType.plain,
-    )
-    
-    try:
-        await mailer.send_message(message)
-        logger.info(f"Email sent successfully to {recipient}")
-    except Exception:
-        logger.error(f"Failed to send email to {recipient} after all retries")
-        raise
+    stmt = select(Home).where(Home.config_type == "MAIN")
+    home = (await db.execute(stmt)).scalars().first()
+   
 
-
-async def send_otp(
-    email: str,
-    otp: str,
-    subject: str,
-    otp_type: str,
-    mailer: FastMail,
-) -> None:
-    """
-    Send OTP email - wraps send_email with OTP-specific formatting.
-    
-    Args:
-        email: Recipient email
-        otp: 6-digit OTP code
-        subject: Email subject
-        otp_type: Type of OTP ("registration" or "login")
-        mailer: FastMail instance
-    """
-    body = (
-        f"Your {otp_type} OTP is: {otp}\n\n"
-        f"This code expires in 10 minutes.\n"
-        f"If you didn't request this, please ignore this email."
-    )
-    
-    try:
-        await send_email(
-            recipient=email,
-            subject=subject,
-            body=body,
-            mailer=mailer,
-        )
-    except Exception as exc:
-        # ✅ This is the key part the original advice was likely about:
-        # Don't let a failed background email vanish silently.
-        # Log loudly so ops/alerts can catch it.
-        logger.critical(
-            f"CRITICAL: OTP email to {email} failed after all retries. "
-            f"User cannot complete {otp_type}. Error: {exc}"
+    if not home:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Home page settings not yet configured"
         )
 
-
-
-#end
-try:
-        app.state.redis = Redis.from_url(
-            settings.redis_url,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=10,
-            retry_on_timeout=True,
-            retry_on_error=True,
-            health_check_interval=30,
-            max_connections=50,
-        )
-        # Test connection
-        pong =  app.state.redis.ping() # text connection
-        if not pong:
-             raise RuntimeError("redis connection failed")
-        logger.info(f"redis connected successfully ->{pong}")
-    except Exception as e:
-        logger.error(f"redis connection fail: {e}")
-        raise RuntimeError("redis connection failed")
+    return ReadHome(
+        id=home.id,
+        sitename=home.sitename, 
+        intro=home.intro,
+        aboutus=home.aboutus,
+        mission=home.mission,
+        vision=home.vision,
+        logo_key=get_public_url(home.logo_key),
+        banner_key=get_public_url(home.banner_key),
+    )  
+    
+    
+         
 
 
 
-
-
-
-from typing import Annotated 
-from typing import TypeAlias
-from fastapi import Depends, Request, HTTPException
-from redis.asyncio import Redis
-
-
-async def get_redis(request: Request) ->Redis:
-    if not hasattr(request.app.state, "redis") or request.app.state.redis is None:
-        raise HTTPException(status_code=503, detail="Redis service not available")
-    return request.app.state.redis
-
-RedisDep: TypeAlias =Annotated[Redis, Depends(get_redis)]
 
 
 
