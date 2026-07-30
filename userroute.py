@@ -1,4 +1,40 @@
- File "/app/api/main.py", line 10, in <module>
+
+
+@router.post(
+    "/register",
+    status_code=status.HTTP_201_CREATED,
+    summary="Register new user account",
+    response_description="OTP sent to email",
+)
+async def register(
+    data: CreateUser,
+    redis: RedisDep,
+    mailer: MailDep,
+    background_tasks: BackgroundTasks,   # ✅ No Depends() needed
+    db: AsyncSession = Depends(get_db),
+    current_user:ReadUser | None = Depends(get_optional_user),
+) -> dict:
+    """
+    Step 1: Register a new user.
+    
+    - Validates email uniqueness
+    - Validates country exists
+    - Creates unverified account
+    - Sends OTP to email
+    
+    Returns registration token for OTP verification step.
+    """
+    return await register_user(
+        data=data,
+        db=db,
+        redis=redis,
+        mailer=mailer,
+        background_tasks=background_tasks,
+        current_user=current_user
+    )
+
+#route
+File "/app/api/main.py", line 10, in <module>
 backend-1  |     from api.users.routes import router as user_router
 backend-1  |   File "/app/api/users/routes.py", line 93, in <module>
 backend-1  |     @router.post(
