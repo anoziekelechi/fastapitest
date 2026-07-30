@@ -1,39 +1,3 @@
-async def get_home_settings_logic(db: AsyncSession) -> ReadHome:
-    """
-    Fetch the MAIN home configuration with public URLs
-    """
-    stmt = select(Home).where(Home.config_type == "MAIN")
-    home = (await db.execute(stmt)).scalars().first()
-   
-
-    if not home:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Home page settings not yet configured"
-        )
-
-    return ReadHome(
-        id=home.id,
-        sitename=home.sitename, 
-        intro=home.intro,
-        aboutus=home.aboutus,
-        mission=home.mission,
-        vision=home.vision,
-        logo_key=get_public_url(home.logo_key),
-        banner_key=get_public_url(home.banner_key),
-    )  
-    
-    
-         
-
-
-
-
-
-
-
-#api/users/logics.py
-
 """
 User business logic.
 
@@ -44,6 +8,7 @@ Flow:
 """
 import secrets
 import logging
+from typing import Any
 from datetime import datetime, timedelta, timezone
 
 import jwt
@@ -924,6 +889,7 @@ async def reset_password(
     redis: Redis,
     current_user: ReadUser | None = None,
 ) -> dict:
+    r: Any = redis
     """
     Step 2: Verify OTP and set new password.
 
@@ -1014,7 +980,7 @@ async def reset_password(
     
     # Invalidate ALL existing refresh tokens for this user
     # Forces re-login on all devices (security best practice after password reset)
-    existing_tokens:set[str] = await redis.smembers(f"user_refresh:{user_id}")
+    existing_tokens:set[str] = await r.smembers(f"user_refresh:{user_id}")
     if existing_tokens:
         for token in existing_tokens:
             try:
@@ -1257,128 +1223,65 @@ async def verify_new_email(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="OTP expired or invalid"
-# new emsil
-
-
-            """Email sending utilities with retry logic."""
-import logging
-import smtplib
-import socket
-
-from fastapi_mail import FastMail, MessageSchema, MessageType
-from pydantic import EmailStr
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-    RetryCallState,
-)
-
-logger = logging.getLogger(__name__)
-
-
-def _before_sleep_log(retry_state: RetryCallState) -> None:
-    """
-    Log warning before each retry attempt.
-    Uses named function instead of lambda for better type safety.
-    """
-    attempt = retry_state.attempt_number
+        )
     
-    # ✅ Safely access next_action.sleep
-    if retry_state.next_action is not None:
-        sleep_time = getattr(retry_state.next_action, "sleep", 0)
-        logger.warning(
-            f"Email send failed (attempt {attempt}). "
-            f"Retrying in {sleep_time:.1f}s..."
+    # Race condition guard: check new email still isn't taken
+    # (someone else could have registered it between step 1 and step 2)
+    existing = await get_user_by_email(db, new_email)
+    if existing and get_user_id(existing) != user_id:
+        # Clean up since we can't proceed
+        await redis.delete(f"email_change:{data.email_change_token}")
+        await redis.delete(otp_key)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This email address has just been registered by another account. "
+                   "Please choose a different email."
         )
-    else:
-        logger.warning(f"Email send failed (attempt {attempt}). Retrying...")
-
-
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=2, min=2, max=30),
-    retry=retry_if_exception_type((
-        ConnectionError,
-        TimeoutError,
-        socket.timeout,
-        smtplib.SMTPConnectError,
-        smtplib.SMTPServerDisconnected,
-        smtplib.SMTPException,
-        # ✅ NOT SMTPAuthenticationError - retrying bad credentials is pointless
-    )),
-    before_sleep=_before_sleep_log,     # ✅ Named function, no lambda
-    reraise=True,
-)
-async def send_email(
-    recipient: str,
-    subject: str,
-    body: str,
-    mailer: FastMail,
-) -> None:
-    """
-    Send email with automatic retry on transient failures.
-
-    Args:
-        recipient: Recipient email address
-        subject: Email subject line
-        body: Plain text email body
-        mailer: FastMail instance from app.state
-
-    Raises:
-        Exception: After all retries exhausted
-    """
-    message = MessageSchema(
-        subject=subject,
-        recipients=[EmailStr(recipient)],   # ✅ Cast to EmailStr
-        body=body,
-        subtype=MessageType.plain,
+    
+    # ✅ All checks passed - update email
+    old_email = user.email
+    user.email = new_email
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    
+    # Clean up Redis
+    await redis.delete(f"email_change:{data.email_change_token}")
+    await redis.delete(otp_key)
+    
+    logger.info(
+        f"Email changed successfully for user_id={user_id}. "
+        f"{old_email} → {new_email}"
     )
-
-    try:
-        await mailer.send_message(message)
-        logger.info(f"Email sent successfully to {recipient}")
-    except Exception:
-        logger.error(f"Failed to send email to {recipient}")
-        raise
+    
+    return ReadUser.model_validate(user)
 
 
-async def send_otp_email(
-    email: str,
-    otp: str,
-    subject: str,
-    otp_type: str,
-    mailer: FastMail,
-) -> None:
-    """
-    Send OTP email with OTP-specific body formatting.
 
-    Args:
-        email: Recipient email address
-        otp: 6-digit OTP code
-        subject: Email subject line
-        otp_type: Flow type e.g. "registration", "login", "password_reset"
-        mailer: FastMail instance from app.state
-    """
-    body = (
-        f"Your {otp_type} OTP is: {otp}\n\n"
-        f"This code expires in 10 minutes.\n"
-        f"If you didn't request this, please ignore this email."
-    )
 
-    try:
-        await send_email(
-            recipient=email,
-            subject=subject,
-            body=body,
-            mailer=mailer,
-        )
-    except Exception as exc:
-        # Log loudly - a failed OTP email means user is stuck
-        logger.critical(
-            f"CRITICAL: OTP email to {email} failed after all retries. "
-            f"User cannot complete {otp_type}. Error: {exc}"
-        )
-        # Don't re-raise - OTP is already stored in Redis
-        # User can request a resend via /otp/resend endpoint
+# =============================================================================
+# PERMISSIONS
+# =============================================================================
+
+async def has_permission(user: ReadUser, required_perm: str) -> bool:
+    """Check if user has required permission."""
+    if user.is_admin:
+        return True
+    # Permission check requires loading group - do in route if needed
+    return False
+
+
+def require_admin():
+    """Dependency: require admin user."""
+    async def dependency(
+        request: Request,
+        db: AsyncSession,
+    ) -> ReadUser:
+        user = await get_current_user(request, db)
+        if not user.is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin access required"
+            )
+        return user
+    return dependency
