@@ -25,6 +25,12 @@ Argument of type "datetime" cannot be assigned to parameter "__first" of type "_
     "datetime" is not assignable to "ExpressionElementRole[Any]"
   ...Pylance
 
+# 3rd error
+
+Argument of type "int | None" cannot be assigned to parameter "country_id" of type "int" in function "__init__"
+  Type "int | None" is not assignable to type "int"
+    "None" is not assignable to "int"PylancereportArgumentType
+(variable) country_id: int | None
 
 """
 Create admin users.
