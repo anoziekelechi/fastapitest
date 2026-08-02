@@ -1,3 +1,16 @@
+Argument of type "int | None" cannot be assigned to parameter "expression" of type "_ColumnExpressionArgument[Any] | _StarOrOne | None" in function "__init__"
+  Type "int | None" is not assignable to type "_ColumnExpressionArgument[Any] | _StarOrOne | None"
+    Type "int" is not assignable to type "_ColumnExpressionArgument[Any] | _StarOrOne | None"
+      "int" is not assignable to "ColumnElement[Any]"
+      "int" is incompatible with protocol "_HasClauseElement[Any]"
+        "__clause_element__" is not present
+      "int" is not assignable to "SQLCoreOperations[Any]"
+      "int" is not assignable to "ExpressionElementRole[Any]"
+      "int" is not assignable to "TypedColumnsClauseRole[Any]"
+
+
+
+
 
 """
 Create admin users.
