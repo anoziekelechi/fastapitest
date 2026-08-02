@@ -1,3 +1,6 @@
+
+
+
 Argument of type "int | None" cannot be assigned to parameter "expression" of type "_ColumnExpressionArgument[Any] | _StarOrOne | None" in function "__init__"
   Type "int | None" is not assignable to type "_ColumnExpressionArgument[Any] | _StarOrOne | None"
     Type "int" is not assignable to type "_ColumnExpressionArgument[Any] | _StarOrOne | None"
@@ -9,7 +12,18 @@ Argument of type "int | None" cannot be assigned to parameter "expression" of ty
       "int" is not assignable to "TypedColumnsClauseRole[Any]"
 
 
+#second error
 
+Argument of type "datetime" cannot be assigned to parameter "__first" of type "_ColumnExpressionOrStrLabelArgument[Any] | Literal[_NoArg.NO_ARG] | None" in function "order_by"
+  Type "datetime" is not assignable to type "_ColumnExpressionOrStrLabelArgument[Any] | Literal[_NoArg.NO_ARG] | None"
+    "datetime" is not assignable to "None"
+    "datetime" is not assignable to "str"
+    "datetime" is not assignable to "ColumnElement[Any]"
+    "datetime" is incompatible with protocol "_HasClauseElement[Any]"
+      "__clause_element__" is not present
+    "datetime" is not assignable to "SQLCoreOperations[Any]"
+    "datetime" is not assignable to "ExpressionElementRole[Any]"
+  ...Pylance
 
 
 """
