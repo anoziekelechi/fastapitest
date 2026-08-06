@@ -1,3 +1,21 @@
+docker compose exec backend python -c "
+from sqlalchemy import text
+from api.core.database import engine
+
+with engine.connect() as conn:
+    result = conn.execute(text('''
+        SELECT column_name, data_type 
+        FROM information_schema.columns 
+        WHERE table_name = 'users' 
+          AND column_name IN ('created_at', 'updated_at', 'date_verified')
+        ORDER BY column_name;
+    '''))
+    for row in result:
+        print(row)
+"
+
+
+
 #error
 Traceback (most recent call last):
   File "asyncpg/protocol/prepared_stmt.pyx", line 175, in asyncpg.protocol.protocol.PreparedStatementState._encode_bind_msg
