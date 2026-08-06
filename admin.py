@@ -1,3 +1,24 @@
+op.create_table('users',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('group_id', sa.Integer(), nullable=True),
+    sa.Column('country_id', sa.Integer(), nullable=False),
+    sa.Column('surname', sa.String(length=20), nullable=False),
+    sa.Column('othernames', sa.String(length=50), nullable=False),
+    sa.Column('email', sa.String(length=250), nullable=False),
+    sa.Column('hashed_password', sa.String(length=128), nullable=False),
+    sa.Column('is_admin', sa.Boolean(), server_default='false', nullable=False),
+    sa.Column('disabled', sa.Boolean(), server_default='false', nullable=False),
+    sa.Column('payment_id', sa.String(length=128), nullable=True),
+    sa.Column('one_click', sa.Boolean(), server_default='false', nullable=False),
+    sa.Column('verified', sa.Boolean(), server_default='false', nullable=False),
+    sa.Column('date_verified', sa.DateTime(timezone=True), nullable=True),
+    sa.ForeignKeyConstraint(['country_id'], ['countries.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['group_id'], ['groups.id'], ondelete='SET NULL'),
+    sa.PrimaryKeyConstraint('id')
+    )
+#
 docker compose exec backend python -c "
 from sqlalchemy import text
 from api.core.database import engine
