@@ -1,3 +1,57 @@
+from sqlmodel import Field,SQLModel
+from typing import Callable, List,Optional, Any
+from sqlalchemy import func,Column, DateTime
+from sqlalchemy.sql.elements import ClauseElement
+from datetime import date, datetime,timezone 
+
+
+
+
+def utc_now() -> datetime:
+    """Return current UTC datetime (timezone-aware)."""
+    return datetime.now(timezone.utc)
+
+
+def timezone_column(onupdate: bool = False) ->Callable[[], Column]:
+    """
+    Returns a fresh Column object for each model to prevent 
+    'Column already assigned to table' error.
+    """
+    def create_column() -> Column:
+        return Column(
+            DateTime(timezone=True),
+            server_default=func.now(),
+            nullable=False,
+            onupdate=func.now() if onupdate else None,
+        )
+    return create_column
+
+
+class BaseModel(SQLModel):
+    """Abstract base model with timezone-aware timestamps."""
+    
+    __abstract__ = True
+    
+    id: int | None = Field(default=None, primary_key=True)
+    
+    # Created at
+    created_at: datetime = Field(
+        default_factory=utc_now,
+        sa_column=timezone_column(onupdate=False),                    # No onupdate
+    )
+    
+    # Updated at
+    updated_at: datetime = Field(
+        default_factory=utc_now,
+        sa_column=timezone_column(onupdate=True), # With onupdate
+    )
+
+
+
+
+
+
+#
 docker compose exec backend python -c "
 import asyncio
 from sqlalchemy import text
