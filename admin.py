@@ -1,3 +1,41 @@
+#new base
+from sqlmodel import Field, SQLModel
+from sqlalchemy import DateTime, func
+from datetime import datetime, timezone
+
+
+def utc_now() -> datetime:
+    """Return current UTC datetime (timezone-aware)."""
+    return datetime.now(timezone.utc)
+
+
+class BaseModel(SQLModel):
+    """Abstract base model with timezone-aware timestamps."""
+    
+    __abstract__ = True
+    
+    id: int | None = Field(default=None, primary_key=True)
+    
+    created_at: datetime = Field(
+        default_factory=utc_now,
+        sa_type=DateTime(timezone=True),
+        sa_column_kwargs={
+            "server_default": func.now(),
+            "nullable": False,
+        },
+    )
+    
+    updated_at: datetime = Field(
+        default_factory=utc_now,
+        sa_type=DateTime(timezone=True),
+        sa_column_kwargs={
+            "server_default": func.now(),
+            "nullable": False,
+            "onupdate": func.now(),
+        },
+    )
+
+#old base
 from sqlmodel import Field,SQLModel
 from typing import Callable, List,Optional, Any
 from sqlalchemy import func,Column, DateTime
