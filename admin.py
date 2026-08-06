@@ -1,3 +1,23 @@
+docker compose exec backend python -c "
+import asyncio
+from sqlalchemy import text
+from api.core.database import engine
+
+async def check():
+    async with engine.connect() as conn:
+        result = await conn.execute(text('''
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_name = 'users' 
+              AND column_name IN ('created_at', 'updated_at', 'date_verified')
+            ORDER BY column_name;
+        '''))
+        for row in result:
+            print(row)
+
+asyncio.run(check())
+"
+
 op.create_table('users',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
@@ -18,22 +38,6 @@ op.create_table('users',
     sa.ForeignKeyConstraint(['group_id'], ['groups.id'], ondelete='SET NULL'),
     sa.PrimaryKeyConstraint('id')
     )
-#
-docker compose exec backend python -c "
-from sqlalchemy import text
-from api.core.database import engine
-
-with engine.connect() as conn:
-    result = conn.execute(text('''
-        SELECT column_name, data_type 
-        FROM information_schema.columns 
-        WHERE table_name = 'users' 
-          AND column_name IN ('created_at', 'updated_at', 'date_verified')
-        ORDER BY column_name;
-    '''))
-    for row in result:
-        print(row)
-"
 
 
 
