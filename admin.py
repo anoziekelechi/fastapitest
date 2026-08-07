@@ -1,55 +1,23 @@
-from sqlmodel import select
-from sqlalchemy.orm import selectinload
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from api.models.users import User
-from api.users.schemas import UserRead
-
-
-async def get_users(
-    db: AsyncSession,
-    skip: int = 0,
-    limit: int = 100,
-) -> list[UserRead]:
-    result = await db.execute(
-        select(User)
-        .options(selectinload(User.country))
-        .order_by(User.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-    )
-    users = result.scalars().all()
-
-    return [
-        UserRead(
-            email=user.email,
-            surname=user.surname,
-            othernames=user.othernames,
-            country=user.country.name if user.country else None,
-            date_verified=user.date_verified,
-            created_at=user.created_at,
-        )
-        for user in users
-    ]
+#error
+Argument of type "Country | None" cannot be assigned to parameter "keys" of type "_AttrType" in function "selectinload"
+  Type "Country | None" is not assignable to type "_AttrType"
+    Type "Country" is not assignable to type "_AttrType"
+      "Country" is not assignable to "QueryableAttribute[Any]"
+      "Country" is not assignable to "Literal['*']"PylancereportArgumentType
 
 
+#error
 
 
-from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+Argument of type "datetime" cannot be assigned to parameter "column" of type "_ColumnExpressionOrStrLabelArgument[_T@desc]" in function "desc"
+  Type "datetime" is not assignable to type "_ColumnExpressionOrStrLabelArgument[_T@desc]"
+    "datetime" is not assignable to "LambdaElement"
+    "datetime" is not assignable to "str"
+    "datetime" is not assignable to "ColumnElement[_T@desc]"
+    "datetime" is not assignable to "ExpressionElementRole[_T@desc]"
+    "datetime" is not assignable to "SQLCoreOperations[_T@desc]"
+    "datetime" is not assignable to "TypedColumnsClauseRole[_T@desc]"
+    "datetime" is incompatible with protocol "_HasClauseElement[_T@desc]"
+  ...Py
 
-from api.core.database import get_session
-from api.users.logics import get_users
-from api.users.schemas import UserRead
 
-
-router = APIRouter(prefix="/users", tags=["Users"])
-
-
-@router.get("/", response_model=list[UserRead])
-async def list_users(
-    skip: int = 0,
-    limit: int = 100,
-    db: AsyncSession = Depends(get_session),
-):
-    return await get_users(db, skip=skip, limit=limit)
