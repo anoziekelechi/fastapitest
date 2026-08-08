@@ -1,1 +1,7 @@
-{"total":1,"users":[{"id":2,"surname":"ANOZIE","othernames":"KELECHI","email":"kennedykelechijoseph@gmail.com","country":null,"is_admin":true,"verified":true,"disabled":false,"date_verified":null,"created_at":"2026-08-07T11:52:00.634136Z"}]}
+Type "dict[Unknown, Unknown]" is not assignable to return type "AllUsers"
+  "dict[Unknown, Unknown]" is not assignable to "AllUsers"PylancereportReturnType
+(function) def get_users(
+    db: AsyncSession,
+    skip: int = 0,
+    limit: int = 100
+) -> CoroutineType[Any, Any, dict[Unknown, Unknown]]
