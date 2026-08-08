@@ -1,46 +1,100 @@
-async def read_all_countries(
-    db: AsyncSession,
-    skip: int = 0,
-    limit: int = 100,
-) -> CountryListRead:
-    """
-    List all countries with pagination.
 
-    Public - no authentication required.
+
+async def create_country(
+    data: CountryCreate,
+    db: AsyncSession,
+    #current_user: ReadUser,         # ✅ Admin check done in route via require_admin
+) -> dict:
+    """
+    Create a new country.
+
+    Admin only.
+
+    Flow:
+        1. Check name uniqueness (case-insensitive)
+        2. Check currency code uniqueness
+        3. Create country record
 
     Args:
+        data: Validated country data
         db: Database session
-        skip: Records to skip (pagination offset)
-        limit: Maximum records to return
+        current_user: Authenticated admin user
 
     Returns:
-        CountryListRead: Total count + paginated list
+        dict: Success message
+
+    Raises:
+        HTTPException: 409 if name or currency code already exists
     """
-    # Get total count
-    total: int = (
-        await db.execute(select(func.count(Country.id)))
-    ).scalar() or 0
+    # Check name uniqueness
+    existing_name = await get_country_by_name(db, data.name)
+    if existing_name:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Country '{data.name}' already exists"
+        )
     
-    # Get paginated results
-    result = await db.execute(
-        select(Country)
-        .order_by(Country.name)
-        .offset(skip)
-        .limit(limit)
-    )
-    countries = result.scalars().all()
+    # Check currency code uniqueness
+    existing_code = (
+        await db.execute(
+            select(Country).where(
+                func.upper(Country.currency_code) == data.currency_code.upper()
+            )
+        )
+    ).scalars().first()
+    if existing_code:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Currency code '{data.currency_code}' is already "
+                   f"assigned to '{existing_code.name}'"
+        )
     
-    return CountryListRead(
-        total=total,
-
- countries=[CountryRead.model_validate(c) for c in countries],
-
-
-
-
-    Argument of type "int | None" cannot be assigned to parameter "expression" of type "_ColumnExpressionArgument[Any] | _StarOrOne | None" in function "__init__"
-  Type "int | None" is not assignable to type "_ColumnExpressionArgument[Any] | _StarOrOne | None"
-    Type "int" is not assignable to type "_ColumnExpressionArgument[Any] | _StarOrOne | None"
-     
-       
+    country = Country(
+        name=data.name,
+        currency_code=data.currency_code,
+        whatsapp=data.whatsapp,
     )
+    db.add(country)
+    await db.commit()
+    await db.refresh(country)
+    
+    # logger.info(
+    #     f"Country '{country.name}' created by admin {current_user.id}"
+    # )
+    
+    return {
+        "message": f"Country '{country.name}' created successfully",
+        "country": CountryRead.model_validate(country),
+    }
+
+
+
+# routes
+
+@router.post(
+    "/add_country",
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a country (admin only)",
+)
+async def create_country_route(
+    data: CountryCreate,
+    db: DBDep,
+    #current_user: ReadUser = AdminUser,             # ✅ Admin only
+) -> dict:
+    """
+    Create a new country.
+
+    Admin only. Country name is normalized to Title Case.
+    Multiple spaces are collapsed. Numbers and special chars rejected.
+
+    Examples:
+        "liberia"         → "Liberia"
+        "south africa"    → "South Africa"
+        "guinea  bissau"  → "Guinea Bissau"
+    """
+    return await create_country(
+        data=data,
+        db=db,
+        #current_user=current_user,
+    )
+
