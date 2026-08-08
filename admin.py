@@ -1,7 +1,3 @@
-
-
-
-
 async def read_all_countries(
     db: AsyncSession,
     skip: int = 0,
@@ -37,7 +33,7 @@ async def read_all_countries(
     return CountryListRead(
         total=total,
 
-
+ countries=[CountryRead.model_validate(c) for c in countries],
 
 
 
@@ -46,5 +42,5 @@ async def read_all_countries(
   Type "int | None" is not assignable to type "_ColumnExpressionArgument[Any] | _StarOrOne | None"
     Type "int" is not assignable to type "_ColumnExpressionArgument[Any] | _StarOrOne | None"
      
-        countries=[CountryRead.model_validate(c) for c in countries],
+       
     )
