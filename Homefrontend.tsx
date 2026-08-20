@@ -1,84 +1,105 @@
-'use client';
+async def update_country(
+    country_id: int,
+    data: CountryUpdate,
+    db: AsyncSession,
+    #current_user: ReadUser,
+) -> CountryRead:
+    """
+    Update an existing country.
 
-import { useEffect, useState } from 'react';
-import axios from 'axios';
+    Admin only.
 
-interface HomeData {
-  sitename: string;
-  intro?: string | null;
-  aboutus?: string | null;
-  mission?: string | null;
-  vision?: string | null;
-  logo_url?: string | null;
-  image_url?: string | null;
-}
+    Flow:
+        1. Fetch country (404 if not found)
+        2. Validate at least one field provided
+        3. Check name uniqueness if name is being changed
+        4. Check currency uniqueness if currency is being changed
+        5. Apply updates (only provided fields)
 
-export default function Home() {
-  const [data, setData] = useState<HomeData | null>(null);
-  const [loading, setLoading] = useState(true);
+    Args:
+        country_id: ID of country to update
+        data: Partial update data
+        db: Database session
+        current_user: Authenticated admin user
 
-  useEffect(() => {
-    const fetchHome = async () => {
-      try {
-        const res = await axios.get<HomeData>('http://localhost:8000/home');
-        setData(res.data);
-      } catch (err) {
-        console.error('Failed to load home data');
-      } finally {
-        setLoading(false);
-      }
-    };
+    Returns:
+        CountryRead: Updated country
 
-    fetchHome();
-  }, []);
+    Raises:
+        HTTPException: 404 if not found
+        HTTPException: 400 if no fields provided
+        HTTPException: 409 if name or currency already taken
+    """
+    country = await get_country_by_id(db, country_id)
+    if not country:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Country with ID {country_id} not found"
+        )
+    
+    # At least one field must be provided
+    if data.name is None and data.currency_code is None and data.whatsapp is None and data.email_support is None :
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided for update"
+        )
+    
+    updated_fields = []
+    
+    # Update name if provided and different
+    if data.name is not None:
+        if data.name == country.name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New country name is the same as current name"
+            )
+        # Check uniqueness
+        existing = await get_country_by_name(db, data.name)
+        if existing and existing.id != country_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Country '{data.name}' already exists"
+            )
+        country.name = data.name
+        updated_fields.append("name")
+    
+    # Update currency code if provided and different
+    if data.currency_code is not None:
+        if data.currency_code == country.currency_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New currency code is the same as current code"
+            )
+        # Check uniqueness
+        existing_code = (
+            await db.execute(
+                select(Country).where(
+                    func.upper(Country.currency_code) == data.currency_code.upper()
+                )
+            )
+        ).scalars().first()
+        if existing_code and existing_code.id != country_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Currency code '{data.currency_code}' is already "
+                       f"assigned to '{existing_code.name}'"
+            )
+        country.currency_code = data.currency_code
+        updated_fields.append("currency_code")
+    
+    # Update whatsapp if provided
+    if data.whatsapp is not None:
+        country.whatsapp = data.whatsapp
+        updated_fields.append("whatsapp")
+    
+    db.add(country)
+    await db.commit()
+    await db.refresh(country)
+    
+    logger.info(
+        f"Country '{country.name}' updated by admin."  # {current_user.id}
+        f"Fields: {', '.join(updated_fields)}"
+    )
+    
+    return CountryRead.model_validate(country)
 
-  if (loading) return <div className="text-center py-20">Loading...</div>;
-  if (!data) return <div className="text-center py-20">No home data available.</div>;
-
-  return (
-    <div className="min-h-screen">
-      {/* Hero Banner */}
-      {data.image_url && (
-        <div className="relative h-[60vh] bg-gray-900">
-          <img
-            src={data.image_url}
-            alt="Hero"
-            className="w-full h-full object-cover opacity-80"
-          />
-          <div className="absolute inset-0 flex items-center justify-center text-center text-white">
-            <div>
-              <h1 className="text-5xl md:text-6xl font-bold mb-4">{data.sitename}</h1>
-              {data.intro && <p className="text-xl md:text-2xl max-w-2xl mx-auto">{data.intro}</p>}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* About Us */}
-      {data.aboutus && (
-        <div className="py-16 px-6 max-w-4xl mx-auto">
-          <h2 className="text-3xl font-bold mb-6">About Us</h2>
-          <p className="text-lg leading-relaxed text-gray-700">{data.aboutus}</p>
-        </div>
-      )}
-
-      {/* Mission & Vision */}
-      <div className="bg-gray-50 py-16">
-        <div className="max-w-5xl mx-auto grid md:grid-cols-2 gap-10 px-6">
-          {data.mission && (
-            <div>
-              <h3 className="text-2xl font-semibold mb-4">Our Mission</h3>
-              <p className="text-gray-600 leading-relaxed">{data.mission}</p>
-            </div>
-          )}
-          {data.vision && (
-            <div>
-              <h3 className="text-2xl font-semibold mb-4">Our Vision</h3>
-              <p className="text-gray-600 leading-relaxed">{data.vision}</p>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
