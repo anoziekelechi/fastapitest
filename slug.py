@@ -31,10 +31,6 @@ def generate_slug(name: str) -> str:
 
     return slug
 
-
-
-
-
 from sqlmodel import Field, Column, String
 
 
@@ -48,5 +44,46 @@ class SlugMixin:
             index=True,
         ),
     )
+
+
+
+country = Country(
+    name=data.name,
+    currency_code=data.currency_code,
+    slug=generate_slug(data.name),          # ← set directly
+)
+db.add(country)
+await db.commit()
+await db.refresh(country)
+
+
+
+# You need the country name
+country = await db.get(Country, data.country_id)
+if not country:
+    raise HTTPException(status_code=404, detail="Country not found")
+
+slug_source = f"{country.name} {data.address}"
+# e.g. "Nigeria No 12 ABC Street Lagos"
+
+office = Office(
+    country_id=data.country_id,
+    address=data.address,
+    email=data.email,
+    whatsapp=data.whatsapp,
+    phone=data.phone,
+    slug=generate_slug(slug_source),        # → "nigeria-no-12-abc-street-lagos"
+)
+db.add(office)
+await db.commit()
+await db.refresh(office)
+
+
+
+Update (when name/address changes)
+country.name = data.name
+country.slug = generate_slug(data.name)
+
+
 
 
