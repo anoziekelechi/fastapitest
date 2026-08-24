@@ -1,59 +1,138 @@
-# =====================================================================
-# STAGE 1: Builder - Two-step sync for optimal caching
-# =====================================================================
-FROM ghcr.io/astral-sh/uv:0.5.11-python3.12-bookworm AS builder
 
-# Ensure binaries work across stages and pre-compile bytecode
-ENV UV_LINK_MODE=copy \
-    UV_COMPILE_BYTECODE=1
+async def has_permission(
+    user: ReadUser,
+    required_perm: str,
+    target_country_id: int | None = None,
+) -> None:
+    """
+    Pure in-memory permission check.
+    No DB queries - permission already loaded in get_current_user.
+    
+    Hierarchy:
+        1. Admin → all permissions ✅
+        2. User with matching permission → allowed ✅
+        3. Everyone else → 403 ❌
+    
+    Args:
+        user: ReadUser with .permission already set
+        required_perm: Required permission string
+    
+    Raises:
+        HTTPException: 403 if permission denied
+    """
+    # Admins bypass all permission checks
+    if user.is_admin:
+        return
 
-WORKDIR /app
+    # No permission
+    if user.permission is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access deny,you dont have permission",
+        )
+    # wrong permission
+    if user.permission != required_perm:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied - requires '{required_perm}' permission",
+        )
+    # Country scope check
+    if target_country_id is not None:
+        if user.country_id is None:
+            raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied no country with such permission",
+        )
+        if user.country_id != target_country_id:
+            raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You dont have permission on this country resource,",
+            )
 
-# Step 1: Install dependencies ONLY (maximally cached)
-COPY pyproject.toml uv.lock ./
-COPY README.md ./
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv /app/.venv && \
-    . /app/.venv/bin/activate && \
-    uv sync --frozen --no-dev --no-install-project
 
-# Step 2: Install project (only rebuilds when source code changes)
-COPY alembic.ini ./
-COPY alembic ./alembic
-COPY api ./api
-COPY core ./core
+async def get_current_user(
+    request: Request,
+    db: AsyncSession,
+) -> ReadUser:
+    """
+    Get current authenticated user from cookie.
+    
+    Loads permission ONCE here so all downstream
+    has_permission() calls are pure in-memory - no extra DB queries.
+    """
+    token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    . /app/.venv/bin/activate && \
-    uv sync --frozen --no-dev
+    payload = decode_access_token(token)
 
-# =====================================================================
-# STAGE 2: Runtime - Slim & secure
-# =====================================================================
-FROM python:3.12-slim-bookworm
+    user = await get_user_by_id(db, payload.sub)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+        )
 
-WORKDIR /app
+    if user.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended. Please contact admin.",
+        )
 
-# Copy venv with working binaries
-COPY --from=builder /app/.venv /app/.venv
+    if not user.verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account not verified. Please verify your email.",
+        )
 
-# Copy application code (explicit, not /app /app)
-COPY --from=builder /app/alembic.ini ./
-COPY --from=builder /app/alembic ./alembic
-COPY --from=builder /app/api ./api
-COPY --from=builder /app/core ./core
+    # ✅ Load permission ONCE - only 1 extra query for non-admins with a group
+    # Admins skip this entirely (no query needed)
+    permission: str | None = None
+    if not user.is_admin and user.group_id is not None:
+        from api.users.models import Group
+        group = await db.get(Group, user.group_id)
+        if group:
+            permission = group.permission
 
-ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    # ✅ Build ReadUser and inject permission
+    read_user = ReadUser.model_validate(user)
+    read_user.permission = permission
+    return read_user
 
-# Security: non-root user
-RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app
 
-USER appuser
+async def get_authenticated_user(
+    request: Request,
+    db: DBDep,
+) -> ReadUser:
+    """
+    Dependency: Get current authenticated user.
+    
+    Usage:
+        @router.get("/profile")
+        async def profile(user: ReadUser = Depends(get_authenticated_user)):
+            ...
+    """
+    return await get_current_user(request=request, db=db)
 
-EXPOSE 8000
 
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+
+            def require_admin():
+    """Dependency: require admin user."""
+    async def dependency(
+        request: Request,
+        db: DBDep,
+    ) -> ReadUser:
+        user = await get_current_user(request, db)
+        if not user.is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access Denied,Contact Admin"
+            )
+        return user
+    return dependency
