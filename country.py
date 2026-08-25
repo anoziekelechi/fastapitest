@@ -1,4 +1,26 @@
+# api/admin/script.py or a one-off script
 
+async def seed_slugs():
+    """Generate slugs for countries that don't have one."""
+    from api.core.slug import generate_slug
+    
+    async with AsyncSessionFactory() as db:
+        result = await db.execute(
+            select(Country).where(Country.slug == None)
+        )
+        countries = result.scalars().all()
+        
+        for country in countries:
+            country.slug = generate_slug(country.name, country.id)
+            db.add(country)
+        
+        await db.commit()
+        print(f"✅ Generated slugs for {len(countries)} countries")
+
+asyncio.run(seed_slugs())
+
+
+docker compose exec backend python api/admin/seed_slugs.py
 
 async def delete_country(
     db: AsyncSession,
