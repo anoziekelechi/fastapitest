@@ -1,0 +1,19 @@
+# 1. Delete the old migration file
+rm alembic/versions/7dfcadf8abfb*.py
+
+# 2. Completely wipe the database
+docker compose exec db psql -U echezonz -d fastapidb -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+
+# 3. Generate a brand new migration
+docker compose exec backend alembic revision --autogenerate -m "initial schema with timezone-aware timestamps"
+
+# 4. Open the newly created file in alembic/versions/
+#    Search for every created_at and updated_at and make sure they look like this:
+
+#    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+#    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+
+#    If any still say sa.DateTime() without timezone=True → fix them manually.
+
+# 5. Apply the new migration
+docker compose exec backend alembic upgrade head
