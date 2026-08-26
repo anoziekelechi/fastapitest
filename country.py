@@ -1,3 +1,219 @@
+
+def validate_international_phone(value: str | None) -> str | None:
+   
+    if value is None:
+        return None
+
+    cleaned = value.strip()
+
+    if not cleaned:
+        return None
+
+    # Must start with + for international format
+    if not cleaned.startswith("+"):
+        raise ValueError(
+            "Phone number must be in international format starting with '+'. "
+            "Example: '+2348071234567'"
+        )
+
+    try:
+        parsed = phonenumbers.parse(cleaned, None)
+
+        if not phonenumbers.is_valid_number(parsed):
+            raise ValueError(
+                f"'{cleaned}' is not a valid phone number. "
+                f"Please check the country code and number."
+            )
+
+        # Format to E.164
+        return phonenumbers.format_number(
+            parsed,
+            phonenumbers.PhoneNumberFormat.E164
+        )
+
+    except phonenumbers.NumberParseException:
+        raise ValueError(
+            "Invalid phone number format. "
+            "Must be in international format e.g. '+2348071234567'"
+        )
+
+
+def validate_whatsapp(value: str | None) -> str | None:
+   
+    if value is None:
+        return None
+
+    # Reuse international phone validator
+    validated = validate_international_phone(value)
+
+    if validated is None:
+        return None
+
+    # Remove '+' prefix before storing
+    # "+2348071234567" → "2348071234567"
+    return validated.lstrip("+")
+
+
+
+
+
+
+async def create_country(
+    data: CountryCreate,
+    db: AsyncSession,
+    #current_user: ReadUser,         # ✅ Admin check done in route via require_admin
+) -> dict:
+    """
+    Create a new country.
+
+    Admin only.
+
+    Flow:
+        1. Check name uniqueness (case-insensitive)
+        2. Check currency code uniqueness
+        3. Create country record
+
+    Args:
+        data: Validated country data
+        db: Database session
+        current_user: Authenticated admin user
+
+    Returns:
+        dict: Success message
+
+    Raises:
+        HTTPException: 409 if name or currency code already exists
+    """
+    # only admin
+    # if not current_user.is_admin:
+    #     raise HTTPException(
+    #         status_code=status.HTTP_403_FORBIDDEN,
+    #         detail="Action not allowed"
+    #     )
+    # Check name uniqueness
+    existing_name = await get_country_by_name(db, data.name)
+    if existing_name:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Country '{data.name}' already exists"
+        )
+    
+    # Check currency code uniqueness
+    existing_code = (
+        await db.execute(
+            select(Country).where(
+                func.upper(Country.currency_code) == data.currency_code.upper()
+            )
+        )
+    ).scalars().first()
+    if existing_code:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Currency code '{data.currency_code}' is already "
+                   f"assigned to '{existing_code.name}'"
+        )
+        
+    # check email support unique
+    
+    country = Country(
+        name=data.name,
+        currency_code=data.currency_code,
+        email_support=data.email_support,
+        whatsapp=data.whatsapp,
+        slug=generate_slug(data.name),          # ← set directly
+    )
+    db.add(country)
+    await db.commit()
+    await db.refresh(country)
+    
+    # logger.info(
+    #     f"Country '{country.name}' created by admin {current_user.id}"
+    # )
+    
+    return {
+        "message": f"Country '{country.name}' created successfully",
+        "country": CountryRead.model_validate(country),
+    }
+
+
+
+async def read_single_country(
+    db: AsyncSession,
+    slug:str,
+) -> CountryRead:
+    # only admin soon
+    """
+    Get a single country by slug.
+
+    Public - no authentication required.
+
+    Args:
+        country_id: Country ID to fetch
+        db: Database session
+
+    Returns:
+        CountryRead: Country data
+
+    Raises:
+        HTTPException: 404 if not found
+    """
+    country = await get_country_by_slug(db, slug)
+    
+    
+    return CountryRead.model_validate(country)
+
+
+{
+  "detail": [
+    {
+      "type": "value_error",
+      "loc": [
+        "body",
+        "whatsapp"
+      ],
+      "msg": "Value error, Phone number must be in international format starting with '+'. Example: '+2348071234567'",
+      "input": "string",
+      "ctx": {
+        "error": {}
+      }
+    }
+  ]
+}
+
+
+class CountryCreate(BaseModel):
+    """Schema for creating a country."""
+    model_config = ConfigDict(extra="forbid")
+    
+    name: str
+    currency_code: str
+    whatsapp: str | None = None
+    email_support: str | None = None
+    
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return validate_country_name(v)
+    
+    @field_validator("currency_code", mode="before")
+    @classmethod
+    def validate_code(cls, v: str) -> str:
+        return validate_currency_code(v)
+     
+    @field_validator("whatsapp", mode="before")
+    @classmethod
+    def validate_whatsapp(cls, v: str| None) -> str | None:
+        return validate_whatsapp(v)
+     
+    @field_validator("email_support", mode="before")
+    @classmethod
+    def validate_email(cls, v: str | None) -> str | None:
+        return normalize_email(v)
+
+
+
+
+
 # api/admin/script.py or a one-off script
 
 async def seed_slugs():
