@@ -1,3 +1,14 @@
+@overload
+def normalize_email(value:str) -> str: ...
+@overload
+def normalize_email(value:str | None) -> None: ...
+
+def normalize_email(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value.strip().lower()
+
+
 
 def validate_international_phone(value: str | None) -> str | None:
    
