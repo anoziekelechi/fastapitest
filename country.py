@@ -1,5 +1,3 @@
-
-
 async def get_country_by_name(
     db: AsyncSession,
     name: str,
@@ -17,14 +15,14 @@ async def get_country_by_name(
 async def get_country_by_slug(
     db:AsyncSession,
     slug:str,
-)-> Country |  None:
+)-> Country:
     
     normalized_slug = slug.strip().lower()
     result = await db.execute(
         select(Country).where(Country.slug== normalized_slug)
     )
     country=result.scalars().first()
-    if not country:
+    if country is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Country {slug} not found"
@@ -175,11 +173,7 @@ async def read_single_country(
         )
     
     country = await get_country_by_slug(db, slug)
-    if country is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"country with slug '{slug}' not found"
-        )
+   
     
     
     return CountryRead.model_validate(country)
@@ -249,11 +243,8 @@ async def delete_country(
             detail="Action not allowed"
         )
     country = await get_country_by_slug(db, slug)
-    if country is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"country with slug '{slug}' not found"
-        )
+    
+        
 
     country_name = country.name
     
@@ -307,12 +298,6 @@ async def update_country(
     # ==============================================================
 
     country = await get_country_by_slug(db, slug)
-
-    if country is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Country with slug '{slug}' not found",
-        )
 
     # ==============================================================
     # 3. Reject completely empty update payload
@@ -493,16 +478,7 @@ async def update_country(
     # Reload the object from the database.
     await db.refresh(country)
 
-    # ==============================================================
-    # 10. Log update
-    # ==============================================================
 
-    # logger.info(
-    #     f"Country '{country.name}' "
-    #     f"(slug='{country.slug}') updated by "
-    #     f"user id={current_user.id}. "
-    #     f"Fields: {', '.join(updated_fields)}"
-    # )
 
     # ==============================================================
     # 11. Return updated country
