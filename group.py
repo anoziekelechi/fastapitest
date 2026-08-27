@@ -1,3 +1,37 @@
+
+def normalize_field(value: str) -> str:
+    """
+    Normalize group name/permission field.
+    
+    Rules:
+    - Letters and underscores only
+    - No forbidden words
+    - Converted to snake_case lowercase
+    """
+    if not value or not value.strip():
+        raise ValueError("Field cannot be empty")
+    
+    stripped = value.strip()
+    
+    # Only letters, spaces, underscores
+    if not re.fullmatch(r"[a-zA-Z_\s]+", stripped):
+        raise ValueError("Only letters and underscores allowed")
+    
+    # Block forbidden words
+    lowered = stripped.lower()
+    for word in FORBIDDEN_WORDS:
+        if word in lowered:
+            raise ValueError(f"Invalid name: contains forbidden word")
+    
+    # Convert to snake_case
+    normalized = re.sub(r"[\s_]+", "_", lowered).strip("_")
+    
+    if not normalized:
+        raise ValueError("Field cannot be empty after normalization")
+    
+    return normalized  # ✅ Fixed: was missing return!
+
+
 """Admin business logic."""
 
 from fastapi import HTTPException, status
