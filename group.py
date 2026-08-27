@@ -1,3 +1,4 @@
+
 """Admin business logic."""
 from sqlalchemy.ext.asyncio import AsyncSession
 from api.core.slug import generate_slug
@@ -23,7 +24,8 @@ async def get_user_by_email(
     email: str,
 ) -> User | None:
     """Fetch user by email."""
-    result = await db.execute(select(User).where(User.email == email))
+    normalized_email = email.strip().lower()
+    result = await db.execute(select(User).where(User.email == normalized_email))
     return result.scalars().first()
 
 
@@ -32,19 +34,37 @@ async def get_user_by_email(
 async def get_group_by_slug(
     db:AsyncSession,
     slug:str,
-)-> Group |  None:
+)-> Group:
     
     normalized_slug = slug.strip().lower()
     result = await db.execute(
         select(Group).where(Group.slug== normalized_slug)
     )
     group=result.scalars().first()
-    if not group:
+    if group is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"group {slug} not found"
         )
     return group
+
+
+async def get_group_by_name(
+    db: AsyncSession,
+    name: str,
+) -> Group | None:
+    
+   
+    result = await db.execute(select(Group).where(Group.name == name.strip()))
+    return result.scalars().first()
+
+async def get_permission_by_name(
+    db: AsyncSession,
+    permission: str,
+) -> Group | None:
+   
+    result = await db.execute(select(Group).where(Group.permission == permission.strip()))
+    return result.scalars().first()
 
 
 # =============================================================================
@@ -62,9 +82,8 @@ async def create_group(
         409: If group name or permission already exists
     """
     # Check name uniqueness
-    existing_name = (
-        await db.execute(select(Group).where(Group.name == data.name))
-    ).scalars().first()
+    existing_name = await get_group_by_name(db, data.name)
+    
     if existing_name:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -72,9 +91,8 @@ async def create_group(
         )
     
     # Check permission uniqueness
-    existing_perm = (
-        await db.execute(select(Group).where(Group.permission == data.permission))
-    ).scalars().first()
+    existing_perm = await get_permission_by_name (db,data.permission)
+   
     if existing_perm:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -91,6 +109,25 @@ async def create_group(
     await db.refresh(group)
     
     return {"message": f"Group '{group.name}' created successfully"}
+
+
+
+async def read_single_group(
+    db: AsyncSession,
+    slug:str,
+    current_user: ReadUser, 
+) -> GroupRead:
+    
+    
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Action not allowed"
+        )
+    
+    group = await get_group_by_slug(db, slug) 
+    return GroupRead.model_validate(group)
+
 
 
 async def list_groups(
@@ -182,15 +219,10 @@ async def delete_group(
     Delete a permission group.
     
     Raises:
-        404: Group not found
         400: Group has assigned users
     """
     group = await get_group_by_slug(db, slug)
-    if group is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Group not found"
-        )
+   
     
     # Prevent deletion if users are assigned
     if group.users:
@@ -210,7 +242,6 @@ async def delete_group(
 # =============================================================================
 # USER MANAGEMENT
 # =============================================================================
-
 async def assign_user_to_group(
     data: UserGroupAssign,
     db: AsyncSession,
@@ -222,20 +253,17 @@ async def assign_user_to_group(
         404: User or group not found
         400: User already in this group
     """
-    # ✅ Fixed: was using user.email (undefined), now data.email
-    user = (
-        await db.execute(select(User).where(User.email == data.email))
-    ).scalars().first()
-    if not user:
+  
+    user = await get_user_by_email(db, data.email)
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User '{data.email}' not found"
         )
     
-    group = (
-        await db.execute(select(Group).where(Group.name == data.group_name))
-    ).scalars().first()
-    if not group:
+    group = await get_group_by_name(db, data.group_name)
+    
+    if group is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Group '{data.group_name}' not found"
@@ -267,10 +295,8 @@ async def remove_user_from_group(
         404: User not found
         400: User not in any group
     """
-    user = (
-        await db.execute(select(User).where(User.email == data.email))
-    ).scalars().first()
-    if not user:
+    user = await get_user_by_email(db,data.email)
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User '{data.email}' not found"
@@ -306,10 +332,8 @@ async def disable_user(
         404: User not found
         400: User already disabled
     """
-    user = (
-        await db.execute(select(User).where(User.email == data.email))
-    ).scalars().first()
-    if not user:
+    user = await get_user_by_email(db, data.email)
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User '{data.email}' not found"
@@ -339,10 +363,9 @@ async def enable_user(
         404: User not found
         400: User already active
     """
-    user = (
-        await db.execute(select(User).where(User.email == data.email))
-    ).scalars().first()
-    if not user:
+    user = await get_user_by_email (db, data.email)
+   
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User '{data.email}' not found"
