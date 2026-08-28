@@ -84,7 +84,7 @@ async def get_main_home(
 async def setup_home_logic(
     sitename: str,
     db: AsyncSession,
-    current_user=None,
+    current_user=ReadUser,
     intro: Optional[str] = None,
     logo_key: Optional[UploadFile] = None,
     banner_key: Optional[UploadFile] = None,
@@ -119,20 +119,11 @@ async def setup_home_logic(
     # ADMIN / PERMISSION CHECK
     # =========================================================================
     #
-    # If your route already uses a dependency such as require_admin,
-    # you can omit this check here.
-    #
-    # Keeping authorization in one layer is preferable to checking it
-    # multiple times.
-    #
-    # Example:
-    #
-    # await has_permission(
-    #     user=current_user,
-    #     required_perm=Permissions.MANAGE_SITE,
-    # )
-    #
-    # -------------------------------------------------------------------------
+    if not current_user.is_admin 
+       raise HTTPException (
+        status_code=status.HTTP_403_FORBIDDEN, 
+        detail="not allowed"
+       ) -------------------------------------------------------------------------
 
     # =========================================================================
     # BASIC INPUT VALIDATION
