@@ -1,4 +1,314 @@
+# improved version 
+"""Home/site configuration business logic."""
 
+from typing import Optional
+
+from fastapi import HTTPException, UploadFile, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
+
+from api.models.site import Home
+from api.site.schemas import ReadHome
+
+# Import these from wherever they live in your project.
+# from api.core.permissions import has_permission, Permissions
+# from api.users.schemas import ReadUser
+# from api.core.storage import (
+#     handle_file_update,
+#     get_public_url,
+#     validate_image_file_securely,
+# )
+# from api.core.storage import LOGO_FOLDER, BANNER_FOLDER
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+LOGO_MAX_SIZE = 5 * 1024 * 1024       # 5 MiB
+BANNER_MAX_SIZE = 8 * 1024 * 1024    # 8 MiB
+
+HOME_CONFIG_TYPE = "MAIN"
+
+
+# =============================================================================
+# GET MAIN HOME CONFIGURATION
+# =============================================================================
+
+async def get_main_home(
+    db: AsyncSession,
+) -> Home | None:
+    """
+    Fetch the MAIN home configuration.
+
+    Returns:
+        Home | None:
+            The MAIN configuration if it exists.
+    """
+
+    result = await db.execute(
+        select(Home).where(
+            Home.config_type == HOME_CONFIG_TYPE
+        )
+    )
+
+    return result.scalars().first()
+
+
+# =============================================================================
+# CREATE / UPDATE HOME CONFIGURATION
+# =============================================================================
+
+async def setup_home_logic(
+    sitename: str,
+    db: AsyncSession,
+    current_user=None,
+    intro: Optional[str] = None,
+    logo_key: Optional[UploadFile] = None,
+    banner_key: Optional[UploadFile] = None,
+) -> dict[str, str]:
+    """
+    Create or update the MAIN home configuration.
+
+    Behavior:
+
+    - If MAIN configuration does not exist:
+        Create it.
+
+    - If MAIN configuration already exists:
+        Update sitename and intro.
+
+    - Existing logo is preserved when no new logo is uploaded.
+
+    - Existing banner is preserved when no new banner is uploaded.
+
+    - A new uploaded logo replaces the existing logo.
+
+    - A new uploaded banner replaces the existing banner.
+
+    Raises:
+        HTTPException:
+            400 - Invalid request
+            403 - User is not allowed
+            500 - Failed to save configuration
+    """
+
+    # =========================================================================
+    # ADMIN / PERMISSION CHECK
+    # =========================================================================
+    #
+    # If your route already uses a dependency such as require_admin,
+    # you can omit this check here.
+    #
+    # Keeping authorization in one layer is preferable to checking it
+    # multiple times.
+    #
+    # Example:
+    #
+    # await has_permission(
+    #     user=current_user,
+    #     required_perm=Permissions.MANAGE_SITE,
+    # )
+    #
+    # -------------------------------------------------------------------------
+
+    # =========================================================================
+    # BASIC INPUT VALIDATION
+    # =========================================================================
+
+    sitename = sitename.strip()
+
+    if not sitename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Site name cannot be empty",
+        )
+
+    if len(sitename) > 120:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Site name must not exceed 120 characters",
+        )
+
+    if intro is not None:
+        intro = intro.strip()
+
+        if len(intro) > 1200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Intro must not exceed 1200 characters",
+            )
+
+        # Treat whitespace-only intro as empty.
+        if not intro:
+            intro = None
+
+    # =========================================================================
+    # GET CURRENT CONFIGURATION
+    # =========================================================================
+
+    current = await get_main_home(db)
+
+    # =========================================================================
+    # FILE HANDLING
+    # =========================================================================
+
+    #
+    # IMPORTANT:
+    #
+    # handle_file_update() should:
+    #
+    # 1. Validate the uploaded file.
+    # 2. Check file size.
+    # 3. Store the new file.
+    # 4. Return the new storage key.
+    # 5. Handle replacement/deletion of the old file as appropriate.
+    #
+    # If no file is supplied, it should return the existing key.
+    #
+
+    new_logo_key = await handle_file_update(
+        file=logo_key,
+        current_key=current.logo_key if current else None,
+        prefix=LOGO_FOLDER,
+        max_size=LOGO_MAX_SIZE,
+        validator=validate_image_file_securely,
+    )
+
+    new_banner_key = await handle_file_update(
+        file=banner_key,
+        current_key=current.banner_key if current else None,
+        prefix=BANNER_FOLDER,
+        max_size=BANNER_MAX_SIZE,
+        validator=validate_image_file_securely,
+    )
+
+    # =========================================================================
+    # DATABASE OPERATION
+    # =========================================================================
+
+    try:
+        # =====================================================================
+        # CREATE
+        # =====================================================================
+
+        if current is None:
+            record = Home(
+                config_type=HOME_CONFIG_TYPE,
+                sitename=sitename,
+                intro=intro,
+                logo_key=new_logo_key,
+                banner_key=new_banner_key,
+            )
+
+            db.add(record)
+
+        # =====================================================================
+        # UPDATE
+        # =====================================================================
+
+        else:
+            current.sitename = sitename
+            current.intro = intro
+
+            # Only replace logo when a new logo was uploaded.
+            if logo_key is not None:
+                current.logo_key = new_logo_key
+
+            # Only replace banner when a new banner was uploaded.
+            if banner_key is not None:
+                current.banner_key = new_banner_key
+
+            record = current
+
+        # =====================================================================
+        # SAVE
+        # =====================================================================
+
+        await db.commit()
+        await db.refresh(record)
+
+    except Exception:
+        await db.rollback()
+
+        # Log the actual exception here.
+        #
+        # logger.exception(
+        #     "Failed to save MAIN home configuration"
+        # )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save home configuration",
+        )
+
+    # =========================================================================
+    # RESPONSE
+    # =========================================================================
+
+    return {
+        "message": "Home settings updated successfully",
+        "status": "success",
+    }
+
+
+# =============================================================================
+# READ HOME SETTINGS
+# =============================================================================
+
+async def get_home_settings_logic(
+    db: AsyncSession,
+) -> ReadHome:
+    """
+    Fetch the MAIN home configuration.
+
+    Used by the public site/context to populate:
+
+    - Site name
+    - Intro
+    - Logo
+    - Banner
+
+    If no configuration exists yet, return safe defaults.
+    """
+
+    home = await get_main_home(db)
+
+    # =========================================================================
+    # DEFAULT CONFIGURATION
+    # =========================================================================
+
+    if home is None:
+        return ReadHome(
+            id=0,
+            sitename="Ecommerce",
+            intro="",
+            logo_key=None,
+            banner_key=None,
+        )
+
+    # =========================================================================
+    # PUBLIC CONFIGURATION
+    # =========================================================================
+
+    return ReadHome(
+        id=home.id,
+        sitename=home.sitename,
+        intro=home.intro or "",
+        logo_key=(
+            get_public_url(home.logo_key)
+            if home.logo_key
+            else None
+        ),
+        banner_key=(
+            get_public_url(home.banner_key)
+            if home.banner_key
+            else None
+        ),
+    )
+
+
+#old version 
 
 LOGO_MAX_SIZE = 5 * 1024 * 1024   # 5 MiB
 HERO_MAX_SIZE = 8 * 1024 * 1024   # 8 MiB
