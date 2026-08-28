@@ -5,6 +5,7 @@ HERO_MAX_SIZE = 8 * 1024 * 1024   # 8 MiB
 
 async def setup_home_logic(
     sitename: str,
+    current_user 
     db: AsyncSession,
     intro: Optional[str] = None,
     logo_key: Optional[UploadFile] = None,
