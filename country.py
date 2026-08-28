@@ -1,3 +1,101 @@
+
+
+LOGO_MAX_SIZE = 5 * 1024 * 1024   # 5 MiB
+HERO_MAX_SIZE = 8 * 1024 * 1024   # 8 MiB
+
+async def setup_home_logic(
+    sitename: str,
+    db: AsyncSession,
+    intro: Optional[str] = None,
+    logo_key: Optional[UploadFile] = None,
+    banner_key: UploadFile | None = None,
+   
+) -> dict[str, str]:
+    """
+    Create or update MAIN home configuration
+    Returns response with public image URLs
+    """
+    stmt = select(Home).where(Home.config_type == "MAIN")
+    current = (await db.execute(stmt)).scalars().first()
+
+    # Handle file updates (with env-specific prefix)
+    new_logo_key = await handle_file_update(
+        file=logo_key,
+        current_key=current.logo_key if current else None,
+        prefix= LOGO_FOLDER,
+        max_size=LOGO_MAX_SIZE,
+        validator=validate_image_file_securely,
+    )
+
+    new_banner_key = await handle_file_update(
+        file=banner_key,
+        current_key=current.banner_key if current else None,
+        prefix= BANNER_FOLDER,
+        max_size=HERO_MAX_SIZE,
+        validator=validate_image_file_securely,
+    )
+
+    try:
+        if current is None:
+            # First time creation
+            record = Home(
+                config_type="MAIN",
+                sitename=sitename,
+                intro=intro,
+                logo_key=new_logo_key,
+                banner_key=new_banner_key,
+            )
+            db.add(record)
+        else:
+            # Partial update
+            current.sitename = sitename
+
+            # Only update file keys if new file was provided
+            if logo_key is not None:
+                current.logo_key = new_logo_key
+            if banner_key is not None:
+                current.banner_key = new_banner_key
+
+            record = current
+
+        await db.commit()
+        await db.refresh(record)
+
+        return {"message":"Home settings updated successfully", "status":"success"}
+
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save home configuration: {str(e)}"
+        ) from e
+
+
+async def get_home_settings_logic(db: AsyncSession) -> ReadHome:
+    """
+    Fetch the MAIN home configuration with public URLs
+    """
+    stmt = select(Home).where(Home.config_type == "MAIN")
+    home = (await db.execute(stmt)).scalars().first()
+   
+
+    if not home:
+        return ReadHome(
+            id=0,
+            sitename="Ecommerce",
+            intro="",
+            logo_key="mylogo",
+            banner_key="banner",
+        )
+
+    return ReadHome(
+        id=home.id,
+        sitename=home.sitename, 
+        intro=home.intro,
+        logo_key=get_public_url(home.logo_key),
+        banner_key=get_public_url(home.banner_key),
+    )  
+#Country
 async def get_country_by_name(
     db: AsyncSession,
     name: str,
