@@ -1,3 +1,25 @@
+
+
+@router.post( "/setup",status_code=status.HTTP_201_CREATED,response_model=ReadHome,)
+async def setup_home(
+    db: DBDep, 
+    sitename: Annotated[str, Form(min_length=1, max_length=120)],
+    intro: Annotated[str | None, Form(max_length=1200)] = None,
+    logo_key: Annotated[UploadFile | None, File()] = None,
+    banner_key: Annotated[UploadFile | None, File()] = None,
+    current_user: ReadUser = AdminUser, 
+) -> dict[str, str]:
+    """
+    Endpoint for admin to configure home page settings
+    """
+    return await setup_home_logic(
+        db=db,
+        sitename=sitename,
+        intro=intro,
+        logo_key=logo_key,
+        banner_key=banner_key,
+        current_user=current_user,
+    )
 # improved version 
 """Home/site configuration business logic."""
 
