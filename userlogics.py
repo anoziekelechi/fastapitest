@@ -1,3 +1,82 @@
+
+#new
+async def get_current_user(
+    request: Request,
+    db: AsyncSession,
+) -> ReadUser:
+    """
+    Get current authenticated user from cookie.
+    
+    Loads permission ONCE here so all downstream
+    has_permission() calls are pure in-memory - no extra DB queries.
+    """
+    token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+    try:
+        payload = decode_access_token(token)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session",
+        )
+        
+
+    user = await get_user_by_id(db, payload.sub)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+        )
+
+    if user.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended. Please contact admin.",
+            headers={"X-Error-Code":"account_suspended"},
+        )
+
+    if not user.verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account not verified. Please verify your email.",
+            headers={"X-Error-Code":"account_unverified"},
+        )
+
+    # ✅ Load permission ONCE - only 1 extra query for non-admins with a group
+    # Admins skip this entirely (no query needed)
+    permission: str | None = None
+    if not user.is_admin and user.group_id is not None:
+        from api.users.models import Group
+        group = await db.get(Group, user.group_id)
+        if group:
+            permission = group.permission
+
+    # ✅ Build ReadUser and inject permission
+    read_user = ReadUser.model_validate(user)
+    read_user.permission = permission
+    return read_user
+
+
+async def get_authenticated_user(
+    request: Request,
+    db: DBDep,
+) -> ReadUser:
+    """
+    Dependency: Get current authenticated user.
+    
+    Usage:
+        @router.get("/profile")
+        async def profile(user: ReadUser = Depends(get_authenticated_user)):
+            ...
+    """
+    return await get_current_user(request=request, db=db)
+
+
+
 #api/users/logics.py
 """
 User business logic.
