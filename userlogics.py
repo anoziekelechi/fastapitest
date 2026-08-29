@@ -1,4 +1,15 @@
-
+async def get_optional_user(
+    request: Request,
+    db: DBDep,
+) -> ReadUser | None:
+    
+    token= request.cookies.get("access_token")
+    if not token:
+        return None
+    try:
+        return await get_current_user(request=request,db=db)
+    except HTTPException:
+        return None
 #new
 async def get_current_user(
     request: Request,
