@@ -1,419 +1,34 @@
-async def get_optional_user(
+async def logout_user(
     request: Request,
-    db: DBDep,
-) -> ReadUser | None:
-    
-    token= request.cookies.get("access_token")
-    if not token:
-        return None
-    try:
-        return await get_current_user(request=request,db=db)
-    except HTTPException:
-        return None
-#new
-async def get_current_user(
-    request: Request,
-    db: AsyncSession,
-) -> ReadUser:
-    """
-    Get current authenticated user from cookie.
-    
-    Loads permission ONCE here so all downstream
-    has_permission() calls are pure in-memory - no extra DB queries.
-    """
-    token = request.cookies.get("access_token")
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-        )
-    try:
-        payload = decode_access_token(token)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired session",
-        )
-        
-
-    user = await get_user_by_id(db, payload.sub)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-        )
-
-    if user.disabled:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account suspended. Please contact admin.",
-            headers={"X-Error-Code":"account_suspended"},
-        )
-
-    if not user.verified:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account not verified. Please verify your email.",
-            headers={"X-Error-Code":"account_unverified"},
-        )
-
-    # ✅ Load permission ONCE - only 1 extra query for non-admins with a group
-    # Admins skip this entirely (no query needed)
-    permission: str | None = None
-    if not user.is_admin and user.group_id is not None:
-        from api.users.models import Group
-        group = await db.get(Group, user.group_id)
-        if group:
-            permission = group.permission
-
-    # ✅ Build ReadUser and inject permission
-    read_user = ReadUser.model_validate(user)
-    read_user.permission = permission
-    return read_user
-
-
-async def get_authenticated_user(
-    request: Request,
-    db: DBDep,
-) -> ReadUser:
-    """
-    Dependency: Get current authenticated user.
-    
-    Usage:
-        @router.get("/profile")
-        async def profile(user: ReadUser = Depends(get_authenticated_user)):
-            ...
-    """
-    return await get_current_user(request=request, db=db)
-
-
-# =============================================================================
-# CSRF PROTECTION
-# =============================================================================
-
-async def generate_csrf_token(
-    user_id: int,
+    response: Response,
     redis: Redis,
-) -> str:
-    """Generate and store CSRF token in Redis."""
-    csrf_token = secrets.token_urlsafe(32)
-    expiry_seconds = settings.access_token_expire_minutes * 60
-    
-    csrf_data = CSRFData(
-        user_id=user_id,
-        expires_at=int(
-            (datetime.now(timezone.utc) + timedelta(
-                seconds=expiry_seconds
-            )).timestamp()
-        )
-    )
-    
-    await redis.set(
-        f"csrf:{user_id}:{csrf_token}",
-        json.dumps(csrf_data.model_dump()),
-        ex=expiry_seconds,
-    )
-    
-    return csrf_token
-
-
-async def verify_csrf_token(
-    user_id: int,
-    csrf_token: str,
-    redis: Redis,
-    #redis: RedisDep,
-) -> bool:
-    """Verify CSRF token against Redis."""
-    key = f"csrf:{user_id}:{csrf_token}"
-    raw = await redis.get(key)
-    
-    if not raw:
-        return False
-    
-    try:
-        csrf_info = CSRFData(**json.loads(raw))
-    except (json.JSONDecodeError, ValueError):
-        await redis.delete(key)
-        return False
-    
-    if csrf_info.user_id != user_id:
-        return False
-    
-    if csrf_info.expires_at < int(datetime.now(timezone.utc).timestamp()):
-        await redis.delete(key)
-        return False
-    
-    return True
-
-
-async def csrf_protection(
-    request: Request,
-    redis: Redis,
-    user_id: int,
-) -> None:
-    """
-    Validate CSRF token.
-    
-    Flow:
-    1. Browser sends cookie automatically (HttpOnly)
-    2. Frontend JS reads csrf_token cookie (NOT httponly)
-    3. Frontend sends csrf_token in X-CSRF-Token header
-    4. We compare header value against Redis
-    """
-    header_token = request.headers.get("X-CSRF-Token")
-    
-    if not header_token:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="CSRF token missing from headers"
-        )
-    
-    if not await verify_csrf_token(user_id, header_token, redis):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid or expired CSRF token"
-        )
-        
-async def require_csrf(
-    request: Request,
-    redis: RedisDep,
-    current_user: ReadUser = Depends(get_authenticated_user),
-) -> None:  
-    """
-    Dependency: Require valid CSRF token.
-    
-    Usage:
-        @router.post("/sensitive")
-        async def sensitive(_: None = Depends(require_csrf)):
-            ...
-    """
-    await csrf_protection(
-        request=request,
-        redis=redis,
-        user_id=current_user.id,
-    )
-
-#api/users/logics.py
-"""
-User business logic.
-
-Flow:
-    Registration: POST /register → OTP email → POST /verify-registration
-    Login:        POST /login    → OTP email → POST /verify-login
-    Logout:       POST /logout   (clears cookies + revokes tokens)
-"""
-import secrets
-import logging
-from typing import Any
-from datetime import datetime, timedelta, timezone
-
-import jwt
-from fastapi import BackgroundTasks, HTTPException, Request, Response, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
-
-from redis.asyncio import Redis
-from fastapi_mail import FastMail
-from api.core.auth import (
-    hash_password,
-    verify_password,
-    create_access_token,
-    create_refresh_token,
-    decode_access_token,
-    revoke_refresh_token,
-    set_auth_cookies,
-    clear_auth_cookies,
-    generate_csrf_token,
-    REFRESH_TOKEN_COOKIE,
-)
-from api.core.settings import get_settings
-from api.models.users import User
-from api.users.schemas import (
-    CreateUser,
-    LoginRequest,
-    ReadUser,
-    VerifyOtpRequest,
-    UpdateNames,
-    UpdatePassword,
-    VerifyPassword,
-    ResendOtpRequest,
-    ResetPassword,
-    RequestResetPassword,
-    RequestEmailChange,
-    VerifyEmailChange,
-)
-from api.models.home import Country
-from api.users.send_otp_email import send_otp
-logger = logging.getLogger(__name__)
-
-
-settings = get_settings()
-
-# OTP Configuration
-OTP_LENGTH = 6
-OTP_EXPIRE_MINUTES = 10
-OTP_RATE_LIMIT = 5
-OTP_RATE_WINDOW = 3600  # 1 hour
-
-
-
-
-
-
-
-
-
-
-def generate_otp() -> str:
-    """Generate a 6-digit OTP."""
-    return "".join(str(secrets.randbelow(10)) for _ in range(OTP_LENGTH))
-
-
-# =============================================================================
-# OTP
-# =============================================================================
-
-
-
-async def generate_and_send_otp(
-    user: User,
-    otp_type: str,
-    subject: str,
-    redis: Redis,
-    mailer: FastMail,
-    background_tasks: BackgroundTasks,
-    override_email:str | None = None,
-) -> None:
-    """
-    Generate OTP, store in Redis FIRST, then queue email delivery.
-
-    Design principle:
-        The OTP must be valid and usable the moment this function
-        returns, REGARDLESS of whether the email actually arrives.
-        Email delivery is best-effort; OTP validity is guaranteed.
-
-        If email delivery fails (even after retries), the user can
-        request a resend via the rate-limited resend endpoint - they
-        are never stuck waiting on an email that silently failed.
-
-    Args:
-        user: The user to send the OTP to
-        otp_type: "registration" or "login"
-        subject: Email subject line
-        redis: Redis client
-        mailer: FastMail instance
-        background_tasks: FastAPI background tasks queue
-        override_email if provided send otp to this email instead of user.email
-        used for change flow where OTP goes to New Email
-
-    Raises:
-        HTTPException: 429 if rate limit exceeded
-    """
-    user_id= get_user_id(user)
-    # STEP 1: Rate limit check (before generating anything)
-    rate_key = f"otp_rate:{user_id}:{otp_type}"
-    count = await redis.incr(rate_key)
-    if count == 1:
-        await redis.expire(rate_key, OTP_RATE_WINDOW)
-    if count > OTP_RATE_LIMIT:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many OTP requests. Try again in 1 hour."
-        )
-
-    # STEP 2: Generate OTP
-    otp = generate_otp()
-
-    # STEP 3: Store in Redis FIRST - this is the source of truth.
-    # OTP is valid and verifiable from this point forward,
-    # independent of email success/failure.
-    otp_key = f"otp:{otp}:{user.id}:{otp_type}"
-    await redis.set(
-        otp_key,
-        "1",
-        ex=int(timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds()),
-    )
-    #send to override email if provided
-    recipient_email=override_email if override_email else user.email
-
-    logger.info(
-        f"OTP stored in Redis for user {user.id} (type: {otp_type}). "
-        f"Queuing email delivery..."
-    )
-    
-
-    # STEP 4: Queue email delivery (best-effort, non-blocking).
-    # If this fails after all tenacity retries inside send_otp_email,
-    # the OTP above is STILL valid - user can request a resend.
-    background_tasks.add_task(
-        send_otp,
-        email=recipient_email,
-        otp=otp,
-        subject=subject,
-        otp_type=otp_type,
-        mailer=mailer,
-    )
-    
-    
-    
-    
-    
-# ______ RESEND OTP _______
-
-
-async def resend_otp(
-    data: ResendOtpRequest,
-    db: AsyncSession,
-    redis: Redis,
-    mailer: FastMail,
-    background_tasks: BackgroundTasks,
+    current_user: ReadUser,
 ) -> dict:
     """
-    Resend OTP for an in-progress registration or login flow.
+    Logout user.
     
-    Requires a valid (unexpired) account_token from the original
-    register/login request - prevents resending OTPs to arbitrary
-    emails without first passing credential validation.
-    
-    Subject to the same OTP_RATE_LIMIT as the original send.
+    - Revokes refresh token
+    - Clears all auth cookies
+    - Clears user OTPs from Redis
     """
-    user = await get_user_by_email(db, data.email)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
+    # Revoke refresh token
+    refresh_token = request.cookies.get(REFRESH_TOKEN_COOKIE)
+    if refresh_token:
+        await revoke_refresh_token(refresh_token, redis)
     
-    # Validate the session token is still active
-    token_prefix = "reg_attempt" if data.otp_type == "registration" else "login_attempt"
-    stored_id = await redis.get(f"{token_prefix}:{data.account_token}")
-    if not stored_id or int(stored_id) != user.id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Session expired - please start over"
-        )
+    # Clean up OTPs
+    otp_keys = await redis.keys(f"otp:*:{current_user.id}:*")
+    if otp_keys:
+        await redis.delete(*otp_keys)
     
-    subject = (
-        "Verify your account" if data.otp_type == "registration"
-        else "Your login OTP"
-    )
+    # ✅ Clear all cookies
+    clear_auth_cookies(response)
     
-    # ✅ Same function - rate limited, stores in Redis before queuing email
-    await generate_and_send_otp(
-        user=user,
-        otp_type=data.otp_type,
-        subject=subject,
-        redis=redis,
-        mailer=mailer,
-        background_tasks=background_tasks,
-    )
-    
-    return {"message": "A new OTP has been sent to your email"}
+    return {"message": "Logged out successfully"}
 
 
-# =============================================================================
-# REGISTRATION
-# =============================================================================
+
+
 @router.post(
     "/logout",
     status_code=status.HTTP_200_OK,
@@ -441,482 +56,9 @@ async def logout(
         current_user=current_user,
     )
 
-async def logout_user(
-    request: Request,
-    response: Response,
-    redis: Redis,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Logout user.
-    
-    - Revokes refresh token
-    - Clears all auth cookies
-    - Clears user OTPs from Redis
-    """
-    # Revoke refresh token
-    refresh_token = request.cookies.get(REFRESH_TOKEN_COOKIE)
-    if refresh_token:
-        await revoke_refresh_token(refresh_token, redis)
-    
-    # Clean up OTPs
-    otp_keys = await redis.keys(f"otp:*:{current_user.id}:*")
-    if otp_keys:
-        await redis.delete(*otp_keys)
-    
-    # ✅ Clear all cookies
-    clear_auth_cookies(response)
-    
-    return {"message": "Logged out successfully"}
 
 
 
-@router.put(
-    "/profile/names",
-    response_model=ReadUser,
-    status_code=status.HTTP_200_OK,
-    summary="Update user names",
-    dependencies=[Depends(require_csrf)],  # ✅ CSRF on mutations
-)
-async def update_names(
-    data: UpdateNames,
-    db: DBDep,
-    current_user: ReadUser = Depends(get_authenticated_user),
-) -> ReadUser:
-    """Update user's surname and/or othernames."""
-    return await update_user_names(
-        data=data,
-        db=db,
-        current_user=current_user,
-    )
-async def register_user(
-    data: CreateUser,
-    db: AsyncSession,
-    redis: Redis,
-    mailer: FastMail,
-    background_tasks: BackgroundTasks,
-    current_user: ReadUser | None = None,
-) -> dict:
-    """
-    Step 1: Register new user.
-    - block user if already logged in
-    - Validates email uniqueness
-    - Validates country exists
-    - Creates user (unverified)
-    - Sends OTP via email
-    - Returns registration token (anti-replay)
-    """
-    if current_user is not None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Logged in user cannot create account"
-        )
-    # Check email uniqueness
-    existing = await get_user_by_email(db, data.email)
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Email already registered"
-        )
-    
-    # Validate country exists
-    country = await db.get(Country, data.country_id)  # ✅ await
-    if not country:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Country not found"
-        )
-    # Create user
-    new_user = User(
-        surname=data.surname,
-        othernames=data.othernames,
-        email=data.email,
-        hashed_password=hash_password(data.password),
-        country_id=data.country_id,
-        is_admin=False,
-        disabled=False,
-        verified=False,
-        one_click=False,
-        payment_id=None,
-    )
-    db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
-    
-    # Create registration session token (anti-replay)
-    reg_token = secrets.token_urlsafe(32)
-    await redis.set(
-        f"reg_attempt:{reg_token}",
-        str(new_user.id),
-        ex=int(timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds()),
-    )
-    
-    # Send OTP
-    await generate_and_send_otp(
-        user=new_user,
-        otp_type="registration",  # ✅ Fixed typo: otp_yype → otp_type
-        subject="Verify your account",
-        redis=redis,
-        mailer=mailer,
-        background_tasks=background_tasks,
-    )
-    logger.info(f"New registration started for {new_user.email} (user_id={new_user.id})")
-    
-    return {
-        "message": "OTP sent to your email",
-        "email": new_user.email,
-        "reg_token": reg_token,
-    }
-
-
-async def verify_registration_otp(
-    data: VerifyOtpRequest,
-    db: AsyncSession,
-    redis: Redis,
-) -> ReadUser:
-    """
-    Step 2: Verify registration OTP.
-    
-    - Validates session token (anti-replay)
-    - Validates OTP
-    - Marks user as verified
-    """
-    # Get user
-    user = await get_user_by_email(db, data.email)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    if user.verified:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Account already verified"
-        )
-    
-    # Validate session token
-    stored_id = await redis.get(f"reg_attempt:{data.account_token}")
-    if not stored_id or int(stored_id) != user.id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Session expired or invalid"
-        )
-    await redis.delete(f"reg_attempt:{data.account_token}")
-    
-    # Validate OTP
-    otp_key = f"otp:{data.otp_code}:{user.id}:registration"
-    if not await redis.exists(otp_key):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OTP expired or invalid"
-        )
-    await redis.delete(otp_key)
-    
-    # Mark user as verified
-    user.verified = True
-    user.date_verified = datetime.now(timezone.utc)
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    
-    return ReadUser.model_validate(user)
-
-
-# =============================================================================
-# LOGIN
-# =============================================================================
-
-
-async def initiate_login(
-    data: LoginRequest,
-    db: AsyncSession,
-    redis: Redis,
-    mailer: FastMail,
-    background_tasks: BackgroundTasks,
-    current_user: ReadUser | None = None,
-) -> dict:
-    """
-    Step 1: Validate credentials, send OTP.
-    Allows disabled and unverified users through to give specific messages.
-    """
-    if current_user is not None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Already logged in"
-        )
-
-    # Validate credentials only (same error - prevents enumeration)
-    user = await get_user_by_email(db, data.email)
-    if not user or not verify_password(data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials"
-        )
-
-    # ✅ Removed: disabled and verified checks
-    # They now get specific messages via complete_login
-    # which checks status AFTER OTP verification
-
-    user_id = get_user_id(user)
-
-    # Rate limiting
-    rate_key = f"login_rate:{user_id}"
-    r: Any = redis
-    attempts = await r.incr(rate_key)
-    if attempts == 1:
-        await r.expire(
-            rate_key,
-            int(timedelta(minutes=15).total_seconds())
-        )
-    if attempts > 8:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many login attempts. Try again in 15 minutes."
-        )
-
-    # Anti-replay token
-    login_token = secrets.token_urlsafe(32)
-    await r.set(
-        f"login_attempt:{login_token}",
-        str(user_id),
-        ex=int(timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds()),
-    )
-
-    # Send OTP
-    await generate_and_send_otp(
-        user=user,
-        otp_type="login",
-        subject="Your login OTP",
-        redis=redis,
-        mailer=mailer,
-        background_tasks=background_tasks,
-    )
-
-    logger.info(f"Login OTP sent to user_id={user_id}")
-
-    return {
-        "message": "OTP sent to your email",
-        "email": user.email,
-        "login_token": login_token,
-    }
-
-
-async def complete_login(
-    data: VerifyOtpRequest,
-    db: AsyncSession,
-    redis: Redis,
-    response: Response,
-    current_user: ReadUser | None = None,
-) -> dict:
-    
-    
-    
-    if current_user is not None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Already logged in"
-        )
-    """
-    Step 2: Verify OTP and issue tokens.
-    Returns specific messages for disabled/unverified accounts.
-    """
-    user = await get_user_by_email(db, data.email)
-   
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials"
-        )
-
-    user_id = get_user_id(user)
-    r: Any = redis
-
-    # Validate session token
-    stored_id = await r.get(f"login_attempt:{data.account_token}")
-    if not stored_id or int(stored_id) != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Session expired or invalid"
-        )
-    await r.delete(f"login_attempt:{data.account_token}")
-
-    # Validate OTP
-    otp_key = f"otp:{data.otp_code}:{user_id}:login"
-    if not await r.exists(otp_key):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OTP expired or invalid"
-        )
-    await r.delete(otp_key)
-
-    # Clear rate limit
-    await r.delete(f"login_rate:{user_id}")
-
-    # ✅ Check account status AFTER OTP verification
-    # Return specific status codes so frontend can handle each case
-
-    if user.disabled:
-        logger.warning(f"Disabled user login attempt: user_id={user_id}")
-        return {
-            "status": "disabled",
-            "message": "Account suspended. Please contact admin.",
-            "email": user.email,
-        }
-
-    if not user.verified:
-        logger.info(f"Unverified user login attempt: user_id={user_id}")
-        return {
-            "status": "unverified",
-            "message": "Account not verified. Please check your email.",
-            "email": user.email,
-        }
-
-    # ✅ Active and verified - issue tokens
-    access_token = create_access_token(user_id)
-    refresh_token = await create_refresh_token(user_id, redis)
-    csrf_token = await generate_csrf_token(user_id, redis)
-
-    set_auth_cookies(
-        response=response,
-        access_token=access_token,
-        refresh_token=refresh_token,
-        csrf_token=csrf_token,
-    )
-
-    logger.info(f"Login successful for user_id={user_id}")
-
-    return {
-        "status": "success",
-        "message": "Login successful",
-    }
-
-
-
-
-
-
-# =============================================================================
-# LOGOUT
-# =============================================================================
-
-async def logout_user(
-    request: Request,
-    response: Response,
-    redis: Redis,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Logout user.
-    
-    - Revokes refresh token
-    - Clears all auth cookies
-    - Clears user OTPs from Redis
-    """
-    # Revoke refresh token
-    refresh_token = request.cookies.get(REFRESH_TOKEN_COOKIE)
-    if refresh_token:
-        await revoke_refresh_token(refresh_token, redis)
-    
-    # Clean up OTPs
-    otp_keys = await redis.keys(f"otp:*:{current_user.id}:*")
-    if otp_keys:
-        await redis.delete(*otp_keys)
-    
-    # ✅ Clear all cookies
-    clear_auth_cookies(response)
-    
-    return {"message": "Logged out successfully"}
-
-
-# =============================================================================
-# USER MANAGEMENT
-# =============================================================================
-
-
-
-
-
-async def get_authenticated_user(
-    request: Request,
-    db: AsyncSession ,
-) -> ReadUser:
-    """
-    Dependency: Get current authenticated user.
-    
-    Usage:
-        @router.get("/profile")
-        async def profile(user: ReadUser = Depends(get_authenticated_user)):
-            ...
-    """
-    return await get_current_user(request=request, db=db)
-
-
-async def get_optional_user(
-    request: Request,
-    db: AsyncSession,
-) -> ReadUser | None:
-    
-    token= request.cookies.get("access_token")
-    if not token:
-        return None
-    try:
-        return await get_current_user(request=request,db=db)
-    except HTTPException:
-        return None
-
-
-async def update_user_names(
-    data: UpdateNames,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> ReadUser:
-    """
-    Update authenticated user's surname and/or othernames.
-    
-    - At least one field must be provided
-    - Only updates fields that differ from current values
-    - Requires authentication (enforced at route level)
-    """
-    if data.surname is None and data.othernames is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field (surname or othernames) must be provided"
-        )
-    
-    user = await get_user_by_id(db, current_user.id)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    
-    updated_fields = []
-    
-    if data.surname is not None:
-        if data.surname == user.surname:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="New surname is the same as current surname"
-            )
-        user.surname = data.surname
-        updated_fields.append("surname")
-    
-    if data.othernames is not None:
-        if data.othernames == user.othernames:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="New othernames is the same as current othernames"
-            )
-        user.othernames = data.othernames
-        updated_fields.append("othernames")
-    
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    
-    logger.info(f"User {current_user.id} updated: {', '.join(updated_fields)}")
-    
-    return ReadUser.model_validate(user)
 
 async def change_password(
     data: UpdatePassword,
@@ -997,6 +139,57 @@ async def delete_account(
     clear_auth_cookies(response)
     
     return {"message": "Account deleted successfully"}
+
+
+
+
+
+@router.put(
+    "/password",
+    status_code=status.HTTP_200_OK,
+    summary="Change password",
+    dependencies=[Depends(require_csrf)],  # ✅ CSRF on mutations
+)
+async def update_password(
+    data: UpdatePassword,
+    db: DBDep,
+    current_user: ReadUser = Depends(get_authenticated_user),
+) -> dict:
+    """Change current user's password."""
+    return await change_password(
+        data=data,
+        db=db,
+        current_user=current_user,
+    )
+
+
+@router.delete(
+    "/account",
+    status_code=status.HTTP_200_OK,
+    summary="Delete user account",
+    dependencies=[Depends(require_csrf)],  # ✅ CSRF on destructive actions
+)
+async def delete_user_account(
+    data: VerifyPassword,
+    response: Response,
+    redis: RedisDep,
+    db: DBDep,
+    current_user: ReadUser = Depends(get_authenticated_user),
+) -> dict:
+    """
+    Permanently delete user account.
+    
+    - Requires password confirmation
+    - Cleans up all user data in Redis
+    - Clears auth cookies
+    """
+    return await delete_account(
+        data=data,
+        db=db,
+        redis=redis,
+        response=response,
+        current_user=current_user,
+    )
 
 
 
@@ -1257,267 +450,64 @@ async def reset_password(
 
 
 
-#________ Change Email _____________
 
-async def request_email_change(
-    data: RequestEmailChange,
-    db: AsyncSession,
-    redis: Redis,
-    mailer: FastMail,
+
+@router.post(
+    "/password/reset-request",
+    status_code=status.HTTP_200_OK,
+    summary="Request password reset OTP",
+)
+async def request_password_reset(
+    data: RequestResetPassword,
+    redis: RedisDep,
+    mailer: MailDep,
     background_tasks: BackgroundTasks,
-    current_user: ReadUser,             # ✅ Required - must be logged in
+    db: DBDep,
+    # ✅ Optional - not logged in is expected here
+    current_user: ReadUser | None = Depends(get_optional_user),
 ) -> dict:
     """
-    Step 1: Validate current password and send OTP to NEW email.
+    Request a password reset OTP.
 
-    Flow:
-        1. Require authentication (current_user is NOT optional here)
-        2. Fetch real user from DB (current_user is ReadUser schema, not ORM)
-        3. Verify current password matches
-        4. Ensure new email is different from current email
-        5. Ensure new email is not already taken by another account
-        6. Store new email + anti-replay token in Redis temporarily
-        7. Send OTP to NEW email (not old email - we're verifying the new one)
-
-    Why send OTP to new email (not old)?
-        We need to prove the user OWNS the new email address.
-        Sending to the old email only proves they're logged in,
-        which we already know. The OTP to the new email proves
-        they have access to it.
-
-    Args:
-        data: Current password + new email
-        db: Database session
-        redis: Redis client
-        mailer: FastMail instance
-        background_tasks: FastAPI background tasks queue
-        current_user: Authenticated user (required - raises 401 if missing)
-
-    Returns:
-        dict: message + email_change_token (needed for verify step)
-
-    Raises:
-        HTTPException: 401 if password incorrect
-        HTTPException: 400 if new email same as current
-        HTTPException: 409 if new email already registered
-        HTTPException: 429 if too many OTP requests
+    Blocked if already authenticated (use 'change password' instead).
+    Returns the same response whether email exists or not (prevents enumeration).
     """
-    # Fetch real ORM user (current_user is a ReadUser schema, not ORM object)
-    user = await get_user_by_id(db, current_user.id)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    
-    # Verify current password
-    if not verify_password(data.current_password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Current password is incorrect"
-        )
-    
-    # Ensure new email differs from current email
-    if data.new_email == user.email:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New email must be different from your current email"
-        )
-    
-    # Ensure new email is not already registered to another account
-    existing = await get_user_by_email(db, data.new_email)
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This email address is already registered to another account"
-        )
-    
-    user_id = get_user_id(user)
-    
-    # Store new email in Redis temporarily so verify step can use it
-    # without us passing it back in the response (which could be tampered with)
-    email_change_token = secrets.token_urlsafe(32)
-    
-    # Store both the user_id AND the new email under this token
-    await redis.set(
-        f"email_change:{email_change_token}",
-        f"{user_id}:{data.new_email}",   # ← store both together
-        ex=int(timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds()),
-    )
-    
-    # pass real user + override_email
-    await generate_and_send_otp(
-        user=user,                 # ← OTP goes to NEW email
-        otp_type="email_change",
-        subject="Verify your new email address",
+    return await request_reset_password(
+        data=data,
+        db=db,
         redis=redis,
         mailer=mailer,
         background_tasks=background_tasks,
-        override_email=data.new_email,
+        current_user=current_user,
     )
-    
-    logger.info(
-        f"Email change OTP sent for user_id={user_id}. "
-        f"New email: {data.new_email}"
-    )
-    
-    return {
-        "message": "An OTP has been sent to your new email address. "
-                   "Please verify it to complete the email change.",
-        "email_change_token": email_change_token,
-    }
 
 
-async def verify_new_email(
-    data: VerifyEmailChange,
-    db: AsyncSession,
-    redis: Redis,
-    current_user: ReadUser,             # ✅ Required - must still be logged in
-) -> ReadUser:
+@router.post(
+    "/password/reset",
+    status_code=status.HTTP_200_OK,
+    summary="Complete password reset with OTP",
+)
+async def complete_password_reset(
+    data: ResetPassword,
+    redis: RedisDep,
+    db: DBDep,
+   
+    # ✅ Optional - not logged in is expected here
+    current_user: ReadUser | None = Depends(get_optional_user),
+) -> dict:
     """
-    Step 2: Verify OTP sent to new email and update email in DB.
+    Complete password reset.
 
-    Flow:
-        1. Require authentication (session must still be valid)
-        2. Validate email_change_token (anti-replay, retrieves new email)
-        3. Ensure token belongs to this logged-in user (not another user's token)
-        4. Validate OTP sent to new email
-        5. Final check: new email still not taken (race condition guard)
-        6. Update email in DB
-        7. Clean up Redis
-        8. Return updated user profile
+    Requires OTP from reset-request step and the reset_token
+    returned in that response (anti-replay protection).
 
-    Why require auth in step 2?
-        Prevents someone who gets hold of the email_change_token
-        (e.g. from a shared screen or shoulder surfing) from completing
-        the change without also having the active session cookie.
-        Both the session AND the token are required.
-
-    Args:
-        data: OTP code + email_change_token from step 1
-        db: Database session
-        redis: Redis client
-        current_user: Authenticated user (must match token owner)
-
-    Returns:
-        ReadUser: Updated user profile with new email
-
-    Raises:
-        HTTPException: 400 if token invalid/expired
-        HTTPException: 403 if token belongs to different user
-        HTTPException: 401 if OTP invalid/expired
-        HTTPException: 409 if new email taken (race condition)
-        HTTPException: 404 if user not found
+    Invalidates all existing sessions on success (forces re-login).
     """
-    # Fetch real ORM user
-    user = await get_user_by_id(db, current_user.id)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    
-    user_id = get_user_id(user)
-    
-    # Validate email_change_token and retrieve stored data
-    stored_data = await redis.get(f"email_change:{data.email_change_token}")
-    if not stored_data:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email change session expired or invalid. "
-                   "Please request a new OTP."
-        )
-    
-    # Parse stored data: "user_id:new_email"
-    try:
-        stored_user_id_str, new_email = stored_data.split(":", 1)
-        stored_user_id = int(stored_user_id_str)
-    except (ValueError, AttributeError):
-        # Corrupted data - clean up and reject
-        await redis.delete(f"email_change:{data.email_change_token}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid session data. Please request a new OTP."
-        )
-    
-    # Ensure token belongs to the currently logged-in user
-    # Prevents one user from using another user's email change token
-    if stored_user_id != user_id:
-        logger.warning(
-            f"Email change token mismatch: "
-            f"token owner={stored_user_id}, "
-            f"requester={user_id}"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This email change token does not belong to your account"
-        )
-    
-    # Validate OTP (was sent to new_email, stored under new_email's user_id)
-    otp_key = f"otp:{data.otp_code}:{user_id}:email_change"
-    if not await redis.exists(otp_key):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OTP expired or invalid"
-        )
-    
-    # Race condition guard: check new email still isn't taken
-    # (someone else could have registered it between step 1 and step 2)
-    existing = await get_user_by_email(db, new_email)
-    if existing and get_user_id(existing) != user_id:
-        # Clean up since we can't proceed
-        await redis.delete(f"email_change:{data.email_change_token}")
-        await redis.delete(otp_key)
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This email address has just been registered by another account. "
-                   "Please choose a different email."
-        )
-    
-    # ✅ All checks passed - update email
-    old_email = user.email
-    user.email = new_email
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    
-    # Clean up Redis
-    await redis.delete(f"email_change:{data.email_change_token}")
-    await redis.delete(otp_key)
-    
-    logger.info(
-        f"Email changed successfully for user_id={user_id}. "
-        f"{old_email} → {new_email}"
-    )
-    
-    return ReadUser.model_validate(user)
+    return await reset_password(
+        data=data,
+        db=db,
+        redis=redis,
+        current_user=current_user,
+)
 
 
-
-
-# =============================================================================
-# PERMISSIONS
-# =============================================================================
-
-async def has_permission(user: ReadUser, required_perm: str) -> bool:
-    """Check if user has required permission."""
-    if user.is_admin:
-        return True
-    # Permission check requires loading group - do in route if needed
-    return False
-
-
-def require_admin():
-    """Dependency: require admin user."""
-    async def dependency(
-        request: Request,
-        db: AsyncSession,
-    ) -> ReadUser:
-        user = await get_current_user(request, db)
-        if not user.is_admin:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Admin access required"
-            )
-        return user
-    return dependency
