@@ -1,3 +1,135 @@
+
+async def complete_login(
+    data: VerifyOtpRequest,
+    db: AsyncSession,
+    redis: Redis,
+    response: Response,
+    current_user: ReadUser | None = None,
+) -> dict:
+    """
+    Step 2: Verify login OTP and complete authentication.
+
+    Validation + consumption of the login session token and OTP
+    is performed atomically.
+    """
+
+    # ---------------------------------------------------------
+    # Already logged in
+    # ---------------------------------------------------------
+    if current_user is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Already logged in",
+        )
+
+    # ---------------------------------------------------------
+    # Get user
+    # ---------------------------------------------------------
+    user = await get_user_by_email(db, data.email)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+
+    user_id = get_user_id(user)
+
+    login_attempt_key = f"login_attempt:{data.account_token}"
+    otp_key = f"otp:{data.otp_code}:{user_id}:login"
+
+    # ---------------------------------------------------------
+    # Atomic validate + consume (register_script version)
+    # ---------------------------------------------------------
+    # Returns:
+    #   1  → both keys were valid and have been deleted
+    #   0  → login session invalid / expired
+    #  -1  → OTP invalid / expired
+
+    lua_script = """
+    local stored = redis.call("GET", KEYS[1])
+    if (not stored) or (stored \~= ARGV[1]) then
+        return 0
+    end
+
+    local otp_exists = redis.call("EXISTS", KEYS[2])
+    if otp_exists == 0 then
+        return -1
+    end
+
+    -- Both valid → consume them
+    redis.call("DEL", KEYS[1])
+    redis.call("DEL", KEYS[2])
+    return 1
+    """
+
+    script = redis.register_script(lua_script)
+
+    result = await script(
+        keys=[login_attempt_key, otp_key],
+        args=[str(user_id)],
+    )
+
+    if result == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session expired or invalid",
+        )
+
+    if result == -1:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OTP expired or invalid",
+        )
+
+    # ---------------------------------------------------------
+    # Clear login rate limit
+    # ---------------------------------------------------------
+    await redis.delete(f"login_rate:{user_id}")
+
+    # ---------------------------------------------------------
+    # Account status checks
+    # ---------------------------------------------------------
+    if user.disabled:
+        logger.warning(f"Disabled user login attempt: user_id={user_id}")
+        return {
+            "status": "disabled",
+            "message": "Account suspended. Please contact admin.",
+            "email": user.email,
+        }
+
+    if not user.verified:
+        logger.info(f"Unverified user login attempt: user_id={user_id}")
+        return {
+            "status": "unverified",
+            "message": "Account not verified. Please verify your email.",
+            "email": user.email,
+        }
+
+    # ---------------------------------------------------------
+    # Issue tokens
+    # ---------------------------------------------------------
+    access_token = create_access_token(user_id)
+    refresh_token = await create_refresh_token(user_id, redis)
+    csrf_token = await generate_csrf_token(user_id, redis)
+
+    set_auth_cookies(
+        response=response,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        csrf_token=csrf_token,
+    )
+
+    logger.info(f"Login successful for user_id={user_id}")
+
+    return {
+        "status": "success",
+        "message": "Login successful",
+    }
+
+
+
+
+
 async def logout_user(
     request: Request,
     response: Response,
