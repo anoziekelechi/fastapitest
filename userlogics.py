@@ -400,3 +400,160 @@ async def resend_otp(
     )
     
     return {"message": "A new OTP has been sent to your email"}
+
+
+
+
+
+
+#=================================================================
+# RESEND OTP FOR UNVERIFIED USERS
+#================================================================
+
+
+async def resend_verification(
+    data: ResendOtpRequest,         # ✅ Reuse existing schema
+    db: AsyncSession,
+    redis: Redis,
+    mailer: FastMail,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """
+    Resend verification OTP to unverified user.
+    Wraps existing resend_otp logic with unverified-specific checks.
+    """
+    # Verify user exists and is actually unverified
+    user = await get_user_by_email(db, data.email)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    if user.verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Account is already verified. Please login."
+        )
+    if user.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is suspended. Please contact admin."
+        )
+
+    # ✅ Delegate to existing resend_otp - no code duplication!
+    return await resend_otp(
+        data=ResendOtpRequest(
+            email=data.email,
+            account_token=data.account_token,
+            otp_type="registration",        # ← Always registration for unverified
+        ),
+        db=db,
+        redis=redis,
+        mailer=mailer,
+        background_tasks=background_tasks,
+    )
+
+
+
+
+
+
+
+# ===============================================================================
+# CONTACT ADMIN
+#================================================================================
+
+async def handle_disabled_account(
+    data: ContactAdminMessage,
+    db: AsyncSession,
+    redis: Redis,
+    mailer: FastMail,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """
+    Handle contact form from disabled users.
+
+    Flow:
+        1. Verify user exists and IS disabled
+        2. Rate limit (max 3 per hour)
+        3. Resolve support email:
+           - Try user's country.email_support first
+           - Fall back to settings.mail_username
+        4. Send message to support email
+        5. Return confirmation
+
+    Args:
+        data: Email + message from user
+        db: Database session
+        redis: Redis client
+        mailer: FastMail instance
+        background_tasks: FastAPI background tasks
+
+    Returns:
+        dict: Confirmation message
+    """
+    r: Any = redis
+
+    # Verify user exists and is disabled
+    user = await get_user_by_email(db, data.email)
+    if not user or not user.disabled:
+        # Generic response - don't reveal account status
+        return {
+            "message": "If your account exists, "
+                       "your message has been sent to our support team."
+        }
+
+    user_id = get_user_id(user)
+
+    # Rate limit - max 3 per hour
+    rate_key = f"contact_admin_rate:{user_id}"
+    count = await r.incr(rate_key)
+    if count == 1:
+        await r.expire(rate_key, 3600)
+    if count > 3:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests. Please try again in 1 hour."
+        )
+
+    # ✅ Resolve support email
+    # Priority: country.email_support → settings.mail_username
+    support_email = settings.mail_username  # fallback
+
+    if user.country_id:
+        country = await db.get(Country, user.country_id)
+        if country and country.email_support:
+            support_email = country.email_support
+            logger.info(
+                f"Using country support email: {support_email} "
+                f"for country_id={user.country_id}"
+            )
+        else:
+            logger.info(
+                f"No country support email found. "
+                f"Using default: {support_email}"
+            )
+    else:
+        logger.info(
+            f"User has no country. Using default: {support_email}"
+        )
+
+    # ✅ Send message to support email in background
+    background_tasks.add_task(
+        send_support_message,
+        support_email=support_email,
+        user_email=data.email,
+        message=data.message,
+        mailer=mailer,
+    )
+
+    logger.info(
+        f"Disabled user {data.email} (id={user_id}) "
+        f"sent contact message to {support_email}"
+    )
+
+    return {
+        "message": "Your message has been sent to our support team. "
+                   "We will review your account and get back to you."
+          }
+
