@@ -1,4 +1,66 @@
 #new 
+async def handle_disabled_account(
+    data: ContactAdminMessage,
+    db: AsyncSession,
+    redis: Redis,
+    mailer: FastMail,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """
+    Handle contact form from disabled users.
+    """
+
+    user = await get_user_by_email(db, data.email)
+
+    # Generic response – don't reveal account status
+    if not user or not user.disabled:
+        return {
+            "message": "If your account exists, "
+                       "your message has been sent to our support team."
+        }
+
+    user_id = get_user_id(user)
+
+    # Rate limit – max 3 per hour
+    rate_key = f"contact_admin_rate:{user_id}"
+    count = await redis.incr(rate_key)
+    if count == 1:
+        await redis.expire(rate_key, 3600)
+    if count > 3:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests. Please try again in 1 hour.",
+        )
+
+    # Resolve support email (country → fallback)
+    support_email = settings.mail_username
+
+    if user.country_id:
+        country = await db.get(Country, user.country_id)
+        if country and country.email_support:
+            support_email = country.email_support
+
+    background_tasks.add_task(
+        send_support_message,
+        support_email=support_email,
+        user_email=data.email,
+        message=data.message,
+        mailer=mailer,
+    )
+
+    logger.info(
+        "Disabled user %s (id=%s) contacted support → %s",
+        data.email,
+        user_id,
+        support_email,
+    )
+
+    return {
+        "message": "Your message has been sent to our support team. "
+                   "We will review your account and get back to you."
+    }
+
+
 async def initiate_login(
     data: LoginRequest,
     db: AsyncSession,
