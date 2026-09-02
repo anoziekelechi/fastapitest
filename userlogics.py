@@ -1,4 +1,334 @@
+#updated reset password 
+import secrets
+from datetime import timedelta
 
+from fastapi import BackgroundTasks, HTTPException, status
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi_mail import FastMail
+
+
+async def request_reset_password(
+    data: RequestResetPassword,
+    db: AsyncSession,
+    redis: Redis,
+    mailer: FastMail,
+    background_tasks: BackgroundTasks,
+    current_user: ReadUser | None = None,
+) -> dict:
+    """
+    Step 1: Request a password reset OTP.
+
+    Flow:
+        1. Block if user is already logged in.
+        2. Look up the email without revealing whether it exists.
+        3. Silently ignore unknown/disabled accounts.
+        4. Generate and send the OTP.
+        5. Only after successful OTP generation, create the reset session token.
+        6. Return the reset session token.
+
+    Security:
+        - Prevents logged-in users from using password reset.
+        - Uses a generic response to prevent email enumeration.
+        - Does not create a reset session when OTP generation fails.
+        - Reset session token is cryptographically random.
+    """
+
+    # -------------------------------------------------------------------------
+    # 1. Block logged-in users
+    # -------------------------------------------------------------------------
+    if current_user is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Logged in users cannot use password reset. "
+                "Use 'change password' instead."
+            ),
+        )
+
+    # -------------------------------------------------------------------------
+    # 2. Generic response
+    # -------------------------------------------------------------------------
+    generic_response = {
+        "message": "If this email is registered, an OTP has been sent.",
+    }
+
+    # -------------------------------------------------------------------------
+    # 3. Look up user
+    # -------------------------------------------------------------------------
+    user = await get_user_by_email(db, data.email)
+
+    if not user:
+        logger.info("Password reset requested for unknown email")
+        return generic_response
+
+    # -------------------------------------------------------------------------
+    # 4. Silently ignore disabled accounts
+    # -------------------------------------------------------------------------
+    if user.disabled:
+        logger.warning("Password reset requested for disabled account")
+        return generic_response
+
+    user_id = get_user_id(user)
+
+    # -------------------------------------------------------------------------
+    # 5. Generate + send OTP
+    # -------------------------------------------------------------------------
+    try:
+        await generate_and_send_otp(
+            user=user,
+            otp_type="password_reset",
+            subject="Reset your password",
+            redis=redis,
+            mailer=mailer,
+            background_tasks=background_tasks,
+        )
+
+    except HTTPException as e:
+        # Rate limiting is safe to expose
+        if e.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            raise
+
+        logger.error(
+            f"OTP generation failed for password reset "
+            f"(user_id={user_id}): {e.detail}"
+        )
+        return generic_response
+
+    except Exception:
+        logger.exception(
+            f"Unexpected OTP generation failure for password reset "
+            f"(user_id={user_id})"
+        )
+        return generic_response
+
+    # -------------------------------------------------------------------------
+    # 6. Create reset session token ONLY after OTP generation succeeds
+    # -------------------------------------------------------------------------
+    reset_token = secrets.token_urlsafe(32)
+
+    reset_ttl = int(
+        timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds()
+    )
+
+    await redis.set(
+        f"reset_attempt:{reset_token}",
+        str(user_id),
+        ex=reset_ttl,
+    )
+
+    logger.info(f"Password reset OTP sent for user_id={user_id}")
+
+    # -------------------------------------------------------------------------
+    # 7. Return reset token
+    # -------------------------------------------------------------------------
+    return {
+        "message": "If this email is registered, an OTP has been sent.",
+        "reset_token": reset_token,
+    }
+
+
+async def reset_password(
+    data: ResetPassword,
+    db: AsyncSession,
+    redis: Redis,
+    current_user: ReadUser | None = None,
+) -> dict:
+    """
+    Step 2: Verify OTP and set a new password.
+
+    Flow:
+        1. Block if user is already logged in.
+        2. Look up user by email.
+        3. Validate reset session token.
+        4. Retrieve OTP from Redis.
+        5. Verify submitted OTP.
+        6. Atomically consume OTP.
+        7. Ensure new password differs from current password.
+        8. Update password.
+        9. Commit database transaction.
+        10. Delete reset session.
+        11. Invalidate all refresh tokens.
+        12. Return success.
+
+    Security:
+        - Reset requires both email + reset session token + OTP.
+        - OTP is consumed atomically.
+        - Reset session expires automatically.
+        - Existing refresh sessions are revoked via revoke_all_user_tokens.
+        - User must authenticate again after password reset.
+    """
+
+    # -------------------------------------------------------------------------
+    # 1. Block logged-in users
+    # -------------------------------------------------------------------------
+    if current_user is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Logged in users cannot use password reset. "
+                "Use 'change password' instead."
+            ),
+        )
+
+    # -------------------------------------------------------------------------
+    # 2. Look up user
+    # -------------------------------------------------------------------------
+    user = await get_user_by_email(db, data.email)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    user_id = get_user_id(user)
+
+    # -------------------------------------------------------------------------
+    # 3. Validate reset session token
+    # -------------------------------------------------------------------------
+    reset_key = f"reset_attempt:{data.reset_token}"
+
+    stored_id = await redis.get(reset_key)
+
+    if not stored_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Reset session expired or invalid. "
+                "Please request a new OTP."
+            ),
+        )
+
+    if isinstance(stored_id, bytes):
+        stored_id = stored_id.decode()
+
+    try:
+        stored_user_id = int(stored_id)
+    except (TypeError, ValueError):
+        await redis.delete(reset_key)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Reset session expired or invalid. "
+                "Please request a new OTP."
+            ),
+        )
+
+    if stored_user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Reset session expired or invalid. "
+                "Please request a new OTP."
+            ),
+        )
+
+    # -------------------------------------------------------------------------
+    # 4. Get stored OTP
+    # -------------------------------------------------------------------------
+    # Expected Redis key: otp:password_reset:{user_id}
+    otp_key = f"otp:password_reset:{user_id}"
+
+    stored_otp = await redis.get(otp_key)
+
+    if not stored_otp:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OTP expired or invalid",
+        )
+
+    if isinstance(stored_otp, bytes):
+        stored_otp = stored_otp.decode()
+
+    # -------------------------------------------------------------------------
+    # 5. Verify submitted OTP
+    # -------------------------------------------------------------------------
+    if not secrets.compare_digest(str(data.otp_code), str(stored_otp)):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OTP expired or invalid",
+        )
+
+    # -------------------------------------------------------------------------
+    # 6. Atomically consume OTP
+    # -------------------------------------------------------------------------
+    consumed_otp = await redis.getdel(otp_key)
+
+    if not consumed_otp:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OTP expired or invalid",
+        )
+
+    if isinstance(consumed_otp, bytes):
+        consumed_otp = consumed_otp.decode()
+
+    if not secrets.compare_digest(str(data.otp_code), str(consumed_otp)):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OTP expired or invalid",
+        )
+
+    # -------------------------------------------------------------------------
+    # 7. Ensure new password differs from current password
+    # -------------------------------------------------------------------------
+    if verify_password(data.new_password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from your current password",
+        )
+
+    # -------------------------------------------------------------------------
+    # 8. Update password
+    # -------------------------------------------------------------------------
+    user.hashed_password = hash_password(data.new_password)
+    db.add(user)
+
+    # -------------------------------------------------------------------------
+    # 9. Commit password change
+    # -------------------------------------------------------------------------
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+
+        # OTP has already been consumed – this is intentional.
+        logger.exception(
+            f"Password reset database commit failed (user_id={user_id})"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to reset password. Please try again.",
+        )
+
+    # -------------------------------------------------------------------------
+    # 10. Delete reset session
+    # -------------------------------------------------------------------------
+    await redis.delete(reset_key)
+
+    # -------------------------------------------------------------------------
+    # 11. Invalidate ALL existing refresh tokens
+    # -------------------------------------------------------------------------
+    # Uses the shared helper that works with the JTI-based design.
+    await revoke_all_user_tokens(user_id, redis)
+
+    # -------------------------------------------------------------------------
+    # 12. Success
+    # -------------------------------------------------------------------------
+    logger.info(
+        f"Password reset successful for user_id={user_id}. "
+        "All refresh tokens invalidated."
+    )
+
+    return {
+        "message": (
+            "Password reset successful. "
+            "Please login with your new password."
+        )
+    }
+#new
 async def complete_login(
     data: VerifyOtpRequest,
     db: AsyncSession,
