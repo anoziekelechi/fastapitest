@@ -1,4 +1,118 @@
+#new 
+async def initiate_login(
+    data: LoginRequest,
+    db: AsyncSession,
+    redis: Redis,
+    mailer: FastMail,
+    background_tasks: BackgroundTasks,
+    current_user: ReadUser | None = None,
+) -> dict:
+    """
+    Step 1: Validate credentials and send login OTP.
 
+    Notes:
+    - Disabled and unverified users are intentionally allowed
+      to reach complete_login so the frontend can show
+      specific status messages.
+    - The anti-replay login token is created only after
+      the OTP has been successfully generated.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Already logged in
+    # ------------------------------------------------------------------
+    if current_user is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Already logged in",
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Validate credentials (same error → prevents enumeration)
+    # ------------------------------------------------------------------
+    user = await get_user_by_email(db, data.email)
+
+    if user is None or not verify_password(data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+
+    user_id = get_user_id(user)
+
+    # ------------------------------------------------------------------
+    # 3. Rate limiting
+    # ------------------------------------------------------------------
+    rate_key = f"login_rate:{user_id}"
+
+    attempts = await redis.incr(rate_key)
+    if attempts == 1:
+        await redis.expire(
+            rate_key,
+            int(timedelta(minutes=15).total_seconds()),
+        )
+
+    if attempts > 8:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Try again in 15 minutes.",
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Send OTP first
+    # ------------------------------------------------------------------
+    try:
+        await generate_and_send_otp(
+            user=user,
+            otp_type="login",
+            subject="Your login OTP",
+            redis=redis,
+            mailer=mailer,
+            background_tasks=background_tasks,
+        )
+    except HTTPException as e:
+        # Re-raise rate-limit errors from the OTP helper
+        if e.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            raise
+
+        logger.error(
+            "Failed to send login OTP for user_id=%s: %s",
+            user_id,
+            e.detail,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send OTP. Please try again.",
+        )
+    except Exception:
+        logger.exception(
+            "Unexpected error while sending login OTP for user_id=%s",
+            user_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send OTP. Please try again.",
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Create anti-replay login token ONLY after OTP succeeds
+    # ------------------------------------------------------------------
+    login_token = secrets.token_urlsafe(32)
+
+    await redis.set(
+        f"login_attempt:{login_token}",
+        str(user_id),
+        ex=int(timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds()),
+    )
+
+    logger.info("Login OTP sent to user_id=%s", user_id)
+
+    return {
+        "message": "OTP sent to your email",
+        "email": user.email,
+        "login_token": login_token,
+    }
+#old
 async def register_user(
     data: CreateUser,
     db: AsyncSession,
