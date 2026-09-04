@@ -1,3 +1,31 @@
+async def logout_user(
+    request: Request,
+    response: Response,
+    redis: Redis,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Logout user.
+    
+    - Revokes refresh token
+    - Clears all auth cookies
+    - Clears user OTPs from Redis
+    """
+    # Revoke refresh token
+    refresh_token = request.cookies.get(REFRESH_TOKEN_COOKIE)
+    if refresh_token:
+        await revoke_refresh_token(refresh_token, redis)
+    
+    # Clean up OTPs
+    otp_keys = await redis.keys(f"otp:*:{current_user.id}:*")
+    if otp_keys:
+        await redis.delete(*otp_keys)
+    
+    # ✅ Clear all cookies
+    clear_auth_cookies(response)
+    
+    return {"message": "Logged out successfully"}
+
 async def initiate_login(
     data: LoginRequest,
     db: AsyncSession,
