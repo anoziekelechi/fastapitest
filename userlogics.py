@@ -1,3 +1,4 @@
+
 async def logout_user(
     request: Request,
     response: Response,
@@ -5,26 +6,31 @@ async def logout_user(
     current_user: ReadUser,
 ) -> dict:
     """
-    Logout user.
-    
-    - Revokes refresh token
-    - Clears all auth cookies
-    - Clears user OTPs from Redis
+    Logout current device.
+
+    - Revokes the current refresh token
+    - Clears auth cookies
+    - Removes any leftover OTP keys for this user
     """
-    # Revoke refresh token
     refresh_token = request.cookies.get(REFRESH_TOKEN_COOKIE)
     if refresh_token:
         await revoke_refresh_token(refresh_token, redis)
-    
-    # Clean up OTPs
-    otp_keys = await redis.keys(f"otp:*:{current_user.id}:*")
-    if otp_keys:
-        await redis.delete(*otp_keys)
-    
-    # ✅ Clear all cookies
+
+    user_id = current_user.id
+
+    # Final OTP key shape: otp:{user_id}:{otp_type}
+    otp_keys = [
+        f"otp:{user_id}:login",
+        f"otp:{user_id}:registration",
+        f"otp:{user_id}:email_change",
+        f"otp:{user_id}:password_reset",
+    ]
+    await redis.delete(*otp_keys)
+
     clear_auth_cookies(response)
-    
+
     return {"message": "Logged out successfully"}
+
 
 async def initiate_login(
     data: LoginRequest,
@@ -35,19 +41,15 @@ async def initiate_login(
     current_user: ReadUser | None = None,
 ) -> dict:
     """
-    Step 1: Validate credentials and send login OTP.
+    Step 1: Validate credentials and start login OTP.
 
-    Notes:
-    - Disabled and unverified users are intentionally allowed
-      to reach complete_login so the frontend can show
-      specific status messages.
-    - The anti-replay login token is created only after
-      the OTP has been successfully generated.
+    Only verified + active users receive an OTP and login_attempt token.
+
+    Responses:
+        status=disabled   → frontend → contact admin (no OTP)
+        status=unverified → frontend → resend verification (no OTP)
+        status=otp_required → frontend → OTP screen → complete_login
     """
-
-    # ------------------------------------------------------------------
-    # 1. Already logged in
-    # ------------------------------------------------------------------
     if current_user is not None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -55,7 +57,7 @@ async def initiate_login(
         )
 
     # ------------------------------------------------------------------
-    # 2. Validate credentials (same error → prevents enumeration)
+    # Credentials (same error → no enumeration)
     # ------------------------------------------------------------------
     user = await get_user_by_email(db, data.email)
 
@@ -68,17 +70,34 @@ async def initiate_login(
     user_id = get_user_id(user)
 
     # ------------------------------------------------------------------
-    # 3. Rate limiting
+    # Account status BEFORE any OTP
+    # ------------------------------------------------------------------
+    if user.disabled:
+        logger.warning("Disabled user login attempt: user_id=%s", user_id)
+        return {
+            "status": "disabled",
+            "message": "Account suspended. Please contact admin.",
+            "email": user.email,
+        }
+
+    if not user.verified:
+        logger.info("Unverified user login attempt: user_id=%s", user_id)
+        return {
+            "status": "unverified",
+            "message": "Account not verified. Please verify your email.",
+            "email": user.email,
+        }
+
+    # ------------------------------------------------------------------
+    # Rate limit (only for users who can log in)
     # ------------------------------------------------------------------
     rate_key = f"login_rate:{user_id}"
-
     attempts = await redis.incr(rate_key)
     if attempts == 1:
         await redis.expire(
             rate_key,
             int(timedelta(minutes=15).total_seconds()),
         )
-
     if attempts > 8:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -86,7 +105,7 @@ async def initiate_login(
         )
 
     # ------------------------------------------------------------------
-    # 4. Send OTP first
+    # Send login OTP (verified + active only)
     # ------------------------------------------------------------------
     try:
         await generate_and_send_otp(
@@ -98,10 +117,8 @@ async def initiate_login(
             background_tasks=background_tasks,
         )
     except HTTPException as e:
-        # Re-raise rate-limit errors from the OTP helper
         if e.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
             raise
-
         logger.error(
             "Failed to send login OTP for user_id=%s: %s",
             user_id,
@@ -122,10 +139,9 @@ async def initiate_login(
         )
 
     # ------------------------------------------------------------------
-    # 5. Create anti-replay login token ONLY after OTP succeeds
+    # Anti-replay session only after OTP is stored
     # ------------------------------------------------------------------
     login_token = secrets.token_urlsafe(32)
-
     await redis.set(
         f"login_attempt:{login_token}",
         str(user_id),
@@ -135,12 +151,16 @@ async def initiate_login(
     logger.info("Login OTP sent to user_id=%s", user_id)
 
     return {
+        "status": "otp_required",
         "message": "OTP sent to your email",
         "email": user.email,
         "login_token": login_token,
     }
-    
-    
+
+
+
+
+
 async def complete_login(
     data: VerifyOtpRequest,
     db: AsyncSession,
@@ -149,25 +169,37 @@ async def complete_login(
     current_user: ReadUser | None = None,
 ) -> dict:
     """
-    Step 2: Verify login OTP and complete authentication.
+    Step 2: Verify login OTP and issue cookies.
 
-    Validation + consumption of the login session token and OTP
-    is performed atomically.
+    Flow:
+        1. Reject already-authenticated users.
+        2. Find user.
+        3. Validate login attempt session.
+        4. Verify current account status.
+        5. Atomically verify + consume hashed OTP.
+        6. Consume login session.
+        7. Clear login rate limit.
+        8. Issue access/refresh/CSRF cookies.
+
+    Only reached for users who already passed initiate_login
+    (verified + active at that time). Status checks remain as a
+    defense-in-depth safety net in case account state changed.
     """
 
-    # ---------------------------------------------------------
-    # Already logged in
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 0. Already authenticated
+    # ------------------------------------------------------------------
     if current_user is not None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Already logged in",
         )
 
-    # ---------------------------------------------------------
-    # Get user
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 1. Find user
+    # ------------------------------------------------------------------
     user = await get_user_by_email(db, data.email)
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -176,84 +208,129 @@ async def complete_login(
 
     user_id = get_user_id(user)
 
+    # ------------------------------------------------------------------
+    # 2. Redis keys
+    # ------------------------------------------------------------------
     login_attempt_key = f"login_attempt:{data.account_token}"
-    otp_key = f"otp:{data.otp_code}:{user_id}:login"
+    otp_key = f"otp:{user_id}:login"
 
-    # ---------------------------------------------------------
-    # Atomic validate + consume (register_script version)
-    # ---------------------------------------------------------
-    # Returns:
-    #   1  → both keys were valid and have been deleted
-    #   0  → login session invalid / expired
-    #  -1  → OTP invalid / expired
+    # ------------------------------------------------------------------
+    # 3. Validate login session
+    #
+    # Do NOT delete it yet.
+    # It is consumed only after successful OTP verification.
+    # ------------------------------------------------------------------
+    stored_id = await redis.get(login_attempt_key)
 
-    lua_script = r"""
-    local stored = redis.call("GET", KEYS[1])
-    if (not stored) or (stored \~= ARGV[1]) then
-        return 0
-    end
-
-    local otp_exists = redis.call("EXISTS", KEYS[2])
-    if otp_exists == 0 then
-        return -1
-    end
-
-    -- Both valid → consume them
-    redis.call("DEL", KEYS[1])
-    redis.call("DEL", KEYS[2])
-    return 1
-    """
-
-    script = redis.register_script(lua_script)
-
-    result = await script(
-        keys=[login_attempt_key, otp_key],
-        args=[str(user_id)],
-    )
-
-    if result == 0:
+    if not stored_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Session expired or invalid",
         )
 
-    if result == -1:
+    if isinstance(stored_id, bytes):
+        stored_id = stored_id.decode("utf-8")
+
+    try:
+        stored_user_id = int(stored_id)
+
+    except (TypeError, ValueError):
+        await redis.delete(login_attempt_key)
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session expired or invalid",
+        )
+
+    if stored_user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session expired or invalid",
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Defense-in-depth account status checks
+    #
+    # initiate_login() already checked these.
+    # We check again because account state may have changed while
+    # the OTP was waiting to be verified.
+    # ------------------------------------------------------------------
+    if user.disabled:
+        logger.warning(
+            "Disabled user attempted complete_login: user_id=%s",
+            user_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended. Please contact admin.",
+        )
+
+    if not user.verified:
+        logger.info(
+            "Unverified user attempted complete_login: user_id=%s",
+            user_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account not verified. Please verify your email.",
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Atomically verify + consume hashed OTP
+    #
+    # Redis key:
+    #     otp:{user_id}:login
+    #
+    # Redis value:
+    #     SHA-256 hash of the OTP
+    #
+    # Successful verification atomically deletes the OTP.
+    # ------------------------------------------------------------------
+    otp_valid = await verify_and_consume_otp(
+        redis=redis,
+        otp_key=otp_key,
+        submitted_otp=data.otp_code,
+    )
+
+    if not otp_valid:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="OTP expired or invalid",
         )
 
-    # ---------------------------------------------------------
-    # Clear login rate limit
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 6. Consume login session
+    # ------------------------------------------------------------------
+    await redis.delete(login_attempt_key)
+
+    # ------------------------------------------------------------------
+    # 7. Clear login rate limit
+    #
+    # The user successfully completed login, so there is no reason
+    # to retain the initiate_login OTP-request counter.
+    # ------------------------------------------------------------------
     await redis.delete(f"login_rate:{user_id}")
 
-    # ---------------------------------------------------------
-    # Account status checks
-    # ---------------------------------------------------------
-    if user.disabled:
-        logger.warning(f"Disabled user login attempt: user_id={user_id}")
-        return {
-            "status": "disabled",
-            "message": "Account suspended. Please contact admin.",
-            "email": user.email,
-        }
-
-    if not user.verified:
-        logger.info(f"Unverified user login attempt: user_id={user_id}")
-        return {
-            "status": "unverified",
-            "message": "Account not verified. Please verify your email.",
-            "email": user.email,
-        }
-
-    # ---------------------------------------------------------
-    # Issue tokens
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 8. Issue authentication tokens
+    # ------------------------------------------------------------------
     access_token = create_access_token(user_id)
-    refresh_token = await create_refresh_token(user_id, redis)
-    csrf_token = await generate_csrf_token(user_id, redis)
 
+    refresh_token = await create_refresh_token(
+        user_id,
+        redis,
+    )
+
+    csrf_token = await generate_csrf_token(
+        user_id,
+        redis,
+    )
+
+    # ------------------------------------------------------------------
+    # 9. Set authentication cookies
+    # ------------------------------------------------------------------
     set_auth_cookies(
         response=response,
         access_token=access_token,
@@ -261,15 +338,15 @@ async def complete_login(
         csrf_token=csrf_token,
     )
 
-    logger.info(f"Login successful for user_id={user_id}")
+    logger.info(
+        "Login successful for user_id=%s",
+        user_id,
+    )
 
     return {
         "status": "success",
         "message": "Login successful",
     }
-
-
-
 
 
 
