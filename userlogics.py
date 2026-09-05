@@ -7,55 +7,218 @@ async def delete_account(
     current_user: ReadUser,
 ) -> dict:
     """
-    Delete user account.
-    
-    - Verifies password
-    - Cleans up all Redis data
-    - Deletes user from database
-    - Clears cookies
+    Permanently delete the authenticated user's account.
+
+    Flow:
+        1. Fetch the user from the database.
+        2. Verify the provided password.
+        3. Revoke ALL refresh tokens.
+        4. Remove user-specific Redis authentication data.
+        5. Delete the user from the database.
+        6. Clear authentication cookies.
+
+    Redis cleanup includes:
+        - CSRF token
+        - Login rate limit
+        - OTP rate limits
+        - OTP hashes for all OTP types
+
+    Flow-specific attempt/session keys such as:
+
+        reg_attempt:{token}
+        login_attempt:{token}
+        email_change:{token}
+        reset_attempt:{token}
+
+    are intentionally NOT searched or deleted here because:
+
+        - Their keys contain random tokens rather than user IDs.
+        - They have short TTLs.
+        - They automatically expire.
+        - Their associated user must still exist for the relevant
+          endpoint to proceed.
+
+    Raises:
+        HTTPException:
+            If the user does not exist, the password is invalid,
+            token revocation fails, or database deletion fails.
     """
-    user = await get_user_by_id(db, current_user.id)
+
+    # ------------------------------------------------------------------
+    # 1. Get the user
+    # ------------------------------------------------------------------
+    user = await get_user_by_id(
+        db,
+        current_user.id,
+    )
+
     if not user:
+        logger.warning(
+            "Delete account attempted for non-existent user_id=%s",
+            current_user.id,
+        )
+
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
+            detail="User not found",
         )
-    
-    if not verify_password(data.password, user.hashed_password):
+
+    user_id = get_user_id(user)
+
+    # Save email for logging before deleting the SQLAlchemy object.
+    user_email = user.email
+
+    # ------------------------------------------------------------------
+    # 2. Verify current password
+    # ------------------------------------------------------------------
+    if not verify_password(
+        data.password,
+        user.hashed_password,
+    ):
+        logger.warning(
+            "Failed password verification for account deletion: "
+            "user_id=%s",
+            user_id,
+        )
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid password"
+            detail="Invalid password",
         )
-    
-    user_id=current_user.id
-    # Revoke every refresh token and blacklist them
-    await revoke_all_user_tokens(user_id, redis)
-    # Clean up ALL Redis data for this user
-    patterns = [
-        #f"user_refresh:{user.id}",
-        f"csrf:{user.id}",
-        f"login_rate:{user.id}",
-        f"otp_rate:{user.id}:*",
-        f"otp:*{user_id}",
+
+    # ------------------------------------------------------------------
+    # 3. Revoke ALL refresh tokens
+    #
+    # This happens before account deletion so that existing refresh
+    # tokens are invalidated immediately.
+    #
+    # If revocation fails, abort account deletion.
+    # ------------------------------------------------------------------
+    try:
+        await revoke_all_user_tokens(
+            user_id,
+            redis,
+        )
+
+        logger.debug(
+            "Revoked all refresh tokens for user_id=%s",
+            user_id,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to revoke refresh tokens for user_id=%s "
+            "during account deletion",
+            user_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to revoke tokens. Account deletion aborted.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 4. Remove user-specific Redis authentication data
+    #
+    # Current OTP architecture:
+    #
+    #   OTP:
+    #       otp:{user_id}:registration
+    #       otp:{user_id}:login
+    #       otp:{user_id}:email_change
+    #       otp:{user_id}:password_reset
+    #
+    #   OTP rate limits:
+    #       otp_rate:{user_id}:registration
+    #       otp_rate:{user_id}:login
+    #       otp_rate:{user_id}:email_change
+    #       otp_rate:{user_id}:password_reset
+    #
+    #   Other authentication state:
+    #       csrf:{user_id}
+    #       login_rate:{user_id}
+    #
+    # OTP values contain only SHA-256 hashes.
+    # ------------------------------------------------------------------
+    redis_keys = [
+        f"csrf:{user_id}",
+        f"login_rate:{user_id}",
+
+        # OTP rate limits
+        f"otp_rate:{user_id}:registration",
+        f"otp_rate:{user_id}:login",
+        f"otp_rate:{user_id}:email_change",
+        f"otp_rate:{user_id}:password_reset",
+
+        # OTP hashes
+        f"otp:{user_id}:registration",
+        f"otp:{user_id}:login",
+        f"otp:{user_id}:email_change",
+        f"otp:{user_id}:password_reset",
     ]
-    for pattern in patterns:
-        keys = await redis.keys(pattern)
-        if keys:
-            await redis.delete(*keys)
-    
-    
-    # Delete user
-    await db.delete(user)
-    await db.commit()
-    
-    # Clear cookies
+
+    try:
+        await redis.delete(*redis_keys)
+
+        logger.debug(
+            "Cleaned up user authentication Redis keys "
+            "for user_id=%s",
+            user_id,
+        )
+
+    except Exception:
+        # Redis keys have TTLs, so failure here should not prevent
+        # permanent database deletion.
+        #
+        # Refresh-token revocation was handled separately above and
+        # MUST NOT be silently ignored.
+        logger.exception(
+            "Failed to clean up Redis authentication data "
+            "for user_id=%s",
+            user_id,
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Delete user from database
+    #
+    # This is the permanent account deletion.
+    # ------------------------------------------------------------------
+    try:
+        await db.delete(user)
+        await db.commit()
+
+    except Exception as exc:
+        await db.rollback()
+
+        logger.exception(
+            "Failed to permanently delete user_id=%s "
+            "from database",
+            user_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete account. Please try again later.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 6. Clear authentication cookies
+    # ------------------------------------------------------------------
     clear_auth_cookies(response)
-    
-    return {"message": "Account deleted successfully"}
 
+    # ------------------------------------------------------------------
+    # 7. Security/audit log
+    # ------------------------------------------------------------------
+    logger.info(
+        "Account deletion completed successfully: "
+        "user_id=%s, email=%s",
+        user_id,
+        user_email,
+    )
 
-
-
+    return {
+        "message": "Account deleted successfully",
+    }
 
 
 async def request_reset_password(
