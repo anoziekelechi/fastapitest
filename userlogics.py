@@ -1,224 +1,4 @@
 
-async def delete_account(
-    data: VerifyPassword,
-    db: AsyncSession,
-    redis: Redis,
-    response: Response,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Permanently delete the authenticated user's account.
-
-    Flow:
-        1. Fetch the user from the database.
-        2. Verify the provided password.
-        3. Revoke ALL refresh tokens.
-        4. Remove user-specific Redis authentication data.
-        5. Delete the user from the database.
-        6. Clear authentication cookies.
-
-    Redis cleanup includes:
-        - CSRF token
-        - Login rate limit
-        - OTP rate limits
-        - OTP hashes for all OTP types
-
-    Flow-specific attempt/session keys such as:
-
-        reg_attempt:{token}
-        login_attempt:{token}
-        email_change:{token}
-        reset_attempt:{token}
-
-    are intentionally NOT searched or deleted here because:
-
-        - Their keys contain random tokens rather than user IDs.
-        - They have short TTLs.
-        - They automatically expire.
-        - Their associated user must still exist for the relevant
-          endpoint to proceed.
-
-    Raises:
-        HTTPException:
-            If the user does not exist, the password is invalid,
-            token revocation fails, or database deletion fails.
-    """
-
-    # ------------------------------------------------------------------
-    # 1. Get the user
-    # ------------------------------------------------------------------
-    user = await get_user_by_id(
-        db,
-        current_user.id,
-    )
-
-    if not user:
-        logger.warning(
-            "Delete account attempted for non-existent user_id=%s",
-            current_user.id,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-
-    user_id = get_user_id(user)
-
-    # Save email for logging before deleting the SQLAlchemy object.
-    user_email = user.email
-
-    # ------------------------------------------------------------------
-    # 2. Verify current password
-    # ------------------------------------------------------------------
-    if not verify_password(
-        data.password,
-        user.hashed_password,
-    ):
-        logger.warning(
-            "Failed password verification for account deletion: "
-            "user_id=%s",
-            user_id,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid password",
-        )
-
-    # ------------------------------------------------------------------
-    # 3. Revoke ALL refresh tokens
-    #
-    # This happens before account deletion so that existing refresh
-    # tokens are invalidated immediately.
-    #
-    # If revocation fails, abort account deletion.
-    # ------------------------------------------------------------------
-    try:
-        await revoke_all_user_tokens(
-            user_id,
-            redis,
-        )
-
-        logger.debug(
-            "Revoked all refresh tokens for user_id=%s",
-            user_id,
-        )
-
-    except Exception as exc:
-        logger.exception(
-            "Failed to revoke refresh tokens for user_id=%s "
-            "during account deletion",
-            user_id,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to revoke tokens. Account deletion aborted.",
-        ) from exc
-
-    # ------------------------------------------------------------------
-    # 4. Remove user-specific Redis authentication data
-    #
-    # Current OTP architecture:
-    #
-    #   OTP:
-    #       otp:{user_id}:registration
-    #       otp:{user_id}:login
-    #       otp:{user_id}:email_change
-    #       otp:{user_id}:password_reset
-    #
-    #   OTP rate limits:
-    #       otp_rate:{user_id}:registration
-    #       otp_rate:{user_id}:login
-    #       otp_rate:{user_id}:email_change
-    #       otp_rate:{user_id}:password_reset
-    #
-    #   Other authentication state:
-    #       csrf:{user_id}
-    #       login_rate:{user_id}
-    #
-    # OTP values contain only SHA-256 hashes.
-    # ------------------------------------------------------------------
-    redis_keys = [
-        f"csrf:{user_id}",
-        f"login_rate:{user_id}",
-
-        # OTP rate limits
-        f"otp_rate:{user_id}:registration",
-        f"otp_rate:{user_id}:login",
-        f"otp_rate:{user_id}:email_change",
-        f"otp_rate:{user_id}:password_reset",
-
-        # OTP hashes
-        f"otp:{user_id}:registration",
-        f"otp:{user_id}:login",
-        f"otp:{user_id}:email_change",
-        f"otp:{user_id}:password_reset",
-    ]
-
-    try:
-        await redis.delete(*redis_keys)
-
-        logger.debug(
-            "Cleaned up user authentication Redis keys "
-            "for user_id=%s",
-            user_id,
-        )
-
-    except Exception:
-        # Redis keys have TTLs, so failure here should not prevent
-        # permanent database deletion.
-        #
-        # Refresh-token revocation was handled separately above and
-        # MUST NOT be silently ignored.
-        logger.exception(
-            "Failed to clean up Redis authentication data "
-            "for user_id=%s",
-            user_id,
-        )
-
-    # ------------------------------------------------------------------
-    # 5. Delete user from database
-    #
-    # This is the permanent account deletion.
-    # ------------------------------------------------------------------
-    try:
-        await db.delete(user)
-        await db.commit()
-
-    except Exception as exc:
-        await db.rollback()
-
-        logger.exception(
-            "Failed to permanently delete user_id=%s "
-            "from database",
-            user_id,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete account. Please try again later.",
-        ) from exc
-
-    # ------------------------------------------------------------------
-    # 6. Clear authentication cookies
-    # ------------------------------------------------------------------
-    clear_auth_cookies(response)
-
-    # ------------------------------------------------------------------
-    # 7. Security/audit log
-    # ------------------------------------------------------------------
-    logger.info(
-        "Account deletion completed successfully: "
-        "user_id=%s, email=%s",
-        user_id,
-        user_email,
-    )
-
-    return {
-        "message": "Account deleted successfully",
-    }
 
 
 async def request_reset_password(
@@ -233,23 +13,36 @@ async def request_reset_password(
     Step 1: Request a password reset OTP.
 
     Flow:
-        1. Block if user is already logged in.
-        2. Look up the email without revealing whether it exists.
+        1. Block already-authenticated users.
+        2. Look up the account by email.
         3. Silently ignore unknown/disabled accounts.
-        4. Generate and send the OTP.
-        5. Only after successful OTP generation, create the reset session token.
-        6. Return the reset session token.
+        4. Generate and store a new password-reset OTP.
+        5. Queue the OTP email.
+        6. Create a reset session token.
+        7. Return the reset session token.
+
+    Redis:
+        OTP:
+            otp:{user_id}:password_reset
+
+        OTP rate limit:
+            otp_rate:{user_id}:password_reset
+
+        Reset session:
+            reset_attempt:{token}
 
     Security:
         - Prevents logged-in users from using password reset.
-        - Uses a generic response to prevent email enumeration.
-        - Does not create a reset session when OTP generation fails.
+        - Uses a generic response for unknown/disabled accounts.
+        - OTP is stored only as a SHA-256 hash.
+        - A new OTP overwrites the previous OTP.
+        - Reset session is created only after OTP generation/storage succeeds.
         - Reset session token is cryptographically random.
     """
 
-    # -------------------------------------------------------------------------
-    # 1. Block logged-in users
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 1. Block already-authenticated users
+    # ------------------------------------------------------------------
     if current_user is not None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -259,34 +52,58 @@ async def request_reset_password(
             ),
         )
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 2. Generic response
-    # -------------------------------------------------------------------------
+    #
+    # Used for unknown and disabled accounts to reduce email
+    # enumeration.
+    # ------------------------------------------------------------------
     generic_response = {
         "message": "If this email is registered, an OTP has been sent.",
     }
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 3. Look up user
-    # -------------------------------------------------------------------------
-    user = await get_user_by_email(db, data.email)
+    # ------------------------------------------------------------------
+    user = await get_user_by_email(
+        db,
+        data.email,
+    )
 
-    if not user:
-        logger.info("Password reset requested for unknown email")
-        return generic_response
-
-    # -------------------------------------------------------------------------
-    # 4. Silently ignore disabled accounts
-    # -------------------------------------------------------------------------
-    if user.disabled:
-        logger.warning("Password reset requested for disabled account")
+    if user is None:
+        logger.info(
+            "Password reset requested for unknown email"
+        )
         return generic_response
 
     user_id = get_user_id(user)
 
-    # -------------------------------------------------------------------------
-    # 5. Generate + send OTP
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 4. Do not issue reset OTPs to disabled accounts
+    # ------------------------------------------------------------------
+    if user.disabled:
+        logger.warning(
+            "Password reset requested for disabled user_id=%s",
+            user_id,
+        )
+        return generic_response
+
+    # ------------------------------------------------------------------
+    # 5. Generate + store password-reset OTP
+    #
+    # generate_and_send_otp():
+    #
+    #   - generates a new 6-digit OTP
+    #   - hashes it with SHA-256
+    #   - stores the hash at:
+    #
+    #       otp:{user_id}:password_reset
+    #
+    #   - applies OTP rate limiting
+    #   - queues the email through BackgroundTasks
+    #
+    # A new OTP overwrites any previous OTP.
+    # ------------------------------------------------------------------
     try:
         await generate_and_send_otp(
             user=user,
@@ -297,44 +114,58 @@ async def request_reset_password(
             background_tasks=background_tasks,
         )
 
-    except HTTPException as e:
-        # Rate limiting is safe to expose
-        if e.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+    except HTTPException as exc:
+        # Keep the existing OTP rate-limit behavior.
+        if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
             raise
 
         logger.error(
-            f"OTP generation failed for password reset "
-            f"(user_id={user_id}): {e.detail}"
+            "Password reset OTP generation failed "
+            "for user_id=%s: %s",
+            user_id,
+            exc.detail,
         )
+
         return generic_response
 
     except Exception:
         logger.exception(
-            f"Unexpected OTP generation failure for password reset "
-            f"(user_id={user_id})"
+            "Unexpected password reset OTP generation failure "
+            "for user_id=%s",
+            user_id,
         )
+
         return generic_response
 
-    # -------------------------------------------------------------------------
-    # 6. Create reset session token ONLY after OTP generation succeeds
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 6. Create reset session ONLY after OTP generation succeeds
+    #
+    # The session value contains the user ID.
+    # The token itself is cryptographically random.
+    # ------------------------------------------------------------------
     reset_token = secrets.token_urlsafe(32)
+
+    reset_key = f"reset_attempt:{reset_token}"
 
     reset_ttl = int(
         timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds()
     )
 
     await redis.set(
-        f"reset_attempt:{reset_token}",
+        reset_key,
         str(user_id),
         ex=reset_ttl,
     )
 
-    logger.info(f"Password reset OTP sent for user_id={user_id}")
+    logger.info(
+        "Password reset OTP generated and reset session created "
+        "for user_id=%s",
+        user_id,
+    )
 
-    # -------------------------------------------------------------------------
-    # 7. Return reset token
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 7. Return reset session token
+    # ------------------------------------------------------------------
     return {
         "message": "If this email is registered, an OTP has been sent.",
         "reset_token": reset_token,
@@ -348,33 +179,42 @@ async def reset_password(
     current_user: ReadUser | None = None,
 ) -> dict:
     """
-    Step 2: Verify OTP and set a new password.
+    Step 2: Verify the password-reset OTP and set a new password.
 
     Flow:
-        1. Block if user is already logged in.
-        2. Look up user by email.
-        3. Validate reset session token.
-        4. Retrieve OTP from Redis.
-        5. Verify submitted OTP.
-        6. Atomically consume OTP.
-        7. Ensure new password differs from current password.
-        8. Update password.
-        9. Commit database transaction.
-        10. Delete reset session.
-        11. Invalidate all refresh tokens.
-        12. Return success.
+        1. Block already-authenticated users.
+        2. Look up the user by email.
+        3. Validate the reset session token.
+        4. Re-check account status.
+        5. Ensure the new password differs from the current password.
+        6. Atomically verify + consume the OTP.
+        7. Update the password.
+        8. Commit the password change.
+        9. Delete the reset session.
+        10. Revoke ALL refresh tokens.
+        11. Return success.
+
+    Redis:
+        OTP:
+            otp:{user_id}:password_reset
+
+        Reset session:
+            reset_attempt:{token}
 
     Security:
-        - Reset requires both email + reset session token + OTP.
-        - OTP is consumed atomically.
+        - Requires email + reset token + OTP.
+        - OTP is stored as a SHA-256 hash.
+        - OTP verification and deletion happen atomically.
+        - OTP cannot be reused after successful verification.
         - Reset session expires automatically.
-        - Existing refresh sessions are revoked via revoke_all_user_tokens.
-        - User must authenticate again after password reset.
+        - All existing refresh tokens are revoked after a successful
+          password change.
+        - User must authenticate again with the new password.
     """
 
-    # -------------------------------------------------------------------------
-    # 1. Block logged-in users
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 1. Block already-authenticated users
+    # ------------------------------------------------------------------
     if current_user is not None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -384,12 +224,15 @@ async def reset_password(
             ),
         )
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 2. Look up user
-    # -------------------------------------------------------------------------
-    user = await get_user_by_email(db, data.email)
+    # ------------------------------------------------------------------
+    user = await get_user_by_email(
+        db,
+        data.email,
+    )
 
-    if not user:
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
@@ -397,9 +240,13 @@ async def reset_password(
 
     user_id = get_user_id(user)
 
-    # -------------------------------------------------------------------------
-    # 3. Validate reset session token
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 3. Validate reset session
+    #
+    # Redis:
+    #
+    #     reset_attempt:{token} → user_id
+    # ------------------------------------------------------------------
     reset_key = f"reset_attempt:{data.reset_token}"
 
     stored_id = await redis.get(reset_key)
@@ -414,12 +261,15 @@ async def reset_password(
         )
 
     if isinstance(stored_id, bytes):
-        stored_id = stored_id.decode()
+        stored_id = stored_id.decode("utf-8")
 
     try:
         stored_user_id = int(stored_id)
+
     except (TypeError, ValueError):
+        # Corrupt session data should not remain in Redis.
         await redis.delete(reset_key)
+
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -428,6 +278,9 @@ async def reset_password(
             ),
         )
 
+    # ------------------------------------------------------------------
+    # 4. Ensure reset token belongs to this user
+    # ------------------------------------------------------------------
     if stored_user_id != user_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -437,114 +290,184 @@ async def reset_password(
             ),
         )
 
-    # -------------------------------------------------------------------------
-    # 4. Get stored OTP
-    # -------------------------------------------------------------------------
-    # Expected Redis key: otp:password_reset:{user_id}
-    otp_key = f"otp:password_reset:{user_id}"
-
-    stored_otp = await redis.get(otp_key)
-
-    if not stored_otp:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OTP expired or invalid",
+    # ------------------------------------------------------------------
+    # 5. Defense-in-depth account status check
+    #
+    # The account may have been disabled after the reset request.
+    # Do not allow the password reset to proceed in that situation.
+    # ------------------------------------------------------------------
+    if user.disabled:
+        logger.warning(
+            "Disabled user attempted password reset: user_id=%s",
+            user_id,
         )
 
-    if isinstance(stored_otp, bytes):
-        stored_otp = stored_otp.decode()
-
-    # -------------------------------------------------------------------------
-    # 5. Verify submitted OTP
-    # -------------------------------------------------------------------------
-    if not secrets.compare_digest(str(data.otp_code), str(stored_otp)):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OTP expired or invalid",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended. Please contact admin.",
         )
 
-    # -------------------------------------------------------------------------
-    # 6. Atomically consume OTP
-    # -------------------------------------------------------------------------
-    consumed_otp = await redis.getdel(otp_key)
-
-    if not consumed_otp:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OTP expired or invalid",
-        )
-
-    if isinstance(consumed_otp, bytes):
-        consumed_otp = consumed_otp.decode()
-
-    if not secrets.compare_digest(str(data.otp_code), str(consumed_otp)):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OTP expired or invalid",
-        )
-
-    # -------------------------------------------------------------------------
-    # 7. Ensure new password differs from current password
-    # -------------------------------------------------------------------------
-    if verify_password(data.new_password, user.hashed_password):
+    # ------------------------------------------------------------------
+    # 6. Ensure new password differs from current password
+    #
+    # This check happens before consuming the OTP so that an otherwise
+    # valid reset is not unnecessarily destroyed because the user
+    # submitted their existing password.
+    # ------------------------------------------------------------------
+    if verify_password(
+        data.new_password,
+        user.hashed_password,
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New password must be different from your current password",
+            detail=(
+                "New password must be different from "
+                "your current password"
+            ),
         )
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 7. Atomically verify + consume OTP
+    #
+    # Current OTP key:
+    #
+    #     otp:{user_id}:password_reset
+    #
+    # Redis contains ONLY the SHA-256 hash of the OTP.
+    #
+    # verify_and_consume_otp() performs:
+    #
+    #     GET hash
+    #     compare submitted OTP hash
+    #     DELETE OTP
+    #
+    # atomically through the Redis Lua script.
+    # ------------------------------------------------------------------
+    otp_key = f"otp:{user_id}:password_reset"
+
+    otp_valid = await verify_and_consume_otp(
+        redis=redis,
+        otp_key=otp_key,
+        submitted_otp=data.otp_code,
+    )
+
+    if not otp_valid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OTP expired or invalid",
+        )
+
+    # ------------------------------------------------------------------
     # 8. Update password
-    # -------------------------------------------------------------------------
-    user.hashed_password = hash_password(data.new_password)
+    # ------------------------------------------------------------------
+    user.hashed_password = hash_password(
+        data.new_password,
+    )
+
     db.add(user)
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 9. Commit password change
-    # -------------------------------------------------------------------------
+    #
+    # The OTP has already been consumed.
+    #
+    # This is intentional:
+    # a successful OTP must never be reusable, even if a later
+    # database operation fails.
+    # ------------------------------------------------------------------
     try:
         await db.commit()
-    except Exception:
+
+    except Exception as exc:
         await db.rollback()
 
-        # OTP has already been consumed – this is intentional.
         logger.exception(
-            f"Password reset database commit failed (user_id={user_id})"
+            "Password reset database commit failed "
+            "for user_id=%s",
+            user_id,
         )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unable to reset password. Please try again.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 10. Consume reset session
+    #
+    # OTP has already been consumed atomically.
+    # The reset session is now also no longer needed.
+    # ------------------------------------------------------------------
+    try:
+        await redis.delete(reset_key)
+
+    except Exception:
+        # Password change succeeded, so do not report the operation
+        # as failed merely because deleting an already-short-lived
+        # session key failed.
+        logger.exception(
+            "Failed to delete password reset session "
+            "for user_id=%s",
+            user_id,
         )
 
-    # -------------------------------------------------------------------------
-    # 10. Delete reset session
-    # -------------------------------------------------------------------------
-    await redis.delete(reset_key)
+    # ------------------------------------------------------------------
+    # 11. Revoke ALL existing refresh tokens
+    #
+    # Password reset invalidates every existing authenticated session.
+    #
+    # The user must login again using the new password.
+    # ------------------------------------------------------------------
+    try:
+        await revoke_all_user_tokens(
+            user_id,
+            redis,
+        )
 
-    # -------------------------------------------------------------------------
-    # 11. Invalidate ALL existing refresh tokens
-    # -------------------------------------------------------------------------
-    # Uses the shared helper that works with the JTI-based design.
-    await revoke_all_user_tokens(user_id, redis)
+    except Exception as exc:
+        # The password has already changed successfully.
+        # Failure here is a serious security event because existing
+        # refresh tokens may still exist.
+        logger.critical(
+            "CRITICAL: Password reset succeeded but "
+            "refresh-token revocation failed for user_id=%s",
+            user_id,
+        )
 
-    # -------------------------------------------------------------------------
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Password was changed, but active sessions could "
+                "not be fully revoked. Please contact support."
+            ),
+        ) from exc
+
+    # ------------------------------------------------------------------
     # 12. Success
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     logger.info(
-        f"Password reset successful for user_id={user_id}. "
-        "All refresh tokens invalidated."
+        "Password reset successful for user_id=%s. "
+        "All refresh tokens invalidated.",
+        user_id,
     )
 
     return {
         "message": (
             "Password reset successful. "
             "Please login with your new password."
-        )
+        ),
     }
 
 
 
-#________ Change Email _____________
+
+
+
+
+# ============================================================================
+# EMAIL CHANGE
+# ============================================================================
+
 
 async def request_email_change(
     data: RequestEmailChange,
@@ -552,105 +475,241 @@ async def request_email_change(
     redis: Redis,
     mailer: FastMail,
     background_tasks: BackgroundTasks,
-    current_user: ReadUser,             # ✅ Required - must be logged in
+    current_user: ReadUser,
 ) -> dict:
     """
-    Step 1: Validate current password and send OTP to NEW email.
+    Step 1: Verify the current password and send an OTP to the NEW email.
 
     Flow:
-        1. Require authentication (current_user is NOT optional here)
-        2. Fetch real user from DB (current_user is ReadUser schema, not ORM)
-        3. Verify current password matches
-        4. Ensure new email is different from current email
-        5. Ensure new email is not already taken by another account
-        6. Store new email + anti-replay token in Redis temporarily
-        7. Send OTP to NEW email (not old email - we're verifying the new one)
+        1. Require authentication.
+        2. Fetch the real ORM user.
+        3. Verify the current password.
+        4. Normalize the new email.
+        5. Ensure the new email differs from the current email.
+        6. Ensure the new email is not already registered.
+        7. Create an email-change session token.
+        8. Store user_id + new_email in Redis.
+        9. Generate/store the email-change OTP.
+        10. Queue the OTP email to the NEW email.
 
-    Why send OTP to new email (not old)?
-        We need to prove the user OWNS the new email address.
-        Sending to the old email only proves they're logged in,
-        which we already know. The OTP to the new email proves
-        they have access to it.
+    Redis:
 
-    Args:
-        data: Current password + new email
-        db: Database session
-        redis: Redis client
-        mailer: FastMail instance
-        background_tasks: FastAPI background tasks queue
-        current_user: Authenticated user (required - raises 401 if missing)
+        Session:
+            email_change:{token}
+                -> JSON:
+                   {
+                       "user_id": user_id,
+                       "new_email": "new@example.com"
+                   }
 
-    Returns:
-        dict: message + email_change_token (needed for verify step)
+        OTP:
+            otp:{user_id}:email_change
 
-    Raises:
-        HTTPException: 401 if password incorrect
-        HTTPException: 400 if new email same as current
-        HTTPException: 409 if new email already registered
-        HTTPException: 429 if too many OTP requests
+        OTP rate limit:
+            otp_rate:{user_id}:email_change
+
+    Security:
+        - Requires the current authenticated session.
+        - Requires the current password.
+        - OTP is sent to the new email address.
+        - New email is stored server-side and is not trusted from
+          the verification request.
+        - A new OTP overwrites the previous email-change OTP.
     """
-    # Fetch real ORM user (current_user is a ReadUser schema, not ORM object)
-    user = await get_user_by_id(db, current_user.id)
-    if not user:
+
+    # ------------------------------------------------------------------
+    # 1. Fetch the real ORM user
+    #
+    # current_user is a ReadUser schema, not the ORM object.
+    # ------------------------------------------------------------------
+    user = await get_user_by_id(
+        db,
+        current_user.id,
+    )
+
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
+            detail="User not found",
         )
-    
-    # Verify current password
-    if not verify_password(data.current_password, user.hashed_password):
+
+    user_id = get_user_id(user)
+
+    # ------------------------------------------------------------------
+    # 2. Verify current password
+    # ------------------------------------------------------------------
+    if not verify_password(
+        data.current_password,
+        user.hashed_password,
+    ):
+        logger.warning(
+            "Failed password verification for email change: "
+            "user_id=%s",
+            user_id,
+        )
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Current password is incorrect"
+            detail="Current password is incorrect",
         )
-    
-    # Ensure new email differs from current email
-    if data.new_email == user.email:
+
+    # ------------------------------------------------------------------
+    # 3. Normalize the new email
+    #
+    # This keeps comparison, uniqueness checks, Redis storage, and the
+    # eventual database value consistent.
+    # ------------------------------------------------------------------
+    new_email = normalize_email(data.new_email)
+
+    if new_email is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New email must be different from your current email"
+            detail="A valid new email address is required",
         )
-    
-    # Ensure new email is not already registered to another account
-    existing = await get_user_by_email(db, data.new_email)
-    if existing:
+
+    # ------------------------------------------------------------------
+    # 4. Ensure the new email differs from the current email
+    # ------------------------------------------------------------------
+    if new_email == user.email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New email must be different from your current email",
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Ensure the new email is not already registered
+    # ------------------------------------------------------------------
+    existing = await get_user_by_email(
+        db,
+        new_email,
+    )
+
+    if existing is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="This email address is already registered to another account"
+            detail=(
+                "This email address is already registered "
+                "to another account"
+            ),
         )
-    
-    user_id = get_user_id(user)
-    
-    # Store new email in Redis temporarily so verify step can use it
-    # without us passing it back in the response (which could be tampered with)
+
+    # ------------------------------------------------------------------
+    # 6. Create email-change session token
+    # ------------------------------------------------------------------
     email_change_token = secrets.token_urlsafe(32)
-    
-    # Store both the user_id AND the new email under this token
-    await redis.set(
-        f"email_change:{email_change_token}",
-        f"{user_id}:{data.new_email}",   # ← store both together
-        ex=int(timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds()),
+
+    email_change_key = (
+        f"email_change:{email_change_token}"
     )
-    
-    # pass real user + override_email
-    await generate_and_send_otp(
-        user=user,                 # ← OTP goes to NEW email
-        otp_type="email_change",
-        subject="Verify your new email address",
-        redis=redis,
-        mailer=mailer,
-        background_tasks=background_tasks,
-        override_email=data.new_email,
+
+    session_ttl = int(
+        timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds()
     )
-    
+
+    # ------------------------------------------------------------------
+    # 7. Store user_id + new_email in Redis
+    #
+    # JSON is preferable to:
+    #
+    #     f"{user_id}:{new_email}"
+    #
+    # because JSON provides explicit fields and avoids delimiter
+    # parsing issues.
+    # ------------------------------------------------------------------
+    session_data = json.dumps(
+        {
+            "user_id": user_id,
+            "new_email": new_email,
+        }
+    )
+
+    try:
+        await redis.set(
+            email_change_key,
+            session_data,
+            ex=session_ttl,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to create email-change session "
+            "for user_id=%s",
+            user_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to start email change. Please try again.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 8. Generate + store OTP and queue email
+    #
+    # generate_and_send_otp():
+    #
+    #     otp:{user_id}:email_change
+    #
+    # The OTP is hashed before being stored in Redis.
+    # The plaintext OTP is only passed to the email background task.
+    # ------------------------------------------------------------------
+    try:
+        await generate_and_send_otp(
+            user=user,
+            otp_type="email_change",
+            subject="Verify your new email address",
+            redis=redis,
+            mailer=mailer,
+            background_tasks=background_tasks,
+            override_email=new_email,
+        )
+
+    except HTTPException as exc:
+        # The email-change session should not remain if OTP generation
+        # itself failed.
+        await redis.delete(email_change_key)
+
+        if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            raise
+
+        logger.error(
+            "Email-change OTP generation failed "
+            "for user_id=%s: %s",
+            user_id,
+            exc.detail,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send OTP. Please try again.",
+        ) from exc
+
+    except Exception as exc:
+        await redis.delete(email_change_key)
+
+        logger.exception(
+            "Unexpected email-change OTP generation failure "
+            "for user_id=%s",
+            user_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send OTP. Please try again.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 9. Success
+    # ------------------------------------------------------------------
     logger.info(
-        f"Email change OTP sent for user_id={user_id}. "
-        f"New email: {data.new_email}"
+        "Email-change OTP generated for user_id=%s",
+        user_id,
     )
-    
+
     return {
-        "message": "An OTP has been sent to your new email address. "
-                   "Please verify it to complete the email change.",
+        "message": (
+            "An OTP has been sent to your new email address. "
+            "Please verify it to complete the email change."
+        ),
         "email_change_token": email_change_token,
     }
 
@@ -659,127 +718,316 @@ async def verify_new_email(
     data: VerifyEmailChange,
     db: AsyncSession,
     redis: Redis,
-    current_user: ReadUser,             # ✅ Required - must still be logged in
+    current_user: ReadUser,
 ) -> ReadUser:
     """
-    Step 2: Verify OTP sent to new email and update email in DB.
+    Step 2: Verify the OTP sent to the new email and update the account.
 
     Flow:
-        1. Require authentication (session must still be valid)
-        2. Validate email_change_token (anti-replay, retrieves new email)
-        3. Ensure token belongs to this logged-in user (not another user's token)
-        4. Validate OTP sent to new email
-        5. Final check: new email still not taken (race condition guard)
-        6. Update email in DB
-        7. Clean up Redis
-        8. Return updated user profile
+        1. Require authentication.
+        2. Fetch the real ORM user.
+        3. Validate the email-change session token.
+        4. Parse user_id + new_email from Redis.
+        5. Ensure the token belongs to the authenticated user.
+        6. Re-check account status.
+        7. Atomically verify + consume the OTP.
+        8. Perform a final email uniqueness check.
+        9. Update the email in the database.
+        10. Commit the database transaction.
+        11. Delete the email-change session.
+        12. Revoke all refresh tokens.
+        13. Return the updated user.
 
-    Why require auth in step 2?
-        Prevents someone who gets hold of the email_change_token
-        (e.g. from a shared screen or shoulder surfing) from completing
-        the change without also having the active session cookie.
-        Both the session AND the token are required.
+    Redis:
 
-    Args:
-        data: OTP code + email_change_token from step 1
-        db: Database session
-        redis: Redis client
-        current_user: Authenticated user (must match token owner)
+        Session:
+            email_change:{token}
 
-    Returns:
-        ReadUser: Updated user profile with new email
+        OTP:
+            otp:{user_id}:email_change
 
-    Raises:
-        HTTPException: 400 if token invalid/expired
-        HTTPException: 403 if token belongs to different user
-        HTTPException: 401 if OTP invalid/expired
-        HTTPException: 409 if new email taken (race condition)
-        HTTPException: 404 if user not found
+    Security:
+        - Requires both the authenticated session and email-change token.
+        - The new email is retrieved from trusted Redis state.
+        - The OTP is stored as a SHA-256 hash.
+        - OTP verification and deletion are atomic.
+        - OTP cannot be reused after successful verification.
+        - A final uniqueness check protects against stale state/races.
+        - All refresh sessions are revoked after an email change.
     """
-    # Fetch real ORM user
-    user = await get_user_by_id(db, current_user.id)
-    if not user:
+
+    # ------------------------------------------------------------------
+    # 1. Fetch the real ORM user
+    # ------------------------------------------------------------------
+    user = await get_user_by_id(
+        db,
+        current_user.id,
+    )
+
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
+            detail="User not found",
         )
-    
+
     user_id = get_user_id(user)
-    
-    # Validate email_change_token and retrieve stored data
-    stored_data = await redis.get(f"email_change:{data.email_change_token}")
+
+    # ------------------------------------------------------------------
+    # 2. Validate email-change session
+    # ------------------------------------------------------------------
+    email_change_key = (
+        f"email_change:{data.email_change_token}"
+    )
+
+    stored_data = await redis.get(
+        email_change_key,
+    )
+
     if not stored_data:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email change session expired or invalid. "
-                   "Please request a new OTP."
+            detail=(
+                "Email change session expired or invalid. "
+                "Please request a new OTP."
+            ),
         )
-    
-    # Parse stored data: "user_id:new_email"
+
+    if isinstance(stored_data, bytes):
+        stored_data = stored_data.decode("utf-8")
+
+    # ------------------------------------------------------------------
+    # 3. Parse session data
+    # ------------------------------------------------------------------
     try:
-        stored_user_id_str, new_email = stored_data.split(":", 1)
-        stored_user_id = int(stored_user_id_str)
-    except (ValueError, AttributeError):
-        # Corrupted data - clean up and reject
-        await redis.delete(f"email_change:{data.email_change_token}")
+        session_data = json.loads(stored_data)
+
+        stored_user_id = int(
+            session_data["user_id"]
+        )
+
+        new_email = normalize_email(
+            session_data["new_email"]
+        )
+
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        # Corrupted session data should not remain in Redis.
+        await redis.delete(email_change_key)
+
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid session data. Please request a new OTP."
+            detail=(
+                "Invalid email-change session. "
+                "Please request a new OTP."
+            ),
         )
-    
-    # Ensure token belongs to the currently logged-in user
-    # Prevents one user from using another user's email change token
+
+    if new_email is None:
+        await redis.delete(email_change_key)
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Invalid email-change session. "
+                "Please request a new OTP."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Ensure token belongs to current user
+    # ------------------------------------------------------------------
     if stored_user_id != user_id:
         logger.warning(
-            f"Email change token mismatch: "
-            f"token owner={stored_user_id}, "
-            f"requester={user_id}"
+            "Email-change token mismatch: "
+            "token_owner=%s, requester=%s",
+            stored_user_id,
+            user_id,
         )
+
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="This email change token does not belong to your account"
+            detail=(
+                "This email change token does not belong "
+                "to your account"
+            ),
         )
-    
-    # Validate OTP (was sent to new_email, stored under new_email's user_id)
-    otp_key = f"otp:{data.otp_code}:{user_id}:email_change"
-    if not await redis.exists(otp_key):
+
+    # ------------------------------------------------------------------
+    # 5. Defense-in-depth account status check
+    # ------------------------------------------------------------------
+    if user.disabled:
+        logger.warning(
+            "Disabled user attempted email change: "
+            "user_id=%s",
+            user_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended. Please contact admin.",
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Make sure the new email is still different
+    # ------------------------------------------------------------------
+    if new_email == user.email:
+        # The requested email has somehow become the current email.
+        # The session is no longer useful.
+        await redis.delete(email_change_key)
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This email address is already your current "
+                "email address."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 7. Atomically verify + consume OTP
+    #
+    # Current OTP key:
+    #
+    #     otp:{user_id}:email_change
+    #
+    # Redis contains only the SHA-256 hash of the OTP.
+    # ------------------------------------------------------------------
+    otp_key = f"otp:{user_id}:email_change"
+
+    otp_valid = await verify_and_consume_otp(
+        redis=redis,
+        otp_key=otp_key,
+        submitted_otp=data.otp_code,
+    )
+
+    if not otp_valid:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OTP expired or invalid"
+            detail="OTP expired or invalid",
         )
-    
-    # Race condition guard: check new email still isn't taken
-    # (someone else could have registered it between step 1 and step 2)
-    existing = await get_user_by_email(db, new_email)
-    if existing and get_user_id(existing) != user_id:
-        # Clean up since we can't proceed
-        await redis.delete(f"email_change:{data.email_change_token}")
-        await redis.delete(otp_key)
+
+    # ------------------------------------------------------------------
+    # 8. Final uniqueness check
+    #
+    # Another account could have registered this email after step 1.
+    #
+    # IMPORTANT:
+    # The database UNIQUE constraint remains the ultimate protection
+    # against concurrent registration/update races.
+    # ------------------------------------------------------------------
+    existing = await get_user_by_email(
+        db,
+        new_email,
+    )
+
+    if existing is not None and get_user_id(existing) != user_id:
+        # OTP has already been consumed.
+        # This is intentional: a successfully verified OTP should
+        # never become reusable.
+        await redis.delete(email_change_key)
+
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="This email address has just been registered by another account. "
-                   "Please choose a different email."
+            detail=(
+                "This email address has just been registered "
+                "by another account. Please choose a different email."
+            ),
         )
-    
-    # ✅ All checks passed - update email
+
+    # ------------------------------------------------------------------
+    # 9. Update email
+    # ------------------------------------------------------------------
     old_email = user.email
+
     user.email = new_email
+
     db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    
-    # Clean up Redis
-    await redis.delete(f"email_change:{data.email_change_token}")
-    await redis.delete(otp_key)
-    
+
+    # ------------------------------------------------------------------
+    # 10. Commit database update
+    # ------------------------------------------------------------------
+    try:
+        await db.commit()
+        await db.refresh(user)
+
+    except Exception as exc:
+        await db.rollback()
+
+        logger.exception(
+            "Failed to update email for user_id=%s",
+            user_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Unable to change email address. "
+                "Please try again."
+            ),
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 11. Delete email-change session
+    # ------------------------------------------------------------------
+    try:
+        await redis.delete(email_change_key)
+
+    except Exception:
+        # The database change already succeeded.
+        # The session has a TTL and should not be allowed to prevent
+        # the successful operation from being reported as successful.
+        logger.exception(
+            "Failed to delete email-change session "
+            "for user_id=%s",
+            user_id,
+        )
+
+    # ------------------------------------------------------------------
+    # 12. Revoke all refresh tokens
+    #
+    # Email changes are account-security changes, so all existing
+    # authenticated refresh sessions should be invalidated.
+    #
+    # The user must authenticate again using the account's credentials.
+    # ------------------------------------------------------------------
+    try:
+        await revoke_all_user_tokens(
+            user_id,
+            redis,
+        )
+
+    except Exception as exc:
+        # The email has already been changed successfully.
+        # Failure to revoke sessions is therefore a serious security
+        # event and must not be silently ignored.
+        logger.critical(
+            "CRITICAL: Email change succeeded but "
+            "refresh-token revocation failed for user_id=%s",
+            user_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Email address was changed, but active sessions "
+                "could not be fully revoked. Please contact support."
+            ),
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 13. Success
+    # ------------------------------------------------------------------
     logger.info(
-        f"Email changed successfully for user_id={user_id}. "
-        f"{old_email} → {new_email}"
+        "Email changed successfully for user_id=%s: %s -> %s",
+        user_id,
+        old_email,
+        new_email,
     )
-    
+
     return ReadUser.model_validate(user)
-
-
-
 
 
