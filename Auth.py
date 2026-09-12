@@ -1,559 +1,385 @@
-# """
-# Security utilities.
+from typing import Literal
+OtpType = Literal["registration", "login", "email_change", "password_reset"]
 
-# Token Strategy:
-# - Access token:  HttpOnly cookie (JS cannot read)
-# - Refresh token: HttpOnly cookie (JS cannot read)
-# - CSRF token:    Regular cookie (JS CAN read - needed to send in header)
+class ResendOtpRequest(BaseModel):
+    email: EmailStr
+    account_token: str
+    otp_type: OtpType
 
-# Why CSRF token?
-# - HttpOnly cookies are sent automatically by browser
-# - Attacker can trick browser into sending cookies (CSRF attack)
-# - CSRF token in header proves the request came from YOUR frontend
-# - Because HttpOnly cookies are unreadable by JS, attacker
-#   cannot get the CSRF token to include in their forged request
-# """
 
-# api/core/auth.py
+
+# app/utils/email_change.py
+
 import json
-import secrets
-from datetime import datetime, timezone, timedelta
-from uuid import uuid4
-from redis.asyncio import Redis
-from fastapi_mail import FastMail
-from api.models.users import User
-from api.users.logics import get_authenticated_user
-import jwt
-from passlib.context import CryptContext 
-from fastapi import HTTPException, Request, status, Response, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
+from datetime import timedelta
 
-from api.core.settings import get_settings
-from api.core.redis import RedisDep
-from api.core.mail import MailDep
-from api.users.schemas import (
-    TokenPayload,
-    RefreshTokenPayload,
-    TokenData,
-    TokenResponse,
-    CSRFData,
-    ReadUser,
+from redis.asyncio import Redis
+from fastapi import HTTPException, status
+
+from app.core.config import OTP_EXPIRE_MINUTES
+from app.utils.email import normalize_email
+
+
+SESSION_EXPIRED_DETAIL = (
+    "Email change session expired or invalid. "
+    "Please request a new OTP."
 )
 
 
-# =============================================================================
-# SETUP
-# =============================================================================
-
-settings = get_settings()
-
-# ✅ Removed: oauth2_scheme - not needed with HttpOnly cookies!
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+def email_change_key(token: str) -> str:
+    return f"email_change:{token}"
 
 
-
-
-# PASSWORD UTILITIES
-# =============================================================================
-
-def hash_password(password: str) -> str:
-    """Hash a plain text password using bcrypt."""
-    return pwd_context.hash(password)
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify plain password against bcrypt hash."""
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-# =============================================================================
-# COOKIE CONFIGURATION
-# =============================================================================
-
-# Centralize cookie settings - easy to change in one place
-COOKIE_CONFIG = {
-    "httponly": True,   # ← JS cannot read
-    "secure": True,     # ← HTTPS only (set False for local dev)
-    "samesite": "lax",  # ← Protects against CSRF
-}
-
-ACCESS_TOKEN_COOKIE = "access_token"
-REFRESH_TOKEN_COOKIE = "refresh_token"
-CSRF_TOKEN_COOKIE = "csrf_token"   # ← NOT httponly - JS needs to read this
-
-
-def set_auth_cookies(
-    response: Response,
-    access_token: str,
-    refresh_token: str,
-    csrf_token: str,
-) -> None:
-    """
-    Set all auth cookies on response.
-    Called after login or token refresh.
-    
-    Args:
-        response: FastAPI response object
-        access_token: JWT access token
-        refresh_token: JWT refresh token
-        csrf_token: CSRF token
-    """
-    # Access token - HttpOnly, JS cannot read
-    response.set_cookie(
-        key=ACCESS_TOKEN_COOKIE,
-        value=access_token,
-        max_age=settings.access_token_expire_minutes * 60,
-        httponly=True,                  # ✅ XSS protection
-        secure=settings.is_production(), # ✅ HTTPS in production
-        samesite="lax",                 # ✅ CSRF protection
-    )
-    
-    # Refresh token - HttpOnly, JS cannot read
-    response.set_cookie(
-        key=REFRESH_TOKEN_COOKIE,
-        value=refresh_token,
-        max_age=settings.refresh_token_expire_days * 24 * 60 * 60,
-        httponly=True,                  # ✅ XSS protection
-        secure=settings.is_production(),
-        samesite="lax",
-    )
-    
-    # CSRF token - NOT HttpOnly, JS needs to read and send in header
-    response.set_cookie(
-        key=CSRF_TOKEN_COOKIE,
-        value=csrf_token,
-        max_age=settings.access_token_expire_minutes * 60,
-        httponly=False,                 # ✅ JS can read this
-        secure=settings.is_production(),
-        samesite="lax",
-    )
-
-
-def clear_auth_cookies(response: Response) -> None:
-    """
-    Clear all auth cookies (logout).
-    
-    Args:
-        response: FastAPI response object
-    """
-    response.delete_cookie(ACCESS_TOKEN_COOKIE)
-    response.delete_cookie(REFRESH_TOKEN_COOKIE)
-    response.delete_cookie(CSRF_TOKEN_COOKIE)
-
-
-
-# =============================================================================
-# TOKEN CREATION
-# =============================================================================
-async def create_token_response(
+def build_email_change_session(
     user_id: int,
-    redis: Redis,
-) -> TokenData:                    # ← Returns TokenData, not TokenResponse
-    access_token = create_access_token(user_id)
-    refresh_token = await create_refresh_token(user_id, redis)
-    csrf_token = await generate_csrf_token(user_id, redis)
-    
-    return TokenData(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        csrf_token=csrf_token,
-    )
- 
-
-
-
-
-
-
-
-def create_access_token(user_id: int) -> str:
-    """
-    Create signed JWT access token.
-    
-    Args:
-        user_id: User's database ID
-        
-    Returns:
-        str: Signed JWT
-    """
-    now = datetime.now(timezone.utc)
-    payload = TokenPayload(
-        sub=user_id,
-        iat=int(now.timestamp()),
-        exp=int((now + timedelta(
-            minutes=settings.access_token_expire_minutes
-        )).timestamp()),
-        jti=secrets.token_urlsafe(32),
-        token_type="access",
-    )
-    
-    return jwt.encode(
-        payload.model_dump(),
-        settings.private_key.get_secret_value(),
-        algorithm=settings.algorithm,
-    )
-
-
-async def create_refresh_token(
-    user_id: int,
-    redis: Redis,
-    #mail: FastMail
+    new_email: str,
 ) -> str:
     """
-    Create signed JWT refresh token and store in Redis.
-    
-    Args:
-        user_id: User's database ID
-        redis: Redis client
-        
-    Returns:
-        str: Signed JWT
+    Canonical JSON payload for an email-change session.
+
+    Writer: request_email_change()
+    Readers: resend_otp(), verify_new_email()
     """
-    now = datetime.now(timezone.utc)
-    jti = str(uuid4())
-    
-    payload = RefreshTokenPayload(
-        sub=user_id,
-        iat=int(now.timestamp()),
-        exp=int((now + timedelta(
-            days=settings.refresh_token_expire_days
-        )).timestamp()),
-        jti=jti,
-        token_type="refresh",
+    return json.dumps(
+        {
+            "user_id": user_id,
+            "new_email": normalize_email(new_email),
+        }
     )
-    
-    token = jwt.encode(
-        payload.model_dump(),
-        settings.private_key.get_secret_value(),
-        algorithm=settings.algorithm,
-    )
-    
-    # Store in Redis for rotation/replay protection
-    redis_key = f"user_refresh:{user_id}"
-    await redis.sadd(redis_key, token)
-    await redis.expire(
-        redis_key,
-        int(timedelta(days=settings.refresh_token_expire_days).total_seconds())
-    )
-    
-    return token
 
 
+def session_ttl_seconds() -> int:
+    return int(timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds())
 
 
-
-# =============================================================================
-# TOKEN EXTRACTION FROM COOKIES
-# =============================================================================
-
-async def get_access_token_from_cookie(request: Request) -> str:
-    """
-    Extract access token from HttpOnly cookie.
-    
-    ✅ No Authorization header needed
-    ✅ Browser sends cookie automatically
-    
-    Args:
-        request: FastAPI request
-        
-    Returns:
-        str: JWT access token
-        
-    Raises:
-        HTTPException: If cookie missing
-    """
-    token = request.cookies.get(ACCESS_TOKEN_COOKIE)
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-        )
-    return token
-
-
-
-
-# =============================================================================
-# TOKEN VALIDATION
-# =============================================================================
-
-def decode_access_token(token: str) -> TokenPayload:
-    """
-    Decode and validate access token.
-    
-    Args:
-        token: JWT string
-        
-    Returns:
-        TokenPayload: Validated payload
-        
-    Raises:
-        HTTPException: On invalid/expired token
-    """
-    try:
-        payload = jwt.decode(
-            token,
-            settings.public_key,
-            algorithms=[settings.algorithm],
-            options={"require": ["exp", "iat", "sub", "jti", "token_type"]},
-        )
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Access token expired",
-        )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid access token",
-        )
-    
-    return TokenPayload(**payload)
-
-
-async def validate_refresh_token(
-    refresh_token: str,
+async def parse_email_change_session(
     redis: Redis,
-) -> int:
+    token: str,
+    *,
+    delete_on_error: bool = True,
+) -> tuple[int, str]:
     """
-    Validate refresh token with replay protection.
-    
-    Steps:
-    1. Quick pre-check (no crypto)
-    2. Blacklist check
-    3. Full crypto verification
-    4. Replay protection
-    
-    Args:
-        refresh_token: JWT refresh token
-        redis: Redis client
-        
-    Returns:
-        int: User ID
+    Load and validate an email-change session from Redis.
+
+    Returns (user_id, new_email).
+
+    Raises HTTPException(400, SESSION_EXPIRED_DETAIL) on any failure.
+    If delete_on_error is True, a corrupted session is purged.
     """
-    # Step 1: Quick pre-check
-    try:
-        unverified = jwt.decode(
-            refresh_token,
-            options={"verify_signature": False}
+    key = email_change_key(token)
+
+    stored = await redis.get(key)
+    if not stored:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=SESSION_EXPIRED_DETAIL,
         )
-        jti = unverified.get("jti")
-        
-        if not jti or unverified.get("token_type") != "refresh":
+
+    if isinstance(stored, bytes):
+        stored = stored.decode("utf-8")
+
+    try:
+        session = json.loads(stored)
+        user_id = int(session["user_id"])
+        new_email = normalize_email(session["new_email"])
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        if delete_on_error:
+            await redis.delete(key)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=SESSION_EXPIRED_DETAIL,
+        )
+
+    if not new_email:
+        if delete_on_error:
+            await redis.delete(key)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=SESSION_EXPIRED_DETAIL,
+        )
+
+    return user_id, new_email
+
+
+
+import json
+from datetime import timedelta
+from typing import Literal
+
+from fastapi import HTTPException, status, BackgroundTasks
+from fastapi_mail import FastMail
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.user import User
+from app.core.config import OTP_EXPIRE_MINUTES
+from app.utils.otp import generate_and_send_otp
+from app.utils.users import get_user_by_email, get_user_id
+from app.utils.email import normalize_email
+from app.core.logging import logger
+
+
+OtpType = Literal["registration", "login", "email_change", "password_reset"]
+
+_SESSION_EXPIRED = "Session expired - please start over"
+
+
+# =============================================================================
+# RESEND OTP
+# =============================================================================
+
+async def resend_otp(
+    data,  # ResendOtpRequest: email, account_token, otp_type
+    db: AsyncSession,
+    redis: Redis,
+    mailer: FastMail,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """
+    Resend OTP for an active authentication flow.
+
+    Supported flows:
+
+        registration
+            Session:  reg_attempt:{token}
+            Rule:     user must still be unverified.
+
+        login
+            Session:  login_attempt:{token}
+            Rule:     user must still be verified AND active.
+            Note:     session is created only for verified + active users,
+                      but we re-check state as defense-in-depth.
+
+        email_change
+            Session:  email_change:{token}
+            Value:    JSON { "user_id": int, "new_email": str }
+            Rule:     user is resolved from the session,
+                      NOT from client-supplied email.
+            OTP sent to: session.new_email
+
+        password_reset
+            Session:  reset_attempt:{token}
+            Rule:     user must still satisfy password-reset flow rules.
+
+    Notes:
+        - The existing session token is NOT replaced or deleted on success.
+        - On successful resend the session TTL is refreshed so the user
+          isn't cut off mid-flow.
+        - A new OTP overwrites the previous OTP hash for (user_id, otp_type).
+    """
+
+    # =========================================================================
+    # EMAIL CHANGE — user + new_email come entirely from the Redis session
+    # =========================================================================
+    if data.otp_type == "email_change":
+
+        token_key = f"email_change:{data.account_token}"
+        stored = await redis.get(token_key)
+
+        if not stored:
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid refresh token"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=_SESSION_EXPIRED,
             )
-    except jwt.PyJWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Malformed token"
-        )
-    
-    # Step 2: Blacklist check
-    if await redis.get(f"blacklist:refresh:{jti}"):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has been revoked"
-        )
-    
-    # Step 3: Full crypto verification
-    try:
-        payload = jwt.decode(
-            refresh_token,
-            settings.public_key,
-            algorithms=[settings.algorithm],
-            options={"require": ["exp", "iat", "sub", "jti", "token_type"]},
-        )
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token expired"
-        )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token"
-        )
-    
-    user_id = int(payload["sub"])
-    
-    # Step 4: Replay protection
-    is_valid = await redis.sismember(f"user_refresh:{user_id}", refresh_token)
-    if not is_valid:
-        await redis.set(
-            f"blacklist:refresh:{jti}",
-            "1",
-            ex=int(timedelta(days=settings.refresh_token_expire_days).total_seconds())
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token no longer valid - please login again"
-        )
-    
-    return user_id
 
+        if isinstance(stored, bytes):
+            stored = stored.decode("utf-8")
 
-# =============================================================================
-# TOKEN REVOCATION
-# =============================================================================
-
-async def revoke_refresh_token(
-    refresh_token: str,
-    redis: Redis,
-) -> None:
-    """Revoke a single refresh token."""
-    try:
-        payload = jwt.decode(
-            refresh_token,
-            settings.public_key,
-            algorithms=[settings.algorithm],
-        )
-        user_id = int(payload["sub"])
-        jti = payload["jti"]
-        
-        await redis.srem(f"user_refresh:{user_id}", refresh_token)
-        await redis.set(
-            f"blacklist:refresh:{jti}",
-            "1",
-            ex=int(timedelta(days=settings.refresh_token_expire_days).total_seconds())
-        )
-    except Exception:
-        pass  # Already invalid
-
-
-async def revoke_all_user_tokens(
-    user_id: int,
-    redis: Redis,
-) -> None:
-    """Revoke ALL refresh tokens for user (logout everywhere)."""
-    redis_key = f"user_refresh:{user_id}"
-    tokens = await redis.smembers(redis_key)
-    
-    for token in tokens:
         try:
-            payload = jwt.decode(
-                token,
-                options={"verify_signature": False}
+            session = json.loads(stored)
+            user_id = int(session["user_id"])
+            new_email = normalize_email(session["new_email"])
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            await redis.delete(token_key)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=_SESSION_EXPIRED,
             )
-            jti = payload.get("jti")
-            if jti:
-                await redis.set(
-                    f"blacklist:refresh:{jti}",
-                    "1",
-                    ex=int(timedelta(days=settings.refresh_token_expire_days).total_seconds())
-                )
-        except Exception:
-            continue
-    
-    await redis.delete(redis_key)
 
+        if not new_email:
+            await redis.delete(token_key)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=_SESSION_EXPIRED,
+            )
 
-# =============================================================================
-# CSRF PROTECTION
-# =============================================================================
+        user = await db.get(User, user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found",
+            )
 
-async def generate_csrf_token(
-    user_id: int,
-    redis: Redis,
-) -> str:
-    """Generate and store CSRF token in Redis."""
-    csrf_token = secrets.token_urlsafe(32)
-    expiry_seconds = settings.access_token_expire_minutes * 60
-    
-    csrf_data = CSRFData(
-        user_id=user_id,
-        expires_at=int(
-            (datetime.now(timezone.utc) + timedelta(
-                seconds=expiry_seconds
-            )).timestamp()
+        # Send OTP to the session-owned new email (never trust client email)
+        await generate_and_send_otp(
+            user=user,
+            otp_type="email_change",
+            subject="Verify your new email address",
+            redis=redis,
+            mailer=mailer,
+            background_tasks=background_tasks,
+            override_email=new_email,
         )
-    )
-    
-    await redis.set(
-        f"csrf:{user_id}:{csrf_token}",
-        json.dumps(csrf_data.model_dump()),
-        ex=expiry_seconds,
-    )
-    
-    return csrf_token
 
+        await _refresh_session_ttl(redis, token_key)
 
-async def verify_csrf_token(
-    redis: Redis,
-    user_id: int,
-    csrf_token: str,
-    #redis: RedisDep,
-) -> bool:
-    """Verify CSRF token against Redis."""
-    key = f"csrf:{user_id}:{csrf_token}"
-    raw = await redis.get(key)
-    
-    if not raw:
-        return False
-    
+        logger.info(
+            "Resent email_change OTP for user_id=%s (target=%s)",
+            user_id,
+            new_email,
+        )
+
+        return {"message": "A new OTP has been sent to your email"}
+
+    # =========================================================================
+    # REGISTRATION / LOGIN / PASSWORD_RESET — look up by client email
+    # =========================================================================
+    email = normalize_email(data.email)
+    user = await get_user_by_email(db, email)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    user_id = get_user_id(user)
+
+    # -------------------------------------------------------------------------
+    # Resolve flow-specific rules + session key
+    # -------------------------------------------------------------------------
+    if data.otp_type == "registration":
+
+        if user.verified:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Account already verified",
+            )
+
+        token_key = f"reg_attempt:{data.account_token}"
+        subject = "Verify your account"
+
+    elif data.otp_type == "login":
+
+        # Defense-in-depth: state may have changed since initiate_login()
+        if user.disabled:
+            logger.warning(
+                "Disabled user attempted login OTP resend: user_id=%s",
+                user_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account suspended. Please contact admin.",
+            )
+
+        if not user.verified:
+            logger.info(
+                "Unverified user attempted login OTP resend: user_id=%s",
+                user_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account not verified. Please verify your email first.",
+            )
+
+        token_key = f"login_attempt:{data.account_token}"
+        subject = "Your login OTP"
+
+    elif data.otp_type == "password_reset":
+
+        token_key = f"reset_attempt:{data.account_token}"
+        subject = "Reset your password"
+
+    else:
+        # Unreachable if OtpType Literal is enforced upstream,
+        # but kept for safety against direct calls.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported OTP type for resend",
+        )
+
+    # -------------------------------------------------------------------------
+    # Validate session token (do NOT delete on success — only refresh TTL)
+    # -------------------------------------------------------------------------
+    stored = await redis.get(token_key)
+
+    if not stored:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_SESSION_EXPIRED,
+        )
+
+    if isinstance(stored, bytes):
+        stored = stored.decode("utf-8")
+
     try:
-        csrf_info = CSRFData(**json.loads(raw))
-    except (json.JSONDecodeError, ValueError):
-        await redis.delete(key)
-        return False
-    
-    if csrf_info.user_id != user_id:
-        return False
-    
-    if csrf_info.expires_at < int(datetime.now(timezone.utc).timestamp()):
-        await redis.delete(key)
-        return False
-    
-    return True
-
-
-async def csrf_protection(
-    request: Request,
-    redis: Redis,
-    user_id: int,
-) -> None:
-    """
-    Validate CSRF token.
-    
-    Flow:
-    1. Browser sends cookie automatically (HttpOnly)
-    2. Frontend JS reads csrf_token cookie (NOT httponly)
-    3. Frontend sends csrf_token in X-CSRF-Token header
-    4. We compare header value against Redis
-    """
-    header_token = request.headers.get("X-CSRF-Token")
-    
-    if not header_token:
+        stored_user_id = int(stored)
+    except (TypeError, ValueError):
+        await redis.delete(token_key)
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="CSRF token missing from headers"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_SESSION_EXPIRED,
         )
-    
-    if not await verify_csrf_token(user_id, header_token, redis):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid or expired CSRF token"
-        )
-        
 
-async def require_csrf(
-    request: Request,
-    redis: Redis,
-    current_user: ReadUser = Depends(get_authenticated_user),
-) -> None:
-    """
-    Dependency: Require valid CSRF token.
-    
-    Usage:
-        @router.post("/sensitive")
-        async def sensitive(_: None = Depends(require_csrf)):
-            ...
-    """
-    await csrf_protection(
-        request=request,
+    if stored_user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_SESSION_EXPIRED,
+        )
+
+    # -------------------------------------------------------------------------
+    # Send new OTP (overwrites previous hash for this user + otp_type)
+    # -------------------------------------------------------------------------
+    await generate_and_send_otp(
+        user=user,
+        otp_type=data.otp_type,
+        subject=subject,
         redis=redis,
-        user_id=current_user.id,
+        mailer=mailer,
+        background_tasks=background_tasks,
+        override_email=None,
     )
+
+    # -------------------------------------------------------------------------
+    # Refresh session TTL so the user isn't cut off mid-flow
+    # -------------------------------------------------------------------------
+    await _refresh_session_ttl(redis, token_key)
+
+    logger.info(
+        "Resent %s OTP for user_id=%s",
+        data.otp_type,
+        user_id,
+    )
+
+    return {"message": "A new OTP has been sent to your email"}
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+async def _refresh_session_ttl(redis: Redis, key: str) -> None:
+    """
+    Extend a session token's TTL after a successful resend.
+
+    Rationale:
+        A user who keeps re-requesting OTPs should not have the
+        underlying session expire underneath them. We only extend,
+        never shorten — if the existing TTL is longer, keep it.
+    """
+    try:
+        ttl = await redis.ttl(key)
+    except Exception:
+        logger.exception("Failed to read TTL for session key=%s", key)
+        return
+
+    if ttl is None or ttl < 0:
+        # -1 = no expiry, -2 = key vanished. Nothing to do.
+        return
+
+    fresh = int(timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds())
+
+    try:
+        await redis.expire(key, max(ttl, fresh))
+    except Exception:
+        logger.exception("Failed to refresh TTL for session key=%s", key)
