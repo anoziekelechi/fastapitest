@@ -1,149 +1,118 @@
-async def update_user_names(
-    data: UpdateNames,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> ReadUser:
+class ReadUser(BaseModel):
+    """User response schema."""
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: int 
+    surname: str
+    othernames: str
+    email: str
+    country: str | None = None
+    is_admin: bool
+    verified: bool
+    disabled: bool
+    date_verified: datetime | None = None
+    created_at: datetime
+    country_id: int | None = None
+    permission:str | None = None
+    
+
+
+class UserProfile(BaseModel):
     """
-    Update authenticated user's surname and/or othernames.
+    User profile response schema.
 
-    - Requires an authenticated user.
-    - Rejects a completely empty update payload.
-    - Only updates fields that actually changed.
-    - Rejects the request if no actual changes were made.
-    - Returns the updated user.
+    Fields shown conditionally:
+        country    → None if no country assigned
+        is_admin   → Only shown for admin users
+        name       → Group name, only if in a group
+        permission → Group permission, only if in a group
     """
+    model_config = ConfigDict(from_attributes=True)
 
-    # ==============================================================
-    # 1. Reject completely empty update payload
-    # ==============================================================
+    id: int
+    email: EmailStr
+    surname: str
+    othernames: str
+    country: str | None = None
+    verified: bool
+    disabled: bool
+    date_verified: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
 
-    if all(
-        value is None
-        for value in (
-            data.surname,
-            data.othernames,
-        )
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided for update",
-        )
+    # Conditionally included
+    is_admin: bool | None = None        # Only admins
+    name: str | None = None             # Group name (if in group)
+    permission: str | None = None       # Group permission (if in group)
 
-    # ==============================================================
-    # 2. Get the authenticated user from the database
-    # ==============================================================
+@router.get(
+    "/userprofile",
+    status_code=status.HTTP_200_OK,
+    summary="Get current user profile",
+    response_model=UserProfile,
+    response_model_exclude_none=True,   # ✅ Hides None fields from response
+)
+async def get_profile(
+    db: DBDep,
+    current_user: ReadUser = Depends(get_authenticated_user),  # ✅ ReadUser not User
+) -> dict:
+    """
+    Get authenticated user profile.
 
-    user = await get_user_by_id(
-        db,
-        current_user.id,
+    Response varies by role:
+        Regular user: base fields + group info if assigned
+        Admin: base fields + group info + is_admin: true
+    """
+    return await get_user_profile(
+        db=db,
+        current_user=current_user,
     )
 
-    if  user is None:
+async def get_user_profile(
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Load full user + relationships, then build profile dict
+    with role-based fields.
+    """
+    result = await db.execute(
+        select(User)
+        .options(
+            selectinload(User.country),  # type: ignore[arg-type]
+            selectinload(User.group),    # type: ignore[arg-type]
+        )
+        .where(User.id == current_user.id)
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
 
-    # ==============================================================
-    # 3. Update only fields that actually changed
-    # ==============================================================
+    profile: dict = {
+        "id": user.id,
+        "email": user.email,
+        "surname": user.surname,
+        "othernames": user.othernames,
+        "country": user.country.name if user.country else None,
+        "verified": user.verified,
+        "disabled": user.disabled,
+        "date_verified": user.date_verified,
+        "created_at": user.created_at,
+        "updated_at": user.updated_at,
+    }
 
-    updated_fields: list[str] = []
+    # Group info (only if user belongs to a group)
+    if user.group:
+        profile["name"] = user.group.name
+        profile["permission"] = user.group.permission
 
-    if data.surname is not None:
-        if data.surname != user.surname:
-            user.surname = data.surname
-            updated_fields.append("surname")
+    # Admin-only field
+    if user.is_admin:
+        profile["is_admin"] = True
 
-    if data.othernames is not None:
-        if data.othernames != user.othernames:
-            user.othernames = data.othernames
-            updated_fields.append("othernames")
-
-    # ==============================================================
-    # 4. Reject if nothing actually changed
-    # ==============================================================
-
-    if not updated_fields:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No changes were made",
-        )
-
-    # ==============================================================
-    # 5. Save changes
-    # # ==============================================================
-
-    # try:
-    #     await db.delete(user)
-    #     await db.commit()
-
-    # except Exception as exc:
-    #     await db.rollback()
-
-    #     logger.exception(
-    #         "Failed to permanently delete user_id=%s "
-    #         "from database",
-    #         user_id,
-    #     )
-
-    #     raise HTTPException(
-    #         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-    #         detail="Failed to delete account. Please try again later.",
-    #     ) from exc
-
-    db.add(user)
-    try:
-        await db.commit()
-        await db.refresh(user)
-        
-    except Exception as e:
-        await db.rollback()
-        logger.exception("Cannot complete username update")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="error occured while updating your name"
-        )
-
-   
-    logger.info(
-        f"User {current_user.id} updated: "
-        f"{', '.join(updated_fields)}"
-    )
-
-    # ==============================================================
-    # 7. Return updated user
-    # ==============================================================
-
-    return ReadUser.model_validate(user)
-
-# CHANGE PASSWORD
-
-async def change_password(
-    data: UpdatePassword,
-    db: AsyncSession,
-    redis:Redis,
-    current_user: ReadUser,
-) -> dict:
-    """Change user password."""
-    user = await get_user_by_id(db, current_user.id)
-    if  user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    
-    if not verify_password(data.current_password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Current password is incorrect"
-        )
-    
-    user.hashed_password = hash_password(data.new_password)
-    db.add(user)
-    await db.commit()
-    # force relogin on every devices
-    await revoke_all_user_tokens(current_user.id, redis)
-    return {"message": "Password updated successfully"}
-
+    return profile
 
