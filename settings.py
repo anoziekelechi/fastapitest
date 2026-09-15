@@ -1,3 +1,29 @@
+@property
+    def backend_dir(self) -> Path:
+        return Path(__file__).resolve().parent.parent.parent
+
+    @property
+    def project_root(self) -> Path:
+        return self.backend_dir.parent
+
+    @property
+    def templates_dir(self) -> Path:
+        return self.backend_dir / "templates"
+
+    @property
+    def email_templates_dir(self) -> Path:
+        return self.templates_dir / "emails"
+
+    @property
+    def pdf_templates_dir(self) -> Path:
+        return self.templates_dir / "pdfs"
+
+    @property
+    def report_templates_dir(self) -> Path:
+        return self.templates_dir / "reports"
+
+
+
 from ast import alias
 from email.policy import default
 from pydantic import SecretStr,field_validator,Field
