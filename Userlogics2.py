@@ -1,3 +1,441 @@
+
+import json
+import secrets
+from datetime import datetime, timedelta, timezone
+
+from fastapi import HTTPException, status, BackgroundTasks
+from fastapi_mail import FastMail
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.user import User
+from app.schemas.user import (
+    RequestPasswordChange,
+    ConfirmPasswordChange,
+    ReadUser,
+)
+from app.core.security import hash_password, verify_password
+from app.core.config import OTP_EXPIRE_MINUTES
+from app.core.logging import logger
+from app.utils.otp import generate_and_send_otp, verify_and_consume_otp
+from app.utils.users import get_user_by_id, get_user_id
+from app.utils.tokens import revoke_all_user_tokens
+
+
+# =============================================================================
+# SHARED HELPERS
+# =============================================================================
+
+_SESSION_EXPIRED = "Password change session expired or invalid."
+
+
+def _cp_attempt_key(token: str) -> str:
+    return f"change_password_attempt:{token}"
+
+
+def _cp_otp_key(user_id: int) -> str:
+    return f"otp:{user_id}:change_password"
+
+
+def _session_ttl_seconds() -> int:
+    return int(timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds())
+
+
+# =============================================================================
+# STEP 1 — REQUEST PASSWORD CHANGE
+# =============================================================================
+
+async def request_password_change(
+    data: RequestPasswordChange,
+    db: AsyncSession,
+    redis: Redis,
+    mailer: FastMail,
+    background_tasks: BackgroundTasks,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Step 1: Verify the current password, send an OTP to the user's email,
+    and issue an anti-replay session token.
+
+    Flow:
+        1. Load the ORM user.
+        2. Verify the supplied current password.
+        3. Reject if the account is disabled or unverified.
+        4. Send OTP to user.email (otp_type="change_password").
+        5. Create the session token in Redis (owner = user_id).
+
+    On OTP send failure the session token is NOT created, so there is
+    no orphaned state.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Load ORM user
+    # ------------------------------------------------------------------
+    user = await get_user_by_id(db, current_user.id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    user_id = get_user_id(user)
+
+    # ------------------------------------------------------------------
+    # 2. Verify current password
+    # ------------------------------------------------------------------
+    if not verify_password(data.current_password, user.hashed_password):
+        logger.warning(
+            "Failed password verification for password change request: user_id=%s",
+            user_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Current password is incorrect",
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Account-state guards (defense in depth)
+    # ------------------------------------------------------------------
+    if user.disabled:
+        logger.warning(
+            "Disabled user requested password change: user_id=%s",
+            user_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended. Please contact admin.",
+        )
+
+    if not user.verified:
+        logger.info(
+            "Unverified user requested password change: user_id=%s",
+            user_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account not verified. Please verify your email first.",
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Send OTP (may raise 429 from internal cooldown)
+    # ------------------------------------------------------------------
+    try:
+        await generate_and_send_otp(
+            user=user,
+            otp_type="change_password",
+            subject="Confirm your password change",
+            redis=redis,
+            mailer=mailer,
+            background_tasks=background_tasks,
+        )
+    except HTTPException as e:
+        # Bubble up 429 (cooldown) — frontend needs to surface it
+        if e.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            raise
+
+        logger.error(
+            "Failed to send change_password OTP for user_id=%s: %s",
+            user_id,
+            e.detail,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send OTP. Please try again.",
+        )
+    except Exception:
+        logger.exception(
+            "Unexpected error sending change_password OTP for user_id=%s",
+            user_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send OTP. Please try again.",
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Anti-replay session token (only after OTP is stored)
+    # ------------------------------------------------------------------
+    token = secrets.token_urlsafe(32)
+    await redis.set(
+        _cp_attempt_key(token),
+        str(user_id),
+        ex=_session_ttl_seconds(),
+    )
+
+    logger.info(
+        "Password change OTP sent for user_id=%s",
+        user_id,
+    )
+
+    return {
+        "message": (
+            "An OTP has been sent to your email. "
+            "Enter it below along with your new password."
+        ),
+        "change_password_token": token,
+    }
+
+
+# =============================================================================
+# STEP 2 — CONFIRM PASSWORD CHANGE
+# =============================================================================
+
+async def confirm_password_change(
+    data: ConfirmPasswordChange,
+    db: AsyncSession,
+    redis: Redis,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Step 2: Verify the OTP and set the new password.
+
+    Flow:
+        1. Load ORM user.
+        2. Validate session token → must exist and belong to caller.
+        3. Re-check account state (verified/disabled).
+        4. Reject if new password equals current password.
+        5. Atomically verify + consume OTP.
+        6. Update hashed_password and commit.
+        7. Revoke all refresh tokens (forces re-login everywhere).
+        8. Delete session token.
+        9. Return message.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Load ORM user
+    # ------------------------------------------------------------------
+    user = await get_user_by_id(db, current_user.id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    user_id = get_user_id(user)
+
+    # ------------------------------------------------------------------
+    # 2. Validate session token
+    # ------------------------------------------------------------------
+    session_key = _cp_attempt_key(data.change_password_token)
+    stored = await redis.get(session_key)
+
+    if not stored:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_SESSION_EXPIRED,
+        )
+
+    if isinstance(stored, bytes):
+        stored = stored.decode("utf-8")
+
+    try:
+        stored_user_id = int(stored)
+    except (TypeError, ValueError):
+        await redis.delete(session_key)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_SESSION_EXPIRED,
+        )
+
+    if stored_user_id != user_id:
+        logger.warning(
+            "change_password token mismatch: token_owner=%s, requester=%s",
+            stored_user_id,
+            user_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_SESSION_EXPIRED,
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Re-check account state
+    # ------------------------------------------------------------------
+    if user.disabled:
+        await redis.delete(session_key)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended. Please contact admin.",
+        )
+
+    if not user.verified:
+        await redis.delete(session_key)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account not verified. Please verify your email first.",
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Reject same-password (no-op change)
+    # ------------------------------------------------------------------
+    if verify_password(data.new_password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from your current password",
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Atomically verify + consume OTP
+    # ------------------------------------------------------------------
+    otp_key = _cp_otp_key(user_id)
+    otp_valid = await verify_and_consume_otp(
+        redis=redis,
+        otp_key=otp_key,
+        submitted_otp=data.otp_code,
+    )
+
+    if not otp_valid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OTP expired or invalid",
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Persist new password
+    # ------------------------------------------------------------------
+    user.hashed_password = hash_password(data.new_password)
+    db.add(user)
+
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "Failed to update password for user_id=%s",
+            user_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update password. Please try again.",
+        )
+
+    # ------------------------------------------------------------------
+    # 7. Revoke all refresh tokens
+    #
+    # Failing here is a security event: password is changed but old
+    # sessions may still be valid. Log critical and surface 500.
+    # ------------------------------------------------------------------
+    try:
+        await revoke_all_user_tokens(user_id, redis)
+    except Exception:
+        logger.critical(
+            "CRITICAL: password changed but token revocation failed for user_id=%s",
+            user_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Password was changed, but active sessions could not be "
+                "fully revoked. Please contact support."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 8. Consume session token
+    # ------------------------------------------------------------------
+    try:
+        await redis.delete(session_key)
+    except Exception:
+        logger.exception(
+            "Failed to delete change_password session for user_id=%s",
+            user_id,
+        )
+
+    logger.info("Password changed for user_id=%s", user_id)
+
+    return {"message": "Password updated successfully"}
+
+
+
+
+from pydantic import BaseModel, Field, EmailStr
+
+
+class RequestPasswordChange(BaseModel):
+    """Step 1 body — verify current password, request OTP."""
+    current_password: str = Field(..., min_length=1)
+
+
+class RequestPasswordChangeResponse(BaseModel):
+    message: str
+    change_password_token: str
+
+
+class ConfirmPasswordChange(BaseModel):
+    """Step 2 body — verify OTP, set new password."""
+    change_password_token: str = Field(..., min_length=10)
+    otp_code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+    new_password: str = Field(..., min_length=6)
+
+
+class MessageResponse(BaseModel):
+    message: str
+
+
+from fastapi import APIRouter, Depends, BackgroundTasks, status
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.session import get_db
+from app.db.redis import get_redis
+from app.core.mail import get_mailer
+from app.deps.auth import get_current_user
+from app.schemas.user import (
+    RequestPasswordChange,
+    RequestPasswordChangeResponse,
+    ConfirmPasswordChange,
+    MessageResponse,
+    ReadUser,
+)
+from app.services.auth_service import (
+    request_password_change,
+    confirm_password_change,
+)
+
+router = APIRouter(prefix="/me", tags=["me"])
+
+
+@router.post(
+    "/password/request",
+    response_model=RequestPasswordChangeResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def request_password_change_route(
+    data: RequestPasswordChange,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    mailer=Depends(get_mailer),
+    current_user: ReadUser = Depends(get_current_user),
+):
+    return await request_password_change(
+        data=data,
+        db=db,
+        redis=redis,
+        mailer=mailer,
+        background_tasks=background_tasks,
+        current_user=current_user,
+    )
+
+
+@router.post(
+    "/password/confirm",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def confirm_password_change_route(
+    data: ConfirmPasswordChange,
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis),
+    current_user: ReadUser = Depends(get_current_user),
+):
+    return await confirm_password_change(
+        data=data,
+        db=db,
+        redis=redis,
+        current_user=current_user,
+    )
+
 # app/utils/email_change.py
 
 import json
