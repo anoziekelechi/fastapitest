@@ -1,49 +1,6 @@
 
-import json
-import secrets
-from datetime import datetime, timedelta, timezone
-
-from fastapi import HTTPException, status, BackgroundTasks
-from fastapi_mail import FastMail
-from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.models.user import User
-from app.schemas.user import (
-    RequestPasswordChange,
-    ConfirmPasswordChange,
-    ReadUser,
-)
-from app.core.security import hash_password, verify_password
-from app.core.config import OTP_EXPIRE_MINUTES
-from app.core.logging import logger
-from app.utils.otp import generate_and_send_otp, verify_and_consume_otp
-from app.utils.users import get_user_by_id, get_user_id
-from app.utils.tokens import revoke_all_user_tokens
-
-
-# =============================================================================
-# SHARED HELPERS
-# =============================================================================
-
-_SESSION_EXPIRED = "Password change session expired or invalid."
-
-
-def _cp_attempt_key(token: str) -> str:
-    return f"change_password_attempt:{token}"
-
-
-def _cp_otp_key(user_id: int) -> str:
-    return f"otp:{user_id}:change_password"
-
-
-def _session_ttl_seconds() -> int:
-    return int(timedelta(minutes=OTP_EXPIRE_MINUTES).total_seconds())
-
-
-# =============================================================================
-# STEP 1 — REQUEST PASSWORD CHANGE
-# =============================================================================
+            
+# CHANGE PASSWORD
 
 async def request_password_change(
     data: RequestPasswordChange,
@@ -122,6 +79,7 @@ async def request_password_change(
     try:
         await generate_and_send_otp(
             user=user,
+            db=db,
             otp_type="change_password",
             subject="Confirm your password change",
             redis=redis,
@@ -152,14 +110,21 @@ async def request_password_change(
             detail="Failed to send OTP. Please try again.",
         )
 
+
     # ------------------------------------------------------------------
     # 5. Anti-replay session token (only after OTP is stored)
     # ------------------------------------------------------------------
     token = secrets.token_urlsafe(32)
+    change_password_key = f"change_password_attempt:{token}"
+    session_ttl = int(
+        timedelta(
+            minutes=OTP_EXPIRE_MINUTES
+        ).total_seconds()
+    )
     await redis.set(
-        _cp_attempt_key(token),
+        change_password_key,
         str(user_id),
-        ex=_session_ttl_seconds(),
+        ex=session_ttl,
     )
 
     logger.info(
@@ -176,9 +141,7 @@ async def request_password_change(
     }
 
 
-# =============================================================================
-# STEP 2 — CONFIRM PASSWORD CHANGE
-# =============================================================================
+
 
 async def confirm_password_change(
     data: ConfirmPasswordChange,
@@ -216,17 +179,18 @@ async def confirm_password_change(
     # ------------------------------------------------------------------
     # 2. Validate session token
     # ------------------------------------------------------------------
-    session_key = _cp_attempt_key(data.change_password_token)
-    stored = await redis.get(session_key)
 
-    if not stored:
+    session_key = f"change_password_attempt:{data.change_password_token}"
+    stored_id = await redis.get(session_key)
+
+    if not stored_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=_SESSION_EXPIRED,
         )
 
-    if isinstance(stored, bytes):
-        stored = stored.decode("utf-8")
+    if isinstance(stored_id, bytes):
+        stored = stored_id.decode("utf-8")
 
     try:
         stored_user_id = int(stored)
@@ -277,7 +241,7 @@ async def confirm_password_change(
     # ------------------------------------------------------------------
     # 5. Atomically verify + consume OTP
     # ------------------------------------------------------------------
-    otp_key = _cp_otp_key(user_id)
+    otp_key = f"otp:{user_id}:change_password"
     otp_valid = await verify_and_consume_otp(
         redis=redis,
         otp_key=otp_key,
@@ -345,52 +309,10 @@ async def confirm_password_change(
 
     return {"message": "Password updated successfully"}
 
+ 
 
 
 
-from pydantic import BaseModel, Field, EmailStr
-
-
-class RequestPasswordChange(BaseModel):
-    """Step 1 body — verify current password, request OTP."""
-    current_password: str = Field(..., min_length=1)
-
-
-class RequestPasswordChangeResponse(BaseModel):
-    message: str
-    change_password_token: str
-
-
-class ConfirmPasswordChange(BaseModel):
-    """Step 2 body — verify OTP, set new password."""
-    change_password_token: str = Field(..., min_length=10)
-    otp_code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
-    new_password: str = Field(..., min_length=6)
-
-
-class MessageResponse(BaseModel):
-    message: str
-
-
-from fastapi import APIRouter, Depends, BackgroundTasks, status
-from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.session import get_db
-from app.db.redis import get_redis
-from app.core.mail import get_mailer
-from app.deps.auth import get_current_user
-from app.schemas.user import (
-    RequestPasswordChange,
-    RequestPasswordChangeResponse,
-    ConfirmPasswordChange,
-    MessageResponse,
-    ReadUser,
-)
-from app.services.auth_service import (
-    request_password_change,
-    confirm_password_change,
-)
 
 router = APIRouter(prefix="/me", tags=["me"])
 
