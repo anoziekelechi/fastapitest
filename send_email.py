@@ -1,127 +1,26 @@
-async def generate_and_send_otp(
-    user: User,
-    otp_type: str,
-    subject: str,
-    redis: Redis,
-    mailer: FastMail,
-    background_tasks: BackgroundTasks,
-    override_email: str | None = None,
-) -> None:
-    """
-    Generate OTP, store its SHA-256 hash in Redis, then queue the email.
+"""Email sending utilities with retry logic."""
+from api.users.schemas import ReadUser
+import logging
+import smtplib
+import socket
+from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime, timezone
+from typing import Any
+from api.home.logics import get_home_settings_logic
+from api.core.settings import get_settings
+from pydantic import EmailStr
+from fastapi_mail import FastMail, MessageSchema, MessageType
+from tenacity import (
+    RetryCallState,
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
 
-    Redis key:
-        otp:{user_id}:{otp_type}
-
-    Redis value:
-        SHA-256(otp)
-
-    Supported types:
-        registration
-        login
-        email_change
-        change_password
-        password_reset
-    """
-
-    allowed = {
-        "registration",
-        "login",
-        "email_change",
-        "change_password",
-        "password_reset",
-    }
-
-    if otp_type not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unsupported OTP type",
-        )
-
-    user_id = get_user_id(user)
-
-    # =========================================================================
-    # RATE LIMIT
-    # =========================================================================
-
-    rate_key = f"otp_rate:{user_id}:{otp_type}"
-
-    count = await redis.incr(rate_key)
-
-    if count == 1:
-        await redis.expire(
-            rate_key,
-            OTP_RATE_WINDOW,
-        )
-
-    if count > OTP_RATE_LIMIT:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many OTP requests. Try again in 1 hour.",
-        )
-
-    # =========================================================================
-    # GENERATE OTP
-    # =========================================================================
-
-    otp = generate_otp()
-    otp_hash = hash_otp(otp)
-
-    otp_key = f"otp:{user_id}:{otp_type}"
-
-    # =========================================================================
-    # STORE HASH
-    #
-    # SET overwrites any previous OTP for this user + type.
-    #
-    # Therefore:
-    #
-    # old OTP → immediately invalid
-    # new OTP → becomes the only valid OTP
-    # =========================================================================
-
-    await redis.set(
-        otp_key,
-        otp_hash,
-        ex=int(
-            timedelta(
-                minutes=OTP_EXPIRE_MINUTES
-            ).total_seconds()
-        ),
-    )
-
-    recipient = (
-        override_email
-        if override_email is not None
-        else user.email
-    )
-
-    logger.info(
-        "OTP stored for user_id=%s (type=%s). "
-        "Queuing email...",
-        user_id,
-        otp_type,
-    )
-
-    # =========================================================================
-    # QUEUE EMAIL
-    #
-    # Plaintext OTP exists only in application memory.
-    # It is never stored in Redis.
-    # =========================================================================
-
-    background_tasks.add_task(
-        send_otp,
-        email=recipient,
-        otp=otp,
-        subject=subject,
-        otp_type=otp_type,
-        mailer=mailer,
-    )
+logger = logging.getLogger(__name__)
 
 
-
-#updated latest from deepseek
 """
 Generic email sending utility with retry logic and global template context.
 
@@ -134,26 +33,7 @@ Responsibilities:
 This module does NOT contain OTP business logic.
 """
 
-import logging
-import smtplib
-import socket
-from datetime import datetime, timezone
-from typing import Any
 
-from fastapi_mail import FastMail, MessageSchema, MessageType
-from sqlalchemy.ext.asyncio import AsyncSession
-from tenacity import (
-    RetryCallState,
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
-
-from api.services.home import get_home_settings_logic
-
-
-logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -254,7 +134,7 @@ async def _send_message(
 # =============================================================================
 
 async def _global_email_context(
-    session: AsyncSession,
+    db: AsyncSession,
 ) -> dict[str, Any]:
     """
     Return variables available to all HTML email templates.
@@ -263,7 +143,7 @@ async def _global_email_context(
     so that the email footer always reflects the current Home.sitename.
     """
 
-    home = await get_home_settings_logic(session)
+    home = await get_home_settings_logic(db)
 
     return {
         "current_year": datetime.now(timezone.utc).year,
@@ -279,11 +159,12 @@ async def send_email(
     recipient: str,
     subject: str,
     mailer: FastMail,
-    session: AsyncSession,
+    db: AsyncSession,
     *,
     body: str | None = None,
     template_name: str | None = None,
     template_body: dict[str, Any] | None = None,
+    user: ReadUser | None = None,
 ) -> None:
     """
     Send a generic email.
@@ -324,16 +205,19 @@ async def send_email(
     # =========================================================================
 
     if template_name is not None:
-        global_context = await _global_email_context(session)
+        global_context = await _global_email_context(db)
+        user_context= {"full_names":user.full_names} if user else {}
+        
 
         merged_body = {
             **global_context,
+            **user_context,
             **(template_body or {}),
         }
 
         message = MessageSchema(
             subject=subject,
-            recipients=[recipient],
+            recipients=[recipient],# type: ignore[arg-type]
             template_body=merged_body,
             subtype=MessageType.html,
         )
@@ -345,7 +229,7 @@ async def send_email(
     else:
         message = MessageSchema(
             subject=subject,
-            recipients=[recipient],
+            recipients=[recipient],# type: ignore[arg-type]
             body=body,
             subtype=MessageType.plain,
         )
@@ -397,16 +281,6 @@ It does NOT:
 Those responsibilities belong to the authentication/OTP logic layer.
 """
 
-import logging
-
-from fastapi_mail import FastMail
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from api.utils.email import send_email
-
-
-logger = logging.getLogger(__name__)
-
 
 # =============================================================================
 # OTP CONFIGURATION
@@ -416,10 +290,11 @@ OTP_LABELS = {
     "registration": "registration",
     "login": "login",
     "email_change": "email change",
+    "change_password":"change password",
     "password_reset": "password reset",
 }
 
-OTP_EXPIRE_MINUTES = 10
+OTP_EXPIRE_MINUTES = get_settings().otp_expire_minutes
 
 
 # =============================================================================
@@ -432,7 +307,7 @@ async def send_otp(
     subject: str,
     otp_type: str,
     mailer: FastMail,
-    session: AsyncSession,
+    user: ReadUser | None = None,
 ) -> None:
     """
     Send an OTP email using the shared HTML email utility.
@@ -441,6 +316,7 @@ async def send_otp(
         - registration
         - login
         - email_change
+        - change_password
         - password_reset
 
     The session is used only to resolve the current sitename for the email
@@ -467,14 +343,13 @@ async def send_otp(
             recipient=email,
             subject=subject,
             mailer=mailer,
-            session=session,
-            template_name="otp.html",
+            template_name="emails/otp.html",
             template_body={
                 "otp": otp,
                 "label": otp_label,
-                "otp_type": otp_type,
                 "expires_in_minutes": OTP_EXPIRE_MINUTES,
             },
+            user=user,
         )
 
     except Exception:
@@ -492,134 +367,13 @@ async def send_otp(
     )
 
 
-#old
-"""Email sending utilities with retry logic."""
-import logging
-import smtplib
-import socket
-from pydantic import EmailStr
-from fastapi_mail import FastMail, MessageSchema, MessageType
-from tenacity import (
-    RetryCallState,
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
-
-logger = logging.getLogger(__name__)
-def _before_sleep_log(retry_state: RetryCallState) -> None:
-    attempt=retry_state.attempt_number
-    if retry_state.next_action is not None:
-        sleep_time=getattr(retry_state.next_action, "sleep",0)
-        logger.warning(
-            f"Email send failed(attempt {attempt}). "
-            f"retrying in {sleep_time:.1f}s...."
-        )
-    else:
-        logger.warning(f"Email send failed(attempt {attempt}).Retrying")
-
-
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=2, min=2, max=30),
-    retry=retry_if_exception_type((
-        ConnectionError,
-        TimeoutError,
-        socket.timeout,
-        smtplib.SMTPConnectError,
-        smtplib.SMTPServerDisconnected,
-        smtplib.SMTPException,
-        # ✅ NOT SMTPAuthenticationError - retrying bad credentials is pointless
-    )),
-    before_sleep=_before_sleep_log,
-    reraise=True,
-)
-async def send_email(
-    recipient: str,
-    subject: str,
-    body: str,
-    mailer: FastMail,
-) -> None:
-    """
-    Send email with automatic retry on transient failures.
-    
-    Args:
-        recipient: Recipient email address
-        subject: Email subject
-        body: Email body (plain text)
-        mailer: FastMail instance (from app.state)
-        
-    Raises:
-        Exception: After all retries exhausted (caller should log/handle)
-    """
-    message = MessageSchema(
-        subject=subject,
-        recipients=[recipient], # type: ignore[arg-type]
-        body=body,
-        subtype=MessageType.plain,
-    )
-    
-    try:
-        await mailer.send_message(message)
-        logger.info(f"Email sent successfully to {recipient}")
-    except Exception:
-        logger.error(f"Failed to send email to {recipient} after all retries")
-        raise
-
-
-async def send_otp(
-    email: str,
-    otp: str,
-    subject: str,
-    otp_type: str,
-    mailer: FastMail,
-) -> None:
-    """
-    Send OTP email - wraps send_email with OTP-specific formatting.
-    
-    Args:
-        email: Recipient email
-        otp: 6-digit OTP code
-        subject: Email subject
-        otp_type: Type of OTP ("registration" or "login")
-        mailer: FastMail instance
-    """
-    body = (
-        f"Your {otp_type} OTP is: {otp}\n\n"
-        f"This code expires in 10 minutes.\n"
-        f"If you didn't request this, please ignore this email."
-    )
-    
-    try:
-        await send_email(
-            recipient=email,
-            subject=subject,
-            body=body,
-            mailer=mailer,
-        )
-    except Exception as exc:
-        # ✅ This is the key part the original advice was likely about:
-        # Don't let a failed background email vanish silently.
-        # Log loudly so ops/alerts can catch it.
-        logger.critical(
-            f"CRITICAL: OTP email to {email} failed after all retries. "
-            f"User cannot complete {otp_type}. Error: {exc}"
-        )
-        # Optionally: write to a "failed_notifications" table or alert system
-        # so support can manually intervene if this happens repeatedly
-        
-        
-        
-        
-        
-
 
 async def send_support_message(
     support_email: str,
     user_email: str,
     message: str,
     mailer: FastMail,
+    user: ReadUser | None = None,
 ) -> None:
     """
     Send disabled user's contact message to support email.
@@ -641,8 +395,13 @@ async def send_support_message(
         await send_email(
             recipient=support_email,
             subject=f"Disabled Account Contact: {user_email}",
-            body=body,
+            template_name="emails/support.html",
             mailer=mailer,
+            template_body={
+                "user_email":user_email,
+                "message":message,
+            },
+            user=user
         )
         logger.info(
             f"Support message from {user_email} "
@@ -653,3 +412,4 @@ async def send_support_message(
             f"CRITICAL: Failed to send support message "
             f"from {user_email} to {support_email}. Error: {exc}"
         )
+
