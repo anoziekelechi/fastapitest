@@ -1,24 +1,3 @@
-"""Email sending utilities with retry logic."""
-from api.users.schemas import ReadUser
-import logging
-import smtplib
-import socket
-from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime, timezone
-from typing import Any
-from api.home.logics import get_home_settings_logic
-from api.core.settings import get_settings
-from pydantic import EmailStr
-from fastapi_mail import FastMail, MessageSchema, MessageType
-from tenacity import (
-    RetryCallState,
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
-
-logger = logging.getLogger(__name__)
 
 
 """
@@ -26,14 +5,34 @@ Generic email sending utility with retry logic and global template context.
 
 Responsibilities:
     - Build plain-text or HTML emails
-    - Provide global template variables (current_year, sitename)
+    - Provide global template variables (current_year, sitename, full_names)
     - Send emails
     - Retry transient SMTP/network failures
 
-This module does NOT contain OTP business logic.
+This module does NOT contain OTP business logic, and it does NOT depend on
+any user domain schema. Callers pass `full_names` as a string.
 """
 
+import logging
+import smtplib
+from datetime import datetime, timezone
+from typing import Any
 
+from fastapi_mail import FastMail, MessageSchema, MessageType
+from pydantic import EmailStr
+from sqlalchemy.ext.asyncio import AsyncSession
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from api.home.logics import get_home_settings_logic
+
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -43,7 +42,6 @@ This module does NOT contain OTP business logic.
 EMAIL_RETRY_EXCEPTIONS = (
     ConnectionError,
     TimeoutError,
-    socket.timeout,
     smtplib.SMTPConnectError,
     smtplib.SMTPServerDisconnected,
 )
@@ -135,12 +133,16 @@ async def _send_message(
 
 async def _global_email_context(
     db: AsyncSession,
+    full_names: str,
 ) -> dict[str, Any]:
     """
     Return variables available to all HTML email templates.
 
     The sitename is read from the database (via get_home_settings_logic)
-    so that the email footer always reflects the current Home.sitename.
+    so that email templates always reflect the current Home.sitename.
+
+    `full_names` is provided by the caller and is required for every HTML
+    email, since all templates greet the recipient by name.
     """
 
     home = await get_home_settings_logic(db)
@@ -148,6 +150,7 @@ async def _global_email_context(
     return {
         "current_year": datetime.now(timezone.utc).year,
         "sitename": home.sitename,
+        "full_names": full_names,
     }
 
 
@@ -156,15 +159,15 @@ async def _global_email_context(
 # =============================================================================
 
 async def send_email(
-    recipient: str,
+    recipient: EmailStr,
     subject: str,
     mailer: FastMail,
     db: AsyncSession,
+    full_names: str,
     *,
     body: str | None = None,
     template_name: str | None = None,
     template_body: dict[str, Any] | None = None,
-    user: ReadUser | None = None,
 ) -> None:
     """
     Send a generic email.
@@ -184,6 +187,10 @@ async def send_email(
 
         current_year
         sitename
+        full_names
+
+    Anything else a template needs (otp, heading, message, etc.) must be
+    passed via `template_body`.
     """
 
     # =========================================================================
@@ -205,19 +212,19 @@ async def send_email(
     # =========================================================================
 
     if template_name is not None:
-        global_context = await _global_email_context(db)
-        user_context= {"full_names":user.full_names} if user else {}
-        
+        global_context = await _global_email_context(
+            db,
+            full_names,
+        )
 
         merged_body = {
             **global_context,
-            **user_context,
             **(template_body or {}),
         }
 
         message = MessageSchema(
             subject=subject,
-            recipients=[recipient],# type: ignore[arg-type]
+            recipients=[recipient],
             template_body=merged_body,
             subtype=MessageType.html,
         )
@@ -229,7 +236,7 @@ async def send_email(
     else:
         message = MessageSchema(
             subject=subject,
-            recipients=[recipient],# type: ignore[arg-type]
+            recipients=[recipient],
             body=body,
             subtype=MessageType.plain,
         )
@@ -266,7 +273,7 @@ async def send_email(
 
 
 """
-OTP email utilities.
+OTP and support contact email utilities.
 
 This module contains OTP-specific email presentation logic.
 
@@ -281,6 +288,19 @@ It does NOT:
 Those responsibilities belong to the authentication/OTP logic layer.
 """
 
+import logging
+
+from fastapi_mail import FastMail
+from pydantic import EmailStr
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from api.core.settings import get_settings
+from api.users.schemas import ReadUser
+from api.utils.email import send_email
+
+
+logger = logging.getLogger(__name__)
+
 
 # =============================================================================
 # OTP CONFIGURATION
@@ -290,7 +310,7 @@ OTP_LABELS = {
     "registration": "registration",
     "login": "login",
     "email_change": "email change",
-    "change_password":"change password",
+    "change_password": "change password",
     "password_reset": "password reset",
 }
 
@@ -302,12 +322,13 @@ OTP_EXPIRE_MINUTES = get_settings().otp_expire_minutes
 # =============================================================================
 
 async def send_otp(
-    email: str,
+    email: EmailStr,
     otp: str,
     subject: str,
     otp_type: str,
     mailer: FastMail,
-    user: ReadUser | None = None,
+    db: AsyncSession,
+    user: ReadUser,
 ) -> None:
     """
     Send an OTP email using the shared HTML email utility.
@@ -319,8 +340,14 @@ async def send_otp(
         - change_password
         - password_reset
 
-    The session is used only to resolve the current sitename for the email
-    footer (via get_home_settings_logic). OTP lifecycle is unaffected.
+    The recipient's full name is provided to the global template context so
+    that the greeting reads, e.g.:
+
+        Dear Ada Kelechi,
+        Your login OTP is 123456. It expires in 10 minutes.
+
+    Raises:
+        ValueError: if `otp_type` is not recognized.
     """
 
     # =========================================================================
@@ -343,13 +370,14 @@ async def send_otp(
             recipient=email,
             subject=subject,
             mailer=mailer,
+            db=db,
+            full_names=user.full_names,
             template_name="emails/otp.html",
             template_body={
                 "otp": otp,
                 "label": otp_label,
                 "expires_in_minutes": OTP_EXPIRE_MINUTES,
             },
-            user=user,
         )
 
     except Exception:
@@ -367,49 +395,80 @@ async def send_otp(
     )
 
 
+# =============================================================================
+# SUPPORT CONTACT EMAIL
+# =============================================================================
 
 async def send_support_message(
-    support_email: str,
-    user_email: str,
+    support_email: EmailStr,
+    user_email: EmailStr,
+    user_full_names: str,
     message: str,
     mailer: FastMail,
-    user: ReadUser | None = None,
+    db: AsyncSession,
 ) -> None:
     """
-    Send disabled user's contact message to support email.
+    Send a disabled user's contact message to the support email.
 
     Args:
-        support_email: Destination (country.email_support or settings.mail_username)
-        user_email: The user who sent the message
-        message: The user's message
-        mailer: FastMail instance
+        support_email:   Destination (country.email_support or settings.mail_username)
+        user_email:      The user who sent the message
+        user_full_names: The disabled user's full name (used for the greeting)
+        message:         The user's message
+        mailer:          FastMail instance
+        db:              AsyncSession (used for global template context)
+
+    Raises:
+        Exception: re-raised after logging, so callers can decide whether the
+            support contact failure should surface to the user.
     """
-    body = (
-        f"A disabled user has contacted support.\n\n"
-        f"From: {user_email}\n"
-        f"Message:\n{message}\n\n"
-        f"Please review this account and take appropriate action."
-    )
 
     try:
         await send_email(
             recipient=support_email,
             subject=f"Disabled Account Contact: {user_email}",
-            template_name="emails/support.html",
             mailer=mailer,
+            db=db,
+            full_names=user_full_names,
+            template_name="emails/support.html",
             template_body={
-                "user_email":user_email,
-                "message":message,
+                "user_email": user_email,
+                "message": message,
             },
-            user=user
         )
+
         logger.info(
-            f"Support message from {user_email} "
-            f"sent to {support_email}"
+            "Support message from %s sent to %s",
+            user_email,
+            support_email,
         )
-    except Exception as exc:
+
+    except Exception:
         logger.critical(
-            f"CRITICAL: Failed to send support message "
-            f"from {user_email} to {support_email}. Error: {exc}"
+            "CRITICAL: Failed to send support message "
+            "from %s to %s",
+            user_email,
+            support_email,
+            exc_info=True,
         )
+        raise
+
+
+
+
+
+
+
+
+_OTP_LABELS: dict[str, str] = {
+    "registration": "registration",
+    "login": "login",
+    "email_change": "email change",
+    "password_reset": "password reset",
+    "change_password": "password change",
+}
+
+
+
+
 
