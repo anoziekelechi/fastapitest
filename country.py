@@ -1,3 +1,140 @@
+# api/home/routes.py (excerpt — routes that changed)
+
+from fastapi import APIRouter, BackgroundTasks, Depends, UploadFile, File, Form, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from api.core.database import DBDep
+from api.home.schemas import (
+    CountryCreate,
+    CountryListRead,
+    CountryRead,
+    CountryUpdate,
+    CreateCountryResponse,
+    MessageResponse,
+    ReadHome,
+    UpdateCountryResponse,
+)
+from api.home.logics import (
+    create_country,
+    delete_country,
+    get_home_settings_logic,
+    read_all_countries,
+    read_single_country,
+    setup_home_logic,
+    update_country,
+)
+from api.users.deps import require_admin
+
+router = APIRouter(prefix="/home", tags=["Home"])
+
+
+# =============================================================================
+# COUNTRY
+# =============================================================================
+
+@router.post(
+    "/add_country",
+    response_model=CreateCountryResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new country (admin only)",
+)
+async def add_country(
+    data: CountryCreate,
+    db: DBDep,
+    _: None = Depends(require_admin),
+):
+    return await create_country(data=data, db=db)
+
+
+@router.get(
+    "/countries",
+    response_model=CountryListRead,
+    status_code=status.HTTP_200_OK,
+    summary="List countries",
+)
+async def list_countries(
+    db: DBDep,
+    skip: int = 0,
+    limit: int = 100,
+):
+    return await read_all_countries(db=db, skip=skip, limit=limit)
+
+
+@router.get(
+    "/{slug}",
+    response_model=CountryRead,
+    status_code=status.HTTP_200_OK,
+    summary="Get a single country",
+)
+async def get_country(slug: str, db: DBDep):
+    return await read_single_country(db=db, slug=slug)
+
+
+@router.patch(
+    "/{slug}",
+    response_model=UpdateCountryResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update a country (admin only)",
+)
+async def patch_country(
+    slug: str,
+    data: CountryUpdate,
+    db: DBDep,
+    _: None = Depends(require_admin),
+):
+    return await update_country(slug=slug, data=data, db=db)
+
+
+@router.delete(
+    "/{slug}",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Delete a country (admin only)",
+)
+async def remove_country(
+    slug: str,
+    db: DBDep,
+    _: None = Depends(require_admin),
+):
+    return await delete_country(db=db, slug=slug)
+
+
+# =============================================================================
+# HOME SETTINGS
+# =============================================================================
+
+@router.post(
+    "/setup",
+    response_model=ReadHome,
+    status_code=status.HTTP_200_OK,
+)
+async def setup_home(
+    db: DBDep,
+    sitename: str | None = Form(None),
+    intro: str | None = Form(None),
+    logo_key: UploadFile | None = File(None),
+    banner_key: UploadFile | None = File(None),
+    _: None = Depends(require_admin),
+):
+    return await setup_home_logic(
+        db=db,
+        sitename=sitename,
+        intro=intro,
+        logo_key=logo_key,
+        banner_key=banner_key,
+    )
+
+
+@router.get(
+    "/settings",
+    response_model=ReadHome,
+    status_code=status.HTTP_200_OK,
+)
+async def get_home_settings(db: DBDep):
+    return await get_home_settings_logic(db=db)
+
+
+
 # api/home/logics.py
 
 import logging
