@@ -80,7 +80,7 @@ from api.payments.schemas import (
 from api.users.schemas import ReadUser
 from api.core.permissions import Permissions
 from api.users.logics import has_permission
-from api.core.slug import generate_slug, parse_slug
+from api.core.slug import generate_slug
 
 logger = logging.getLogger(__name__)
 
@@ -144,12 +144,11 @@ async def create_payment_method(
     method = PaymentMethods(
         country_id=data.country_id,
         name=data.name,
+        slug=generate_slug(data.name),
     )
 
     try:
         db.add(method)
-        await db.flush()   # Get ID for slug generation
-        method.slug = generate_slug(method.name, method.id)  # type: ignore[arg-type]
         await db.commit()
         await db.refresh(method)
     except Exception as e:
@@ -330,8 +329,7 @@ async def update_payment_method(
         )
 
     method.name = data.name
-    old_slug = method.slug
-    method.slug = generate_slug(data.name, method.id)  # type: ignore[arg-type]
+    method.slug = generate_slug(data.name) 
 
     try:
         db.add(method)
@@ -386,5 +384,179 @@ async def delete_payment_method(
         )
 
     logger.info(f"Payment method '{method_name}' deleted by id={current_user.id}")
+
+
+
+
+
+    class Group(BaseModel,table=True):# type: ignore
+    __tablename__ = "groups" # type: ignore
+    slug: str | None = Field(
+        default= None,
+        sa_column=Column(String(100),nullable=True, unique=True, index=True)  
+    )
+    name: str = Field(
+        sa_column=Column(String(30),unique=True,nullable=False,index=True)
+        )
+    permission: str = Field(
+        sa_column=Column(String(30),unique=True,nullable=False,index=True)
+    )
+    
+    # one group many users one to many relationship
+    users: List["User"] = Relationship(back_populates="group", sa_relationship_kwargs={"passive_deletes":True})
+
+
+
+
+
+
+    
+async def get_current_user(
+    request: Request,
+    db: AsyncSession,
+) -> ReadUser:
+    """
+    Get current authenticated user from cookie.
+    
+    Loads permission ONCE here so all downstream
+    has_permission() calls are pure in-memory - no extra DB queries.
+    """
+    token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+    try:
+        payload = decode_access_token(token)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session",
+        )
+        
+
+    user = await get_user_by_id(db, payload.sub)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+        )
+
+    if user.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account suspended. Please contact admin.",
+            headers={"X-Error-Code":"account_suspended"},
+        )
+
+    if not user.verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account not verified. Please verify your email.",
+            headers={"X-Error-Code":"account_unverified"},
+        )
+
+    # ✅ Load permission ONCE - only 1 extra query for non-admins with a group
+    # Admins skip this entirely (no query needed)
+    permission: str | None = None
+    if not user.is_admin and user.group_id is not None:
+        from api.users.models import Group
+        group = await db.get(Group, user.group_id)
+        if group:
+            permission = group.permission
+
+    # ✅ Build ReadUser and inject permission
+    read_user = ReadUser.model_validate(user)
+    read_user.permission = permission
+    return read_user
+
+
+
+
+
+
+async def has_permission(
+    user: ReadUser,
+    required_perm: str,
+    target_country_id: int | None = None,
+) -> None:
+    """
+    Pure in-memory permission check.
+    No DB queries - permission already loaded in get_current_user.
+    
+    Hierarchy:
+        1. Admin → all permissions ✅
+        2. User with matching permission → allowed ✅
+        3. Everyone else → 403 ❌
+    
+    Args:
+        user: ReadUser with .permission already set
+        required_perm: Required permission string
+    
+    Raises:
+        HTTPException: 403 if permission denied
+    """
+    # Admins bypass all permission checks
+    if user.is_admin:
+        return
+
+    # No permission
+    if user.permission is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access deny,you dont have permission",
+            headers={"X-Error-Code":"no_permission"},
+        )
+    # wrong permission
+    if user.permission != required_perm:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied - requires '{required_perm}' permission",
+            headers={"X-Error-Code":"wrong_permission"},
+        )
+    # Country scope check
+    if target_country_id is not None:
+        if user.country_id is None:
+            raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied no country with such permission",
+            headers={"X-Error-Code":"no_country_scope"},
+        )
+        if user.country_id != target_country_id:
+            raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You dont have permission on this country resource,",
+            headers={"X-Error-Code":"wrong_country_scope"},
+            )
+            
+            
+            
+ 
+    
+
+
+
+    # can we rewrite this update with this pattern
+
+     # ------------------------------------------------------------------
+    # Reject empty update
+    # ------------------------------------------------------------------
+    if all(
+        value is None
+        for value in (
+            data.name,
+            data.currency_code,
+            data.whatsapp,
+            data.email_support,
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided for update",
+        )
+
+    updated_fields: list[str] = []
+
 
     return {"message": f"Payment method '{method_name}' deleted successfully"}
