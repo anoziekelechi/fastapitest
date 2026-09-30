@@ -1,3 +1,19 @@
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libharfbuzz0b \
+    libcairo2 \
+    libjpeg-dev \
+    libopenjp2-7 \
+    fonts-dejavu \
+    && rm -rf /var/lib/apt/lists/*
+
+
+
+install before pip install weasyprint so the shared libraries are present 
+when Python's build/link step runs. Here's the full pattern:
+
+
 backend/api/templates/
 ├── layouts/
 │   ├── base_email.html           # table-based, inline styles
