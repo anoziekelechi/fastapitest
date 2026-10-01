@@ -13,6 +13,141 @@ install before pip install weasyprint so the shared libraries are present
 when Python's build/link step runs. Here's the full pattern:
 
 
+"""
+Account-related notification emails.
+
+All functions here open their own DB session and are safe to call from
+FastAPI BackgroundTasks.
+"""
+
+import logging
+
+from fastapi_mail import FastMail
+from pydantic import EmailStr
+
+from api.db.session import async_session_maker
+from api.home.logics import get_home_settings_logic
+from api.utils.email import send_email
+
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# MESSAGE CATALOG
+# =============================================================================
+
+_ACCOUNT_UPDATE_MESSAGES: dict[str, tuple[str, str]] = {
+    "password": (
+        "Password Updated",
+        "Dear {name}, your password has been successfully updated.",
+    ),
+    "email": (
+        "Email Updated",
+        "Dear {name}, your email has been successfully updated.",
+    ),
+    "reset_password": (
+        "Password Reset",
+        "Dear {name}, your password has been reset successfully.",
+    ),
+}
+
+
+# =============================================================================
+# WELCOME EMAIL
+# =============================================================================
+
+async def send_welcome(
+    email: EmailStr,
+    full_names: str,
+    mailer: FastMail,
+) -> None:
+    """
+    Send the welcome email after successful registration.
+
+    Safe for BackgroundTasks; opens its own session.
+    """
+
+    try:
+        async with async_session_maker() as db:
+            sitename = (await get_home_settings_logic(db)).sitename
+
+            await send_email(
+                recipient=email,
+                subject=f"Welcome to {sitename}",
+                mailer=mailer,
+                db=db,
+                full_names=full_names,
+                template_name="emails/welcome.html",
+            )
+    except Exception:
+        logger.critical(
+            "CRITICAL: Welcome email to %s failed after all retries",
+            email,
+            exc_info=True,
+        )
+        raise
+
+    logger.info("Welcome email sent to %s", email)
+
+
+# =============================================================================
+# ACCOUNT UPDATE EMAIL
+# =============================================================================
+
+async def send_account_update_email(
+    email: EmailStr,
+    full_names: str,
+    label: str,
+    mailer: FastMail,
+) -> None:
+    """
+    Send an HTML notification after a successful account action.
+
+    Supported labels:
+        - "password"
+        - "email"
+        - "reset_password"
+
+    Safe for BackgroundTasks; opens its own session.
+
+    Raises:
+        ValueError: if `label` is not recognized.
+    """
+
+    if label not in _ACCOUNT_UPDATE_MESSAGES:
+        raise ValueError(
+            f"Unsupported label: {label!r}. "
+            f"Expected one of: {sorted(_ACCOUNT_UPDATE_MESSAGES)}"
+        )
+
+    subject, body_template = _ACCOUNT_UPDATE_MESSAGES[label]
+
+    try:
+        async with async_session_maker() as db:
+            await send_email(
+                recipient=email,
+                subject=subject,
+                mailer=mailer,
+                db=db,
+                full_names=full_names,
+                template_name="emails/account_update.html",
+                template_body={
+                    "heading": subject,
+                    "body_text": body_template.format(name=full_names),
+                },
+            )
+    except Exception:
+        logger.critical(
+            "CRITICAL: Account update email to %s failed (label=%s)",
+            email,
+            label,
+            exc_info=True,
+        )
+        raise
+
+    logger.info("Account update email sent to %s (label=%s)", email, label)
+
 backend/api/templates/
 ├── layouts/
 │   ├── base_email.html           # table-based, inline styles
