@@ -1,13 +1,4 @@
 
-Argument of type "list[dict[str, Any]] | list[UploadFile | Dict[Unknown, Unknown] | str]" cannot be assigned to parameter "attachments" of type "List[UploadFile | Dict[Unknown, Unknown] | str]" in function "__init__"
-  Type "list[dict[str, Any]] | list[UploadFile | Dict[Unknown, Unknown] | str]" is not assignable to type "List[UploadFile | Dict[Unknown, Unknown] | str]"
-    "list[dict[str, Any]]" is not assignable to "List[UploadFile | Dict[Unknown, Unknown] | str]"
-      Type parameter "_T@list" is invariant, but "dict[str, Any]" is not the same as "UploadFile | Dict[Unknown, Unknown] | str"
-      Consider switching from "list" to "Sequence" which is covariantPylancereportArgumentType
-(parameter) attachments: list[dict[str, Any]] | None
-
-# syntax=docker/dockerfile:1.7
-
 
 install before pip install weasyprint so the shared libraries are present 
 when Python's build/link step runs. Here's the full pattern:
