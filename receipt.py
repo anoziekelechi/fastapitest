@@ -1199,6 +1199,66 @@ def validate_message(v: str) -> str:
 
 
 
+# api/firms/models.py
+"""Firm/company profile model."""
+from typing import TYPE_CHECKING, Optional
+from sqlalchemy import Column, String, Integer, ForeignKey, Text
+from sqlmodel import Field, Relationship
+from api.core.base import BaseModel
 
+if TYPE_CHECKING:
+    from api.users.models import User
+    from api.receipts.models import Receipt
+
+
+class Firm(BaseModel, table=True):
+    """
+    Company/firm profile.
+    One user can have MANY firms.
+    """
+    __tablename__ = "firms"
+
+    # FK to User - NOT unique (user can have many firms)
+    user_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    name: str = Field(
+        sa_column=Column(String(200), nullable=False, unique=True, index=True)
+        # Examples: "ABC Business Entity", "XYZ and Sons Trading Company"
+    )
+
+    slug: str | None = Field(
+        default=None,
+        sa_column=Column(String(250), nullable=True, unique=True, index=True)
+    )
+
+    # Optional government registration number
+    # e.g. CAC number in Nigeria
+    registration_number: str | None = Field(
+        default=None,
+        sa_column=Column(String(100), nullable=True, unique=True)
+    )
+
+    address: str = Field(
+        sa_column=Column(Text, nullable=False)
+    )
+
+    phone_number: str = Field(
+        sa_column=Column(String(20), nullable=False)
+    )
+
+    deals_on: str = Field(
+        sa_column=Column(Text, nullable=False)
+    )
+
+    # Relationships
+    owner: Optional["User"] = Relationship(back_populates="firms")
+    receipts: list["Receipt"] = Relationship(back_populates="firm")
 
   
