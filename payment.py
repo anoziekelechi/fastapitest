@@ -1,88 +1,12 @@
+
+Argument of type "list[dict[str, Any]] | list[UploadFile | Dict[Unknown, Unknown] | str]" cannot be assigned to parameter "attachments" of type "List[UploadFile | Dict[Unknown, Unknown] | str]" in function "__init__"
+  Type "list[dict[str, Any]] | list[UploadFile | Dict[Unknown, Unknown] | str]" is not assignable to type "List[UploadFile | Dict[Unknown, Unknown] | str]"
+    "list[dict[str, Any]]" is not assignable to "List[UploadFile | Dict[Unknown, Unknown] | str]"
+      Type parameter "_T@list" is invariant, but "dict[str, Any]" is not the same as "UploadFile | Dict[Unknown, Unknown] | str"
+      Consider switching from "list" to "Sequence" which is covariantPylancereportArgumentType
+(parameter) attachments: list[dict[str, Any]] | None
+
 # syntax=docker/dockerfile:1.7
-
-# =============================================================================
-# BUILDER — install build tools + compile Python deps
-# =============================================================================
-FROM python:3.12-slim AS builder
-
-# Build-time deps: compilers + dev headers + WeasyPrint libs
-# (WeasyPrint libs must be present at build so cffi can link against them)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpango-1.0-0 \
-    libpangoft2-1.0-0 \
-    libpangocairo-1.0-0 \
-    libharfbuzz0b \
-    libcairo2 \
-    libffi-dev \
-    libjpeg-dev \
-    libopenjp2-7 \
-    shared-mime-info \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy
-
-WORKDIR /app
-
-# Copy lock files first for better caching
-COPY pyproject.toml uv.lock ./
-
-# Install deps into .venv without the project itself
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
-
-# Copy the rest of the app
-COPY . /app
-
-# Install the project itself
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
-
-
-# =============================================================================
-# RUNTIME — minimal image with only runtime deps
-# =============================================================================
-FROM python:3.12-slim AS runtime
-
-# Runtime deps for WeasyPrint.
-# Explicit list — never rely on transitive pulls for runtime-critical libs.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpango-1.0-0 \
-    libpangoft2-1.0-0 \
-    libpangocairo-1.0-0 \
-    libharfbuzz0b \
-    libcairo2 \
-    libjpeg-dev \
-    libopenjp2-7 \
-    shared-mime-info \
-    fonts-dejavu-core \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Bring over the built venv + app
-COPY --from=builder /app /app
-ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
-
-EXPOSE 8000
-
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
-
-
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpango-1.0-0 \
-    libpangoft2-1.0-0 \
-    libharfbuzz0b \
-    libcairo2 \
-    libjpeg-dev \
-    libopenjp2-7 \
-    fonts-dejavu \
-    && rm -rf /var/lib/apt/lists/*
-
 
 
 install before pip install weasyprint so the shared libraries are present 
