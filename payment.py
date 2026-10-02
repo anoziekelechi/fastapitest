@@ -1,33 +1,137 @@
- # =============================================================================
+# api/firms/logics.py
+"""Firm business logic."""
+
+import logging
+
+from fastapi import HTTPException, status
+from sqlalchemy import func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
+
+from api.core.slug import generate_slug, parse_slug
+from api.core.validators import normalize_firm_name
+from api.firms.models import Firm
+from api.firms.schemas import (
+    FirmCreate,
+    FirmListRead,
+    FirmRead,
+    FirmUpdate,
+)
+from api.receipts.models import Receipt
+from api.users.schemas import ReadUser
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
 # HELPERS
 # =============================================================================
-async def get_firm_by_slug(
-    db:AsyncSession,
-    slug:str,
-)-> Firm:
-    
-    normalized_slug = slug.strip().lower()
-    result = await db.execute(
-        select(Firm).where(Firm.slug== normalized_slug)
-    )
-    firm=result.scalars().first()
-    if firm is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Country {slug} not found"
-        )
-    return firm
 
+async def get_firm_by_slug(
+    db: AsyncSession,
+    slug: str,
+) -> Firm | None:
+    """
+    Fetch a firm by slug.
+
+    Slug format is `{id}-{slugified-name}` (via generate_slug), so
+    the numeric prefix allows a fast PK lookup before falling back
+    to a slug query.
+
+    Returns None if not found — callers decide whether that's a 404.
+    """
+    try:
+        firm_id = parse_slug(slug)
+        if firm_id is not None:
+            firm = await db.get(Firm, firm_id)
+            if firm and firm.slug == slug.strip().lower():
+                return firm
+
+        result = await db.execute(
+            select(Firm).where(Firm.slug == slug.strip().lower())
+        )
+        return result.scalars().first()
+    except Exception:
+        logger.exception("Failed to fetch firm slug=%s", slug)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        )
 
 
 async def get_firm_by_name(
     db: AsyncSession,
     name: str,
 ) -> Firm | None:
-    
-    normalize_name = normalize_firm_name(name)
-    result = await db.execute(select(Firm).where(Firm.name == normalize_name))
-    return result.scalars().first()
+    """
+    Fetch a firm by normalized name.
+
+    Caller passes the raw name; we normalize here so the query is
+    case-insensitive and whitespace-collapsed consistently.
+    """
+    try:
+        normalized = normalize_firm_name(name)
+        result = await db.execute(
+            select(Firm).where(Firm.name == normalized)
+        )
+        return result.scalars().first()
+    except Exception:
+        logger.exception("Failed to fetch firm name=%s", name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        )
+
+
+async def _count_receipts(
+    db: AsyncSession,
+    firm_id: int,
+) -> int:
+    """
+    Count receipts belonging to a firm.
+
+    Best-effort — returns 0 on error rather than failing the whole
+    request, since the count is metadata and shouldn't block reads.
+    """
+    try:
+        return (
+            await db.execute(
+                select(func.count())
+                .select_from(Receipt)
+                .where(Receipt.firm_id == firm_id)
+            )
+        ).scalar() or 0
+    except Exception:
+        logger.exception(
+            "Failed to count receipts for firm_id=%s", firm_id
+        )
+        return 0
+
+
+async def _counts_by_firm(
+    db: AsyncSession,
+    firm_ids: list[int],
+) -> dict[int, int]:
+    """
+    Batch receipt counts for a list of firm IDs.
+
+    One query, grouped. Returns {firm_id: count}.
+    """
+    if not firm_ids:
+        return {}
+    try:
+        result = await db.execute(
+            select(Receipt.firm_id, func.count(Receipt.id))
+            .where(Receipt.firm_id.in_(firm_ids))
+            .group_by(Receipt.firm_id)
+        )
+        return dict(result.all())
+    except Exception:
+        logger.exception(
+            "Failed to batch-count receipts for %s firms", len(firm_ids)
+        )
+        return {}
+
 
 # =============================================================================
 # CREATE
@@ -38,23 +142,21 @@ async def create_firm(
     db: AsyncSession,
     current_user: ReadUser,
 ) -> dict:
-    """
-    Create a firm profile. A user may own multiple firms.
-    """
+    """Create a firm profile. A user may own multiple firms."""
 
     user_id = current_user.id
 
     # ------------------------------------------------------------------
     # Name uniqueness (global)
     # ------------------------------------------------------------------
-    normalize_name=normalize_firm_name(data.name)
-    existing_name = await get_firm_by_name(db, normalize_name)
+    existing_name = await get_firm_by_name(db, data.name)
     if existing_name is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"firm '{data.name}' already exists",
+            detail=f"Firm '{data.name}' already exists",
         )
 
+    normalized = normalize_firm_name(data.name)
 
     # ------------------------------------------------------------------
     # Registration number uniqueness
@@ -92,8 +194,8 @@ async def create_firm(
     # ------------------------------------------------------------------
     firm = Firm(
         user_id=user_id,
-        name=data.name,
-        slug=generate_slug(normalize_name),
+        name=normalized,
+        slug=generate_slug(normalized),
         registration_number=data.registration_number,
         address=data.address,
         phone_number=data.phone_number,
@@ -106,9 +208,7 @@ async def create_firm(
         await db.refresh(firm)
     except Exception:
         await db.rollback()
-        logger.exception(
-            "Failed to create firm for user_id=%s", user_id
-        )
+        logger.exception("Failed to create firm for user_id=%s", user_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create firm profile. Please try again.",
@@ -143,6 +243,9 @@ async def read_my_firms(
             .order_by(Firm.name)
         )
         firms = result.scalars().all()
+        counts = await _counts_by_firm(db, [f.id for f in firms])
+    except HTTPException:
+        raise
     except Exception:
         logger.exception(
             "Failed to load firms for user_id=%s", current_user.id
@@ -152,10 +255,13 @@ async def read_my_firms(
             detail="Failed to load your firms. Please try again.",
         )
 
-    return FirmListRead(
-        total=len(firms),
-        firms=[FirmRead.model_validate(f) for f in firms],
-    )
+    reads = []
+    for firm in firms:
+        read = FirmRead.model_validate(firm)
+        read.receipt_count = counts.get(firm.id, 0)
+        reads.append(read)
+
+    return FirmListRead(total=len(reads), firms=reads)
 
 
 async def read_all_firms(
@@ -163,7 +269,12 @@ async def read_all_firms(
     skip: int = 0,
     limit: int = 100,
 ) -> FirmListRead:
-    """List all firms. only admin can read all firm in db."""
+    """
+    List every firm in the database.
+
+    Route-level `AdminUser` dependency enforces admin-only access.
+    This service has no user context by design.
+    """
     try:
         total: int = (
             await db.execute(select(func.count()).select_from(Firm))
@@ -173,6 +284,9 @@ async def read_all_firms(
             select(Firm).order_by(Firm.name).offset(skip).limit(limit)
         )
         firms = result.scalars().all()
+        counts = await _counts_by_firm(db, [f.id for f in firms])
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Failed to list firms")
         raise HTTPException(
@@ -180,25 +294,47 @@ async def read_all_firms(
             detail="Failed to load firms. Please try again.",
         )
 
-    return FirmListRead(
-        total=total,
-        firms=[FirmRead.model_validate(f) for f in firms],
-    )
+    reads = []
+    for firm in firms:
+        read = FirmRead.model_validate(firm)
+        read.receipt_count = counts.get(firm.id, 0)
+        reads.append(read)
+
+    return FirmListRead(total=total, firms=reads)
 
 
 async def read_single_firm(
     slug: str,
     db: AsyncSession,
-    #current_user: ReadUser,
+    current_user: ReadUser,
 ) -> FirmRead:
-    """Get a single firm by slug. only owner can access his own firm"""
+    """
+    Get a single firm by slug.
+
+    Access:
+        - owner of the firm
+        - any admin
+
+    Non-owners get 403 (not 404) because the firm's existence is
+    public via the list endpoint — hiding it here would be theater.
+    """
     firm = await get_firm_by_slug(db, slug)
     if not firm:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Firm '{slug}' not found",
         )
-    return FirmRead.model_validate(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own firm",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    read = FirmRead.model_validate(firm)
+    read.receipt_count = await _count_receipts(db, firm.id)
+    return read
 
 
 # =============================================================================
@@ -211,11 +347,7 @@ async def update_firm(
     db: AsyncSession,
     current_user: ReadUser,
 ) -> dict:
-    """
-    Update a firm. Owner or admin only.
-
-    Returns { message, firm }.
-    """
+    """Update a firm. Owner or admin only."""
 
     firm = await get_firm_by_slug(db, slug)
     if not firm:
@@ -224,9 +356,6 @@ async def update_firm(
             detail=f"Firm '{slug}' not found",
         )
 
-    # ------------------------------------------------------------------
-    # Ownership check
-    # ------------------------------------------------------------------
     if firm.user_id != current_user.id and not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -252,40 +381,21 @@ async def update_firm(
             detail="At least one field must be provided for update",
         )
 
-    # ------------------------------------------------------------------
-    # Track changed fields
-    # ------------------------------------------------------------------
     updated_fields: list[str] = []
 
     # --- name (+ slug) ---
     if data.name is not None and data.name != firm.name:
-        try:
-            existing = (
-                await db.execute(
-                    select(Firm).where(
-                        func.lower(Firm.name) == data.name.lower(),
-                        Firm.id != firm.id,
-                    )
-                )
-            ).scalars().first()
-        except Exception:
-            logger.exception(
-                "Failed to check duplicate firm name=%s", data.name
-            )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update firm. Please try again.",
-            )
-
-        if existing:
+        existing = await get_firm_by_name(db, data.name)
+        if existing is not None and existing.id != firm.id:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Firm name '{data.name}' is already taken",
             )
 
         old_slug = firm.slug
-        firm.name = data.name
-        firm.slug = generate_slug(data.name)
+        normalized = normalize_firm_name(data.name)
+        firm.name = normalized
+        firm.slug = generate_slug(normalized)
         updated_fields.append("name")
         logger.info(
             "Firm slug updated: '%s' -> '%s'", old_slug, firm.slug
@@ -345,9 +455,6 @@ async def update_firm(
         firm.deals_on = data.deals_on
         updated_fields.append("deals_on")
 
-    # ------------------------------------------------------------------
-    # Reject no-op update
-    # ------------------------------------------------------------------
     if not updated_fields:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -357,9 +464,6 @@ async def update_firm(
             ),
         )
 
-    # ------------------------------------------------------------------
-    # Persist
-    # ------------------------------------------------------------------
     try:
         db.add(firm)
         await db.commit()
@@ -379,9 +483,12 @@ async def update_firm(
         ",".join(updated_fields),
     )
 
+    read = FirmRead.model_validate(firm)
+    read.receipt_count = await _count_receipts(db, firm.id)
+
     return {
         "message": f"Firm '{firm.name}' updated successfully",
-        "firm": FirmRead.model_validate(firm),
+        "firm": read,
     }
 
 
@@ -394,7 +501,15 @@ async def delete_firm(
     db: AsyncSession,
     current_user: ReadUser,
 ) -> dict:
-    """Delete a firm. Owner or admin only."""
+    """
+    Delete a firm. Owner or admin only.
+
+    Cascade: all receipts belonging to this firm are deleted via
+    the FK constraint on receipts.firm_id (ondelete="CASCADE").
+
+    Returns { message, receipts_deleted } so the frontend can tell
+    the user exactly what was removed.
+    """
 
     firm = await get_firm_by_slug(db, slug)
     if not firm:
@@ -411,6 +526,7 @@ async def delete_firm(
         )
 
     firm_name = firm.name
+    receipts_deleted = await _count_receipts(db, firm.id)
 
     try:
         await db.delete(firm)
@@ -424,8 +540,159 @@ async def delete_firm(
         )
 
     logger.info(
-        "Firm '%s' deleted by user_id=%s", firm_name, current_user.id
+        "Firm '%s' deleted by user_id=%s (receipts_deleted=%s)",
+        firm_name,
+        current_user.id,
+        receipts_deleted,
     )
 
-    return {"message": f"Firm '{firm_name}' deleted successfully"}
+    return {
+        "message": f"Firm '{firm_name}' deleted successfully",
+        "receipts_deleted": receipts_deleted,
+ }
 
+
+
+
+# api/firms/routes.py
+
+from fastapi import APIRouter, status
+
+from api.core.database import DBDep
+from api.firms.logics import (
+    create_firm,
+    delete_firm,
+    read_all_firms,
+    read_my_firms,
+    read_single_firm,
+    update_firm,
+)
+from api.firms.schemas import (
+    CreateFirmResponse,
+    DeleteFirmResponse,
+    FirmCreate,
+    FirmListRead,
+    FirmRead,
+    FirmUpdate,
+    UpdateFirmResponse,
+)
+from api.users.deps import AdminUser, CurrentUser
+
+router = APIRouter(prefix="/firms", tags=["Firms"])
+
+
+# =============================================================================
+# AUTHENTICATED READS — OWNER ONLY
+#
+# Declared BEFORE /{slug} so /firms/me/mine matches here and not
+# the dynamic route.
+# =============================================================================
+
+@router.get(
+    "/me/mine",
+    response_model=FirmListRead,
+    status_code=status.HTTP_200_OK,
+    summary="List firms owned by the authenticated user",
+)
+async def list_my_firms(db: DBDep, current_user: CurrentUser):
+    return await read_my_firms(db=db, current_user=current_user)
+
+
+# =============================================================================
+# ADMIN-ONLY READ
+# =============================================================================
+
+@router.get(
+    "",
+    response_model=FirmListRead,
+    status_code=status.HTTP_200_OK,
+    summary="List all firms (admin only)",
+)
+async def list_all_firms(
+    db: DBDep,
+    admin: AdminUser,
+    skip: int = 0,
+    limit: int = 100,
+):
+    return await read_all_firms(db=db, skip=skip, limit=limit)
+
+
+# =============================================================================
+# PUBLIC-ISH READ — OWNER OR ADMIN
+#
+# Not truly public: the service layer enforces ownership. But the
+# route itself is available to any authenticated user so non-owners
+# get a proper 403 instead of an ambiguous 404.
+# =============================================================================
+
+@router.get(
+    "/{slug}",
+    response_model=FirmRead,
+    status_code=status.HTTP_200_OK,
+    summary="Get a single firm (owner or admin)",
+)
+async def get_firm(
+    slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    return await read_single_firm(
+        slug=slug, db=db, current_user=current_user
+    )
+
+
+# =============================================================================
+# AUTHENTICATED MUTATIONS — OWNER OR ADMIN
+# =============================================================================
+
+@router.post(
+    "",
+    response_model=CreateFirmResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a firm (authenticated)",
+)
+async def create(
+    data: FirmCreate,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    return await create_firm(data=data, db=db, current_user=current_user)
+
+
+@router.patch(
+    "/{slug}",
+    response_model=UpdateFirmResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update a firm (owner or admin)",
+)
+async def patch_firm(
+    slug: str,
+    data: FirmUpdate,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    return await update_firm(
+        slug=slug, data=data, db=db, current_user=current_user
+    )
+
+
+@router.delete(
+    "/{slug}",
+    response_model=DeleteFirmResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Delete a firm (owner or admin) — cascades receipts",
+)
+async def remove_firm(
+    slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    return await delete_firm(
+        slug=slug, db=db, current_user=current_user
+ )
+
+
+
+/firms/me/mine     ← literal, MUST be first
+/firms             ← literal (no path param)
+/firms/{slug}      ← dynamic, MUST be last
