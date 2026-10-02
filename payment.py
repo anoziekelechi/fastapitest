@@ -1,3 +1,83 @@
+# api/firms/schemas.py
+
+class FirmRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    name: str
+    slug: str | None = None
+    registration_number: str | None = None
+    address: str
+    phone_number: str
+    deals_on: str
+    created_at: datetime
+    updated_at: datetime
+
+    # Denormalized count — populated at read time.
+    # Not stored on the firm row.
+    receipt_count: int = 0
+
+
+
+# api/firms/logics.py
+
+from sqlalchemy import func
+from api.receipts.models import Receipt  # new import
+
+
+async def read_single_firm(
+    slug: str,
+    db: AsyncSession,
+) -> FirmRead:
+    """Get a single firm by slug, with receipt count. Public."""
+    firm = await get_firm_by_slug(db, slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{slug}' not found",
+        )
+
+    # Count receipts for this firm (used by the delete confirmation UI)
+    try:
+        receipt_count: int = (
+            await db.execute(
+                select(func.count())
+                .select_from(Receipt)
+                .where(Receipt.firm_id == firm.id)
+            )
+        ).scalar() or 0
+    except Exception:
+        logger.exception(
+            "Failed to count receipts for firm_id=%s", firm.id
+        )
+        # Non-fatal — surface the firm; the delete flow will still
+        # cascade correctly even if the count is wrong.
+        receipt_count = 0
+
+    read = FirmRead.model_validate(firm)
+    read.receipt_count = receipt_count
+    return read
+
+
+
+# api/firms/routes.py
+
+@router.delete(
+    "/{slug}",
+    response_model=DeleteFirmResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Delete a firm (owner or admin) — cascades receipts",
+)
+async def remove_firm(
+    slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    return await delete_firm(
+        slug=slug, db=db, current_user=current_user
+    )
+
 
 
 install before pip install weasyprint so the shared libraries are present 
