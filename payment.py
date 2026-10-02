@@ -1,5 +1,42 @@
 # api/firms/schemas.py
 
+def validate_customer_fullname(value: str) -> str:
+    """
+    Validate customer full name.
+    Must have at least 2 words (firstname + lastname minimum).
+    Letters and spaces only.
+    
+    Valid:
+        "Kelechi Kennedy Joseph" → "KELECHI KENNEDY JOSEPH"
+        "Anozie Kelechi"         → "ANOZIE KELECHI"
+    
+    Invalid:
+        "Kelechi"   → Error (single name not allowed)
+        "John123"   → Error (numbers not allowed)
+    """
+    if not value or not value.strip():
+        raise ValueError("Customer full name cannot be empty")
+    
+    stripped = value.strip()
+    cleaned = re.sub(r" +", " ", stripped)
+    
+    if not re.fullmatch(r"[A-Za-z]+( [A-Za-z]+)+", cleaned):
+        if len(cleaned.split()) < 2:
+            raise ValueError(
+                "Full name must contain at least first and last name. "
+                "Example: 'Kelechi Kennedy'"
+            )
+        raise ValueError(
+            "Full name must contain only letters and spaces. "
+            "No numbers or special characters allowed."
+        )
+    
+    return cleaned.upper()
+
+
+
+
+
 class FirmRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -16,6 +53,7 @@ class FirmRead(BaseModel):
 
     # Denormalized count — populated at read time.
     # Not stored on the firm row.
+    # this will show this will delete 50 receipt
     receipt_count: int = 0
 
 
