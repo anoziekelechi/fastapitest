@@ -1,3 +1,41 @@
+def validate_customer_name(value: str) -> str:
+    """
+    Validate customer name (Individual or Company).
+    Accepts letters, numbers, spaces, ampersands (&), hyphens (-), and periods (.).
+    Collapses multiple spaces into a single space and capitalizes the text.
+    
+    Valid:
+        "Wal-Mart"            → "WAL-MART"
+        "Apple Inc."          → "APPLE INC."
+        "AT&T"                → "AT&T"
+        "3M Company"          → "3M COMPANY"
+    
+    Invalid:
+        ""                    → Error (empty)
+        "User@Company"        → Error (unsupported symbols like @)
+    """
+    if not value or not value.strip():
+        raise ValueError("Customer name cannot be empty")
+    
+    # Trim edges and collapse multiple spaces into a single space
+    cleaned = re.sub(r"\s+", " ", value.strip())
+    
+    # Check if it contains only letters, numbers, spaces, &, -, and .
+    # Note: The hyphen is placed at the very end of the brackets so regex reads it as a literal hyphen.
+    if not re.fullmatch(r"[A-Za-z0-9 &.-]+", cleaned):
+        raise ValueError(
+            "Name must contain only letters, numbers, spaces, ampersands (&), "
+            "periods (.), and hyphens (-)."
+        )
+    
+    return cleaned.upper()
+
+
+Use code with caution.
+What Changed?
+• Regex Set Expanded: The character class is now [A-Za-z0-9 &.-]+. Placing the hyphen - at the very end ensures Python treats it as a literal character rather than a range (like A-Z).
+• Comprehensive Error Message: The error output now clearly lists all allowed special characters to help your users troubleshoot inputs.
+Would you like me to generate a set of Pytest unit tests for this function to verify all your edge cases work correctly before you deploy it?
 # api/firms/schemas.py
 
 def validate_customer_fullname(value: str) -> str:
