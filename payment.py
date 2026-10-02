@@ -1,3 +1,30 @@
+async def get_firm_by_slug(
+    db: AsyncSession,
+    slug: str,
+) -> Firm | None:
+    """
+    Fetch a firm by slug.
+
+    Slugs are derived directly from the firm name
+    (via `generate_slug(name)`) — they carry no id prefix, so a
+    single indexed lookup is all that's needed.
+
+    Returns None if not found — callers decide whether that's a 404.
+    """
+    try:
+        normalized = slug.strip().lower()
+        result = await db.execute(
+            select(Firm).where(Firm.slug == normalized)
+        )
+        return result.scalars().first()
+    except Exception:
+        logger.exception("Failed to fetch firm slug=%s", slug)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        )
+
+
 # api/firms/logics.py
 """Firm business logic."""
 
