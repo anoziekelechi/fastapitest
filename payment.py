@@ -1,3 +1,31 @@
+def normalize_payment_option(value: str) -> str:
+    """
+    Normalize a single payment option selected from a dropdown menu.
+    Trims whitespace, collapses internal multiple spaces, and forces uppercase.
+    
+    Valid:
+        "momo  liberia"       → "MOMO LIBERIA"
+        "bank transfer"       → "BANK TRANSFER"
+        "opay"                → "OPAY"
+    
+    Invalid:
+        ""                    → Error (empty selection)
+        None                  → Error (missing selection)
+    """
+    if not value or not value.strip():
+        raise ValueError("Payment option selection cannot be empty")
+        
+    if not isinstance(value, str):
+        raise TypeError("Payment option must be a text string")
+        
+    # Collapse multiple internal spaces down to one, and capitalize everything
+    return re.sub(r"\s+", " ", value.strip()).upper()
+
+
+
+
+
+
 def validate_customer_name(value: str) -> str:
     """
     Validate customer name (Individual or Company).
