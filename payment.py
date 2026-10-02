@@ -1,3 +1,25 @@
+# ------------------------------------------------------------------
+# Helper — add near the top of the file
+# ------------------------------------------------------------------
+
+def firm_id_of(firm: Firm) -> int:
+    """
+    Return the firm's primary key as an int.
+
+    SQLModel's type checker sees `.id` as `int | None` even after
+    the row is loaded. This helper narrows the type and raises if
+    the invariant is violated.
+    """
+    if firm.id is None:
+        logger.error("Firm row has no id — data integrity issue")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        )
+    return firm.id
+
+
+
 async def get_firm_by_slug(
     db: AsyncSession,
     slug: str,
