@@ -5,9 +5,15 @@ if TYPE_CHECKING:
     from api.models.home import PaymentMethods
 
 
+
 def generate_receipt_number() -> str:
-    """Generate a unique 10-character receipt number."""
-    return secrets.token_urlsafe(7)[:10].upper()
+    """Generate a unique 10-digit receipt number containing only numbers."""
+    # Randomly choose a digit from '0'-'9' ten times and join them together
+    return "".join(secrets.choice("0123456789") for _ in range(10))
+
+# def generate_receipt_number() -> str:
+#     """Generate a unique 10-character receipt number."""
+#     return secrets.token_urlsafe(7)[:10].upper()
 
 
 class Receipt(BaseModel, table=True):
@@ -93,32 +99,35 @@ class Receipt(BaseModel, table=True):
         sa_column=Column(Numeric(precision=12, scale=2), nullable=False)
     )
    
-    discount: Decimal | None = Field(
-    default=None,
+    discount: Decimal = Field(
+    default=Decimal("0.00"),
     sa_column=Column(
         Numeric(precision=12, scale=2),
-        nullable=True,
+        nullable=False,
+        server_default="0"
         ),
     )
 
-    tax: Decimal | None = Field(
-    default=None,
+    tax: Decimal = Field(
+    default=Decimal("0.00"),
     sa_column=Column(
         Numeric(precision=12, scale=2),
-        nullable=True,
+        nullable=False,
+        server_default="0",
         ),
     )
    
-    shipping: Decimal | None = Field(
-    default=None,
+    shipping: Decimal = Field(
+    default=Decimal("0.00"),
     sa_column=Column(
         Numeric(precision=12, scale=2),
-        nullable=True,
+        nullable=False,
+        server_default="0"
         ),
     )
 
     # Calculated totals - stored for historical accuracy
-    sub_total: Decimal = Field(
+    subtotal: Decimal = Field(
         sa_column=Column(Numeric(precision=12, scale=2), nullable=False)
     )
     
@@ -143,14 +152,32 @@ class Receipt(BaseModel, table=True):
     firm: Optional["Firm"] = Relationship(back_populates="receipts")
     payment_method: Optional["PaymentMethods"] = Relationship(
         back_populates="receipts"
+
+
+
+
+        
     )
+def calculate_totals(
+    quantity: int,
+    unit_price: Decimal,
+    discount: Decimal | None = None,
+    tax: Decimal | None = None,
+    shipping: Decimal | None = None,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """
+    Calculate receipt totals.
 
-
-
-
-
-
-
-
-
-
+    Returns:
+        (subtotal, net_total, grand_total)
+    """
+    zero = Decimal("0.00")
+    quantity_dec = Decimal(quantity) # Decimal(str(quantity))
+    discount_dec = discount if discount is not None else zero
+    tax_dec = tax if tax is not None else zero
+    shipping_dec = shipping if shipping is not None else zero
+    
+    subtotal = quantity_dec * unit_price
+    net_total = subtotal - discount_dec
+    grand_total = net_total + tax_dec + shipping_dec
+    return subtotal, net_total, grand_total
