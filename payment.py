@@ -1,5 +1,5 @@
 #updated
-ef validate_country_name(value: str) -> str:
+def validate_country_name(value: str) -> str:
     """
     Validate and normalize country name.
     
