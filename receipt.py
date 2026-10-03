@@ -1,3 +1,28 @@
+# you said this earlier
+// src/lib/receiptPdfUrl.ts
+
+import api from "@/api/client";
+
+/**
+ * Build the absolute URL to a receipt's PDF endpoint.
+ *
+ * Uses the axios client's baseURL when present so the URL
+ * respects any environment prefix (e.g. "/api", "https://api.x.com").
+ * Falls back to a relative path when no baseURL is configured —
+ * the browser resolves it against the current origin.
+ */
+export function receiptPdfUrl(slug: string): string {
+  const base = (api.defaults.baseURL ?? "").replace(/\/$/, "");
+  return `${base}/receipts/${slug}/pdf`;
+}
+
+
+//then in both components 
+import { receiptPdfUrl } from "@/lib/receiptPdfUrl";
+
+// ...
+window.open(receiptPdfUrl(receipt.slug!), "_blank", "noopener,noreferrer");
+
 # api/receipts/schemas.py (additions)
 
 class FirmReceiptsRead(BaseModel):
