@@ -37,3 +37,53 @@ class PaymentMethodCreate(BaseModel):
         return normalize_payment_option(v)
         
 
+
+
+
+
+
+import re
+from pydantic import BaseModel, field_validator
+from pydantic_core.core_schema import FieldValidationInfo
+
+# --- Your Reusable Validator Function ---
+def sanitize_alphanumeric_text(value: str, field_name: str = "Input") -> str:
+    if not value or not value.strip():
+        raise ValueError(f"{field_name} cannot be empty")
+        
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a text string")
+    
+    cleaned = re.sub(r"\s+", " ", value.strip())
+    
+    if not re.fullmatch(r"[A-Za-z0-9 ]+", cleaned):
+        raise ValueError(
+            f"{field_name} must contain only letters, numbers, and spaces. "
+            f"Special characters and punctuation are not allowed."
+        )
+        
+    return cleaned.upper()
+
+
+# --- Your FastAPI / Pydantic Models ---
+class ProductCreateSchema(BaseModel):
+    name: str
+    description: str
+    
+    @field_validator("name")
+    @classmethod
+    def validate_product_fields(cls, v: str, info: FieldValidationInfo) -> str:
+        # info.field_name automatically passes "name" to your error message!
+        return sanitize_alphanumeric_text(v, field_name=info.field_name)
+
+
+class OrderCreateSchema(BaseModel):
+    shipping_address: str
+    billing_address: str
+    
+    # You can apply the exact same validator to multiple fields at once!
+    @field_validator("shipping_address", "billing_address")
+    @classmethod
+    def validate_address_fields(cls, v: str, info: FieldValidationInfo) -> str:
+        # info.field_name automatically becomes "shipping_address" or "billing_address"
+        return sanitize_alphanumeric_text
