@@ -1,40 +1,55 @@
+import re
 
 
-def validate_international_phone(value: str | None) -> str | None:
-   
-    if value is None:
-        return None
+def validate_local_phone(value: str) -> str:
+    """
+    Validate and normalize a required local phone number.
 
-    cleaned = value.strip()
+    Rules:
+        - Required: None and blank values are invalid.
+        - Allows spaces, hyphens, parentheses, and periods
+          as separators.
+        - Must start with '0'.
+        - Must contain 10 or 11 digits after normalization.
+        - Rejects international phone number format.
 
-    if not cleaned:
-        return None
+    Returns:
+        str: Normalized local phone number.
 
-    # Must start with + for international format
-    if not cleaned.startswith("+"):
+    Raises:
+        ValueError: If the phone number is invalid.
+    """
+    if not value or not value.strip():
+        raise ValueError("Phone number cannot be empty.")
+
+    value = value.strip()
+
+    if value.startswith("+"):
         raise ValueError(
-            "Phone number must be in international format starting with '+'. "
-            "Example: '+2348071234567'"
+            "This field accepts local format only. "
+            "Use the international phone validator for "
+            "numbers such as '+2347031246117'."
         )
 
-    try:
-        parsed = phonenumbers.parse(cleaned, None)
+    # Remove permitted separators.
+    cleaned = re.sub(r"[\s().-]", "", value)
 
-        if not phonenumbers.is_valid_number(parsed):
-            raise ValueError(
-                f"'{cleaned}' is not a valid phone number. "
-                f"Please check the country code and number."
-            )
-
-        # Format to E.164
-        return phonenumbers.format_number(
-            parsed,
-            phonenumbers.PhoneNumberFormat.E164
-        )
-
-    except phonenumbers.NumberParseException:
+    if not cleaned.isdigit():
         raise ValueError(
-            "Invalid phone number format. "
-            "Must be in international format e.g. '+2348071234567'"
+            "Phone number must contain digits only, "
+            "apart from spaces, hyphens, parentheses, "
+            "or periods used as separators."
         )
 
+    if not cleaned.startswith("0"):
+        raise ValueError(
+            "Local phone number must start with '0'."
+        )
+
+    if len(cleaned) not in (10, 11):
+        raise ValueError(
+            "Local phone number must contain "
+            "10 or 11 digits."
+        )
+
+    return cleaned
