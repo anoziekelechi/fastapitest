@@ -1,3 +1,21 @@
+
+import re
+
+def normalize_user_message(value: str, field_name: str = "Message") -> str:
+    """
+    Normalize text blocks (messages, details, deals) by collapsing multiple spaces,
+    trimming padding, and ensuring dynamic error reporting for empty fields.
+    Keeps original letter casing.
+    """
+    if not value or not value.strip():
+        raise ValueError(f"{field_name} cannot be empty")
+        
+    # Collapse multiple consecutive spaces/tabs, but preserve newlines
+    cleaned = re.sub(r"[ \t]+", " ", value.strip())
+    
+    return cleaned
+
+
 # api/receipts/schemas.py — the changed sections only
 
 class ReceiptCreate(BaseModel):
