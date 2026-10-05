@@ -1,11 +1,48 @@
-@field_validator("deals_on", mode="before")
-    @classmethod
-    def validate_product_fields(cls, v: str, info: FieldValidationInfo) -> str:
-        # info.field_name automatically passes "name" to your error message!
-        return normalize_user_message(v, field_name=info.field_name)
+
+read = FirmRead.model_validate(firm)
+    read.branches = [ #Cannot assign to attribute "branches" for class "FirmRead"
+        BranchRead.model_validate(b) for b in branches
+    ]
+
+async def _counts_by_firm(
+    db: AsyncSession,
+    firm_ids: list[int],
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Batch branch + receipt counts for many firms."""
+    if not firm_ids:
+        return {}, {}
+
+    try:
+        branch_result = await db.execute(
+            select(Branch.firm_id, func.count())
+            .where(col(Branch.firm_id).in_(firm_ids))
+            .group_by(col(Branch.firm_id))
+        )
+        branch_counts = {row[0]: int(row[1]) for row in branch_result.all()}
+
+        receipt_result = await db.execute(
+            select(Branch.firm_id, func.count(Receipt.id))#Argument of type "int | None" cannot be assigned to parameter "expression" of type 
+            .join(Receipt, col(Receipt.branch_id) == col(Branch.id))
+            .where(col(Branch.firm_id).in_(firm_ids))
+            .group_by(col(Branch.firm_id))
+        )
+        receipt_counts = {row[0]: int(row[1]) for row in receipt_result.all()}
+
+        return branch_counts, receipt_counts
+    except Exception:
+        logger.exception(
+            "Failed to batch-count for %s firms", len(firm_ids)
+        )
+        return {}, {}
 
 
-
+#
+receipt_counts_result = await db.execute(
+            select(Branch.firm_id, func.count(Receipt.id))#Argument of type "int | None" cannot be assigned to parameter "expression" of type
+            .join(Receipt, col(Receipt.branch_id) == col(Branch.id))
+            .where(col(Branch.firm_id).in_(firm_ids))
+            .group_by(col(Branch.firm_id))
+        )
 
 # api/receipts/schemas.py — the changed sections only
 
