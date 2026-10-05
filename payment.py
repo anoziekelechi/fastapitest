@@ -1,3 +1,1219 @@
+import re
+from pydantic import BaseModel, field_validator
+from pydantic_core.core_schema import FieldValidationInfo
+
+# --- Your Reusable Validator Function ---
+def sanitize_alphanumeric_text(value: str, field_name: str = "Input") -> str:
+    if not value or not value.strip():
+        raise ValueError(f"{field_name} cannot be empty")
+        
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a text string")
+    
+    cleaned = re.sub(r"\s+", " ", value.strip())
+    
+    if not re.fullmatch(r"[A-Za-z0-9 ]+", cleaned):
+        raise ValueError(
+            f"{field_name} must contain only letters, numbers, and spaces. "
+            f"Special characters and punctuation are not allowed."
+        )
+        
+    return cleaned.upper()
+
+
+# --- Your FastAPI / Pydantic Models ---
+class ProductCreateSchema(BaseModel):
+    name: str
+    description: str
+    
+    @field_validator("name")
+    @classmethod
+    def validate_product_fields(cls, v: str, info: FieldValidationInfo) -> str:
+        # info.field_name automatically passes "name" to your error message!
+        return sanitize_alphanumeric_text(v, field_name=info.field_name)
+
+
+class OrderCreateSchema(BaseModel):
+    shipping_address: str
+    billing_address: str
+    
+    # You can apply the exact same validator to multiple fields at once!
+    @field_validator("shipping_address", "billing_address")
+    @classmethod
+    def validate_address_fields(cls, v: str, info: FieldValidationInfo) -> str:
+        # info.field_name automatically becomes "shipping_address" or "billing_address"
+        return sanitize_alphanumeric_text(v, field_name=info.field_name.replace("_", " "))
+#message validation
+
+import re
+
+def normalize_user_message(value: str, field_name: str = "Message") -> str:
+    """
+    Normalize text blocks (messages, details, deals) by collapsing multiple spaces,
+    trimming padding, and ensuring dynamic error reporting for empty fields.
+    Keeps original letter casing.
+    """
+    if not value or not value.strip():
+        raise ValueError(f"{field_name} cannot be empty")
+        
+    # Collapse multiple consecutive spaces/tabs, but preserve newlines
+    cleaned = re.sub(r"[ \t]+", " ", value.strip())
+    
+    return cleaned
+
+
+
+
+
+# api/firms/logics.py
+"""Firm business logic."""
+
+import logging
+
+from fastapi import HTTPException, status
+from sqlalchemy import func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import col, select
+
+from api.core.slug import generate_slug
+from api.core.validators import normalize_firm_name
+from api.firms.models import Branch, Firm
+from api.firms.schemas import (
+    BranchCreate,
+    BranchListRead,
+    BranchRead,
+    BranchUpdate,
+    FirmCreate,
+    FirmListRead,
+    FirmRead,
+    FirmUpdate,
+)
+from api.receipts.models import Receipt
+from api.users.logics import has_permission
+from api.users.schemas import ReadUser
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# ID NARROWING
+# =============================================================================
+
+def firm_id_of(firm: Firm) -> int:
+    if firm.id is None:
+        logger.error("Firm row has no id — data integrity issue")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        )
+    return firm.id
+
+
+def branch_id_of(branch: Branch) -> int:
+    if branch.id is None:
+        logger.error("Branch row has no id — data integrity issue")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load branch. Please try again.",
+        )
+    return branch.id
+
+
+# =============================================================================
+# STATE GUARDS
+# =============================================================================
+
+def _guard_user_state(current_user: ReadUser) -> None:
+    if current_user.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account is suspended. Please contact admin.",
+            headers={"X-Error-Code": "account_suspended"},
+        )
+    if not current_user.verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account is not verified. Please verify your email.",
+            headers={"X-Error-Code": "account_unverified"},
+        )
+
+
+def _guard_firm_state(firm: Firm) -> None:
+    if firm.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Firm '{firm.name}' is suspended. Please contact admin.",
+            headers={"X-Error-Code": "firm_suspended"},
+        )
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+async def get_firm_by_slug(
+    db: AsyncSession,
+    slug: str,
+) -> Firm | None:
+    try:
+        normalized = slug.strip().lower()
+        result = await db.execute(
+            select(Firm).where(Firm.slug == normalized)
+        )
+        return result.scalars().first()
+    except Exception:
+        logger.exception("Failed to fetch firm slug=%s", slug)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        )
+
+
+async def get_firm_by_name(
+    db: AsyncSession,
+    name: str,
+) -> Firm | None:
+    try:
+        normalized = normalize_firm_name(name)
+        result = await db.execute(
+            select(Firm).where(Firm.name == normalized)
+        )
+        return result.scalars().first()
+    except Exception:
+        logger.exception("Failed to fetch firm name=%s", name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        )
+
+
+async def _count_receipts(db: AsyncSession, firm_id: int) -> int:
+    try:
+        return (
+            await db.execute(
+                select(func.count())
+                .select_from(Receipt)
+                .join(Branch, col(Receipt.branch_id) == col(Branch.id))
+                .where(col(Branch.firm_id) == firm_id)
+            )
+        ).scalar() or 0
+    except Exception:
+        logger.exception("Failed to count receipts for firm_id=%s", firm_id)
+        return 0
+
+
+async def _count_branches(db: AsyncSession, firm_id: int) -> int:
+    try:
+        return (
+            await db.execute(
+                select(func.count())
+                .select_from(Branch)
+                .where(col(Branch.firm_id) == firm_id)
+            )
+        ).scalar() or 0
+    except Exception:
+        logger.exception("Failed to count branches for firm_id=%s", firm_id)
+        return 0
+
+
+async def _counts_by_firm(
+    db: AsyncSession,
+    firm_ids: list[int],
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Batch branch + receipt counts for many firms."""
+    if not firm_ids:
+        return {}, {}
+
+    try:
+        branch_result = await db.execute(
+            select(Branch.firm_id, func.count())
+            .where(col(Branch.firm_id).in_(firm_ids))
+            .group_by(col(Branch.firm_id))
+        )
+        branch_counts = {row[0]: int(row[1]) for row in branch_result.all()}
+
+        receipt_result = await db.execute(
+            select(Branch.firm_id, func.count(Receipt.id))
+            .join(Receipt, col(Receipt.branch_id) == col(Branch.id))
+            .where(col(Branch.firm_id).in_(firm_ids))
+            .group_by(col(Branch.firm_id))
+        )
+        receipt_counts = {row[0]: int(row[1]) for row in receipt_result.all()}
+
+        return branch_counts, receipt_counts
+    except Exception:
+        logger.exception(
+            "Failed to batch-count for %s firms", len(firm_ids)
+        )
+        return {}, {}
+
+
+# =============================================================================
+# FIRM — CREATE
+# =============================================================================
+
+async def create_firm(
+    data: FirmCreate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """Create a firm. Caller must be verified and active."""
+    _guard_user_state(current_user)
+
+    existing = await get_firm_by_name(db, data.name)
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Firm '{data.name}' already exists",
+        )
+
+    normalized_name = normalize_firm_name(data.name)
+
+    firm = Firm(
+        user_id=current_user.id,
+        name=normalized_name,
+        slug=generate_slug(normalized_name),
+        deals_on=data.deals_on,
+        disabled=False,
+    )
+
+    try:
+        db.add(firm)
+        await db.commit()
+        await db.refresh(firm)
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "Failed to create firm for user_id=%s", current_user.id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create firm profile. Please try again.",
+        )
+
+    logger.info(
+        "Firm '%s' created by user_id=%s", firm.name, current_user.id
+    )
+
+    return {
+        "message": f"Firm '{firm.name}' created successfully",
+        "firm": FirmRead.model_validate(firm),
+    }
+
+
+# =============================================================================
+# FIRM — READ
+# =============================================================================
+
+async def read_my_firms(
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> FirmListRead:
+    _guard_user_state(current_user)
+
+    try:
+        result = await db.execute(
+            select(Firm)
+            .where(Firm.user_id == current_user.id)
+            .order_by(col(Firm.name))
+        )
+        firms = result.scalars().all()
+        ids = [firm_id_of(f) for f in firms]
+        branch_counts, receipt_counts = await _counts_by_firm(db, ids)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "Failed to load firms for user_id=%s", current_user.id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load your firms. Please try again.",
+        )
+
+    reads = []
+    for firm in firms:
+        fid = firm_id_of(firm)
+        read = FirmRead.model_validate(firm)
+        read.branch_count = branch_counts.get(fid, 0)
+        read.receipt_count = receipt_counts.get(fid, 0)
+        reads.append(read)
+
+    return FirmListRead(total=len(reads), firms=reads)
+
+
+async def read_all_firms(
+    db: AsyncSession,
+    skip: int = 0,
+    limit: int = 100,
+) -> FirmListRead:
+    """Admin-only via route-level `AdminUser` dependency."""
+    try:
+        total: int = (
+            await db.execute(select(func.count()).select_from(Firm))
+        ).scalar() or 0
+
+        result = await db.execute(
+            select(Firm)
+            .order_by(col(Firm.name))
+            .offset(skip)
+            .limit(limit)
+        )
+        firms = result.scalars().all()
+        ids = [firm_id_of(f) for f in firms]
+        branch_counts, receipt_counts = await _counts_by_firm(db, ids)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to list firms")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firms. Please try again.",
+        )
+
+    reads = []
+    for firm in firms:
+        fid = firm_id_of(firm)
+        read = FirmRead.model_validate(firm)
+        read.branch_count = branch_counts.get(fid, 0)
+        read.receipt_count = receipt_counts.get(fid, 0)
+        reads.append(read)
+
+    return FirmListRead(total=total, firms=reads)
+
+
+async def read_single_firm(
+    slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> FirmRead:
+    """Owner or admin only."""
+    _guard_user_state(current_user)
+
+    firm = await get_firm_by_slug(db, slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{slug}' not found",
+        )
+
+    _guard_firm_state(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own firm",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    fid = firm_id_of(firm)
+    read = FirmRead.model_validate(firm)
+    read.branch_count = await _count_branches(db, fid)
+    read.receipt_count = await _count_receipts(db, fid)
+    return read
+
+
+# =============================================================================
+# FIRM — UPDATE
+# =============================================================================
+
+async def update_firm(
+    slug: str,
+    data: FirmUpdate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    _guard_user_state(current_user)
+
+    firm = await get_firm_by_slug(db, slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{slug}' not found",
+        )
+
+    _guard_firm_state(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only update your own firm",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    if all(v is None for v in (data.name, data.deals_on)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided for update",
+        )
+
+    updated_fields: list[str] = []
+
+    if data.name is not None and data.name != firm.name:
+        existing = await get_firm_by_name(db, data.name)
+        if existing is not None and firm_id_of(existing) != firm_id_of(firm):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Firm name '{data.name}' is already taken",
+            )
+
+        old_slug = firm.slug
+        normalized = normalize_firm_name(data.name)
+        firm.name = normalized
+        firm.slug = generate_slug(normalized)
+        updated_fields.append("name")
+        logger.info(
+            "Firm slug updated: '%s' -> '%s'", old_slug, firm.slug
+        )
+
+    if data.deals_on is not None and data.deals_on != firm.deals_on:
+        firm.deals_on = data.deals_on
+        updated_fields.append("deals_on")
+
+    if not updated_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "No changes detected - all supplied values are "
+                "identical to the current ones"
+            ),
+        )
+
+    try:
+        db.add(firm)
+        await db.commit()
+        await db.refresh(firm)
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to update firm slug=%s", slug)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update firm profile. Please try again.",
+        )
+
+    fid = firm_id_of(firm)
+    read = FirmRead.model_validate(firm)
+    read.branch_count = await _count_branches(db, fid)
+    read.receipt_count = await _count_receipts(db, fid)
+
+    return {
+        "message": f"Firm '{firm.name}' updated successfully",
+        "firm": read,
+    }
+
+
+# =============================================================================
+# FIRM — DELETE (cascades branches, then receipts via branch cascade)
+# =============================================================================
+
+async def delete_firm(
+    slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    _guard_user_state(current_user)
+
+    firm = await get_firm_by_slug(db, slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{slug}' not found",
+        )
+
+    _guard_firm_state(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own firm",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    firm_name = firm.name
+    fid = firm_id_of(firm)
+
+    receipts_deleted = await _count_receipts(db, fid)
+    branches_deleted = await _count_branches(db, fid)
+
+    try:
+        await db.delete(firm)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to delete firm slug=%s", slug)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete firm. Please try again.",
+        )
+
+    logger.info(
+        "Firm '%s' deleted by user_id=%s "
+        "(branches_deleted=%s, receipts_deleted=%s)",
+        firm_name,
+        current_user.id,
+        branches_deleted,
+        receipts_deleted,
+    )
+
+    return {
+        "message": f"Firm '{firm_name}' deleted successfully",
+        "receipts_deleted": receipts_deleted,
+        "branches_deleted": branches_deleted,
+    }
+
+
+# =============================================================================
+# FIRM — DISABLE / ENABLE
+# =============================================================================
+
+async def disable_firm(
+    data: FirmAction,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    await has_permission(user=current_user, required_perm="manage_firms")
+
+    firm = await get_firm_by_name(db, data.name)
+    if firm is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{data.name}' not found",
+        )
+
+    if firm.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Firm '{firm.name}' is already disabled",
+        )
+
+    firm.disabled = True
+    db.add(firm)
+    try:
+        await db.commit()
+        await db.refresh(firm)
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to disable firm name=%s", data.name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to disable firm. Please try again.",
+        )
+
+    fid = firm_id_of(firm)
+    read = FirmRead.model_validate(firm)
+    read.branch_count = await _count_branches(db, fid)
+    read.receipt_count = await _count_receipts(db, fid)
+
+    return {
+        "message": f"Firm '{firm.name}' has been disabled",
+        "firm": read,
+    }
+
+
+async def enable_firm(
+    data: FirmAction,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    await has_permission(user=current_user, required_perm="manage_firms")
+
+    firm = await get_firm_by_name(db, data.name)
+    if firm is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{data.name}' not found",
+        )
+
+    if not firm.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Firm '{firm.name}' is already active",
+        )
+
+    firm.disabled = False
+    db.add(firm)
+    try:
+        await db.commit()
+        await db.refresh(firm)
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to enable firm name=%s", data.name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to enable firm. Please try again.",
+        )
+
+    fid = firm_id_of(firm)
+    read = FirmRead.model_validate(firm)
+    read.branch_count = await _count_branches(db, fid)
+    read.receipt_count = await _count_receipts(db, fid)
+
+    return {
+        "message": f"Firm '{firm.name}' has been re-activated",
+        "firm": read,
+    }
+
+
+# =============================================================================
+# BRANCH — HELPERS
+# =============================================================================
+
+async def get_branch_by_id(
+    db: AsyncSession,
+    branch_id: int,
+) -> Branch | None:
+    try:
+        return await db.get(Branch, branch_id)
+    except Exception:
+        logger.exception("Failed to fetch branch id=%s", branch_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load branch. Please try again.",
+        )
+
+
+# =============================================================================
+# BRANCH — CREATE
+# =============================================================================
+
+async def create_branch(
+    firm_slug: str,
+    data: BranchCreate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    _guard_user_state(current_user)
+
+    firm = await get_firm_by_slug(db, firm_slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{firm_slug}' not found",
+        )
+
+    _guard_firm_state(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only add branches to your own firm",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    fid = firm_id_of(firm)
+
+    try:
+        existing = (
+            await db.execute(
+                select(Branch).where(
+                    col(Branch.firm_id) == fid,
+                    col(Branch.branch_no) == data.branch_no,
+                )
+            )
+        ).scalars().first()
+    except Exception:
+        logger.exception(
+            "Failed to check duplicate branch_no=%s firm_id=%s",
+            data.branch_no,
+            fid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create branch. Please try again.",
+        )
+
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Branch {data.branch_no} already exists "
+                f"for '{firm.name}'"
+            ),
+        )
+
+    branch = Branch(
+        firm_id=fid,
+        branch_no=data.branch_no,
+        address=data.address,
+        phone_number=data.phone_number,
+    )
+
+    try:
+        db.add(branch)
+        await db.commit()
+        await db.refresh(branch)
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "Failed to create branch for firm_id=%s", fid
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create branch. Please try again.",
+        )
+
+    logger.info(
+        "Branch %s created for firm '%s' by user_id=%s",
+        branch.branch_no,
+        firm.name,
+        current_user.id,
+    )
+
+    return {
+        "message": (
+            f"Branch {branch.branch_no} created successfully "
+            f"for '{firm.name}'"
+        ),
+        "branch": BranchRead.model_validate(branch),
+    }
+
+
+# =============================================================================
+# BRANCH — READ
+# =============================================================================
+
+async def read_branches_for_firm(
+    firm_slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> BranchListRead:
+    _guard_user_state(current_user)
+
+    firm = await get_firm_by_slug(db, firm_slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{firm_slug}' not found",
+        )
+
+    _guard_firm_state(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view branches of your own firm",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    fid = firm_id_of(firm)
+
+    try:
+        result = await db.execute(
+            select(Branch)
+            .where(col(Branch.firm_id) == fid)
+            .order_by(col(Branch.branch_no))
+        )
+        branches = result.scalars().all()
+    except Exception:
+        logger.exception("Failed to load branches for firm_id=%s", fid)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load branches. Please try again.",
+        )
+
+    return BranchListRead(
+        firm_id=fid,
+        firm_name=firm.name,
+        total=len(branches),
+        branches=[BranchRead.model_validate(b) for b in branches],
+    )
+
+
+# =============================================================================
+# BRANCH — UPDATE
+# =============================================================================
+
+async def update_branch(
+    branch_id: int,
+    data: BranchUpdate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    _guard_user_state(current_user)
+
+    branch = await get_branch_by_id(db, branch_id)
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Branch id={branch_id} not found",
+        )
+
+    firm = await db.get(Firm, branch.firm_id)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Firm not found for this branch",
+        )
+
+    _guard_firm_state(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only update branches of your own firm",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    if all(
+        v is None
+        for v in (data.branch_no, data.address, data.phone_number)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided for update",
+        )
+
+    updated_fields: list[str] = []
+
+    if data.branch_no is not None and data.branch_no != branch.branch_no:
+        try:
+            existing = (
+                await db.execute(
+                    select(Branch).where(
+                        col(Branch.firm_id) == branch.firm_id,
+                        col(Branch.branch_no) == data.branch_no,
+                        col(Branch.id) != branch_id_of(branch),
+                    )
+                )
+            ).scalars().first()
+        except Exception:
+            logger.exception(
+                "Failed to check duplicate branch_no=%s", data.branch_no
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update branch. Please try again.",
+            )
+
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Branch {data.branch_no} already exists "
+                    f"for '{firm.name}'"
+                ),
+            )
+
+        branch.branch_no = data.branch_no
+        updated_fields.append("branch_no")
+
+    if data.address is not None and data.address != branch.address:
+        branch.address = data.address
+        updated_fields.append("address")
+
+    if (
+        data.phone_number is not None
+        and data.phone_number != branch.phone_number
+    ):
+        branch.phone_number = data.phone_number
+        updated_fields.append("phone_number")
+
+    if not updated_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "No changes detected - all supplied values are "
+                "identical to the current ones"
+            ),
+        )
+
+    try:
+        db.add(branch)
+        await db.commit()
+        await db.refresh(branch)
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "Failed to update branch id=%s", branch_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update branch. Please try again.",
+        )
+
+    return {
+        "message": (
+            f"Branch {branch.branch_no} updated successfully"
+        ),
+        "branch": BranchRead.model_validate(branch),
+    }
+
+
+# =============================================================================
+# BRANCH — DELETE
+# =============================================================================
+
+async def delete_branch(
+    branch_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Delete a branch. Refused if the branch has issued receipts
+    (FK is RESTRICT).
+    """
+    _guard_user_state(current_user)
+
+    branch = await get_branch_by_id(db, branch_id)
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Branch id={branch_id} not found",
+        )
+
+    firm = await db.get(Firm, branch.firm_id)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Firm not found for this branch",
+        )
+
+    _guard_firm_state(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete branches of your own firm",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    # Refuse if receipts exist
+    try:
+        receipt_count: int = (
+            await db.execute(
+                select(func.count())
+                .select_from(Receipt)
+                .where(col(Receipt.branch_id) == branch_id)
+            )
+        ).scalar() or 0
+    except Exception:
+        logger.exception(
+            "Failed to count receipts for branch_id=%s", branch_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete branch. Please try again.",
+        )
+
+    if receipt_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Branch {branch.branch_no} has {receipt_count} "
+                f"{'receipt' if receipt_count == 1 else 'receipts'}. "
+                f"Delete or transfer them before removing the branch."
+            ),
+        )
+
+    branch_no = branch.branch_no
+
+    try:
+        await db.delete(branch)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to delete branch id=%s", branch_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete branch. Please try again.",
+        )
+
+    logger.info(
+        "Branch %s (firm '%s') deleted by user_id=%s",
+        branch_no,
+        firm.name,
+        current_user.id,
+    )
+
+    return {
+        "message": f"Branch {branch_no} deleted successfully"
+}
+
+
+
+#read_single_firm updated 
+async def read_single_firm(
+    slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> FirmRead:
+    """
+    Get a single firm by slug, with its full branch list nested
+    under `firm.branches`, sorted by `branch_no` ascending.
+
+    Access:
+        - owner of the firm
+        - any admin
+    """
+    _guard_user_state(current_user)
+
+    firm = await get_firm_by_slug(db, slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{slug}' not found",
+        )
+
+    _guard_firm_state(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own firm",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    fid = firm_id_of(firm)
+
+    # ------------------------------------------------------------------
+    # Load branches for this firm
+    # ------------------------------------------------------------------
+    try:
+        branches_result = await db.execute(
+            select(Branch)
+            .where(col(Branch.firm_id) == fid)
+            .order_by(col(Branch.branch_no).asc())
+        )
+        branches = branches_result.scalars().all()
+    except Exception:
+        logger.exception(
+            "Failed to load branches for firm_id=%s", fid
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        )
+
+    # ------------------------------------------------------------------
+    # Count receipts for this firm (across all its branches)
+    # ------------------------------------------------------------------
+    try:
+        receipt_count: int = (
+            await db.execute(
+                select(func.count())
+                .select_from(Receipt)
+                .join(Branch, col(Receipt.branch_id) == col(Branch.id))
+                .where(col(Branch.firm_id) == fid)
+            )
+        ).scalar() or 0
+    except Exception:
+        logger.exception(
+            "Failed to count receipts for firm_id=%s", fid
+        )
+        receipt_count = 0
+
+    # ------------------------------------------------------------------
+    # Assemble
+    # ------------------------------------------------------------------
+    read = FirmRead.model_validate(firm)
+    read.branches = [
+        BranchRead.model_validate(b) for b in branches
+    ]
+    read.branch_count = len(branches)
+    read.receipt_count = receipt_count
+
+    return read
+
+#read_myfirm updated
+async def read_my_firms(
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> FirmListRead:
+    """
+    Get all firms owned by the authenticated user.
+
+    Each firm is returned with its full branch list nested under
+    `firm.branches`, sorted by `branch_no` ascending.
+    """
+    _guard_user_state(current_user)
+
+    try:
+        result = await db.execute(
+            select(Firm)
+            .where(Firm.user_id == current_user.id)
+            .order_by(col(Firm.name))
+        )
+        firms = result.scalars().all()
+    except Exception:
+        logger.exception(
+            "Failed to load firms for user_id=%s", current_user.id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load your firms. Please try again.",
+        )
+
+    if not firms:
+        return FirmListRead(total=0, firms=[])
+
+    firm_ids = [firm_id_of(f) for f in firms]
+
+    # ------------------------------------------------------------------
+    # Batch-load all branches for all of the caller's firms in one query
+    # ------------------------------------------------------------------
+    try:
+        branches_result = await db.execute(
+            select(Branch)
+            .where(col(Branch.firm_id).in_(firm_ids))
+            .order_by(
+                col(Branch.firm_id).asc(),
+                col(Branch.branch_no).asc(),
+            )
+        )
+        all_branches = branches_result.scalars().all()
+    except Exception:
+        logger.exception(
+            "Failed to load branches for user_id=%s", current_user.id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load your firms. Please try again.",
+        )
+
+    # Group branches by firm_id
+    branches_by_firm: dict[int, list[Branch]] = {}
+    for branch in all_branches:
+        branches_by_firm.setdefault(branch.firm_id, []).append(branch)
+
+    # ------------------------------------------------------------------
+    # Batch-load receipt counts per firm
+    # ------------------------------------------------------------------
+    try:
+        receipt_counts_result = await db.execute(
+            select(Branch.firm_id, func.count(Receipt.id))
+            .join(Receipt, col(Receipt.branch_id) == col(Branch.id))
+            .where(col(Branch.firm_id).in_(firm_ids))
+            .group_by(col(Branch.firm_id))
+        )
+        receipt_counts = {
+            row[0]: int(row[1]) for row in receipt_counts_result.all()
+        }
+    except Exception:
+        logger.exception(
+            "Failed to count receipts for user_id=%s", current_user.id
+        )
+        receipt_counts = {}
+
+    # ------------------------------------------------------------------
+    # Assemble
+    # ------------------------------------------------------------------
+    reads: list[FirmRead] = []
+    for firm in firms:
+        fid = firm_id_of(firm)
+        branches = branches_by_firm.get(fid, [])
+
+        read = FirmRead.model_validate(firm)
+        read.branches = [
+            BranchRead.model_validate(b) for b in branches
+        ]
+        read.branch_count = len(branches)
+        read.receipt_count = receipt_counts.get(fid, 0)
+
+        reads.append(read)
+
+    return FirmListRead(total=len(reads), firms=reads)
+
+#old
 # api/receipts/logics.py
 """Receipt business logic."""
 
