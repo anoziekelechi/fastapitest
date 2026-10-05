@@ -1,3 +1,332 @@
+# api/receipts/schemas.py — the changed sections only
+
+class ReceiptCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    firm_id: int = Field(..., gt=0)
+    payment_method_id: int = Field(..., gt=0)
+
+    # Branch replaces free-text branch_no
+    branch_id: int = Field(..., gt=0)
+
+    prepared_by: str = Field(..., min_length=1, max_length=200)
+
+    # ... rest of the fields unchanged (customer, product, financials) ...
+
+
+class ReceiptRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    firm_id: int
+    payment_method_id: int
+    receipt_number: str
+    slug: str | None = None
+
+    # Branch reference (not the number itself)
+    branch_id: int
+
+    prepared_by: str
+
+    # ... rest unchanged ...
+# api/firms/schemas.py
+"""Firm and Branch schemas."""
+
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+# =============================================================================
+# FIRM — REQUEST
+# =============================================================================
+
+class FirmCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=2, max_length=200)
+    deals_on: str = Field(..., min_length=10, max_length=2000)
+
+    @field_validator("name", "deals_on", mode="before")
+    @classmethod
+    def validate_trimmed(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Field cannot be empty")
+        return v.strip()
+
+
+class FirmUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(None, min_length=2, max_length=200)
+    deals_on: str | None = Field(None, min_length=10, max_length=2000)
+
+    @field_validator("name", "deals_on", mode="before")
+    @classmethod
+    def validate_trimmed(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("Field cannot be empty")
+        return v.strip()
+
+
+class FirmAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=2, max_length=200)
+
+
+# =============================================================================
+# FIRM — READ
+# =============================================================================
+
+class FirmRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    name: str
+    slug: str | None = None
+    deals_on: str
+    disabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+    branch_count: int = 0
+    receipt_count: int = 0
+
+
+class FirmListRead(BaseModel):
+    total: int
+    firms: list[FirmRead]
+
+
+# =============================================================================
+# BRANCH — REQUEST
+# =============================================================================
+
+class BranchCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    branch_no: int = Field(..., gt=0)
+    address: str = Field(..., min_length=5, max_length=500)
+    phone_number: str
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def validate_address(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Address cannot be empty")
+        return v.strip()
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        from api.core.validators import validate_international_phone
+        result = validate_international_phone(v)
+        if result is None:
+            raise ValueError("Phone number is required")
+        return result
+
+
+class BranchUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    branch_no: int | None = Field(None, gt=0)
+    address: str | None = Field(None, min_length=5, max_length=500)
+    phone_number: str | None = None
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def validate_address(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("Address cannot be empty")
+        return v.strip()
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def validate_phone(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        from api.core.validators import validate_international_phone
+        result = validate_international_phone(v)
+        if result is None:
+            raise ValueError("Phone number is invalid")
+        return result
+
+
+# =============================================================================
+# BRANCH — READ
+# =============================================================================
+
+class BranchRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    firm_id: int
+    branch_no: int
+    address: str
+    phone_number: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class BranchListRead(BaseModel):
+    firm_id: int
+    firm_name: str
+    total: int
+    branches: list[BranchRead]
+
+
+# =============================================================================
+# RESPONSE ENVELOPES
+# =============================================================================
+
+class CreateFirmResponse(BaseModel):
+    message: str
+    firm: FirmRead
+
+
+class UpdateFirmResponse(BaseModel):
+    message: str
+    firm: FirmRead
+
+
+class FirmAdminActionResponse(BaseModel):
+    message: str
+    firm: FirmRead
+
+
+class DeleteFirmResponse(BaseModel):
+    message: str
+    receipts_deleted: int
+    branches_deleted: int
+
+
+class CreateBranchResponse(BaseModel):
+    message: str
+    branch: BranchRead
+
+
+class UpdateBranchResponse(BaseModel):
+    message: str
+    branch: BranchRead
+
+
+class MessageResponse(BaseModel):
+    message: str
+
+
+# api/firms/models.py
+"""Firm and Branch models."""
+
+from datetime import datetime
+from typing import TYPE_CHECKING, Optional
+
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlmodel import Field, Relationship, SQLModel
+
+if TYPE_CHECKING:
+    from api.receipts.models import Receipt
+    from api.users.models import User
+
+
+class Firm(SQLModel, table=True):
+    """
+    A firm owned by a user.
+
+    A firm may have many branches. Receipts belong to branches,
+    not to the firm directly.
+    """
+    __tablename__ = "firms"  # type: ignore
+
+    user_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    name: str = Field(
+        sa_column=Column(String(200), nullable=False, unique=True, index=True)
+    )
+
+    slug: str | None = Field(
+        default=None,
+        sa_column=Column(
+            String(255), nullable=True, unique=True, index=True
+        ),
+    )
+
+    deals_on: str = Field(
+        sa_column=Column(Text, nullable=False)
+    )
+
+    disabled: bool = Field(
+        default=False,
+        sa_column=Column(
+            Boolean,
+            nullable=False,
+            server_default="false",
+            index=True,
+        ),
+    )
+
+    # Relationships
+    branches: list["Branch"] = Relationship(
+        back_populates="firm",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+    receipts: list["Receipt"] = Relationship(back_populates="firm")
+
+
+class Branch(SQLModel, table=True):
+    """
+    A physical or logical branch of a firm.
+
+    `branch_no` is unique per firm, so a firm can have
+    branch 1 and branch 2, but not two branch 1s.
+
+    Deleting a firm cascades to its branches. Deleting a branch
+    is blocked (RESTRICT) while it still has receipts.
+    """
+    __tablename__ = "branches"  # type: ignore
+    __table_args__ = (
+        UniqueConstraint("firm_id", "branch_no", name="uq_branch_firm_no"),
+    )
+
+    firm_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("firms.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    branch_no: int = Field(
+        sa_column=Column(Integer, nullable=False)
+    )
+
+    address: str = Field(
+        sa_column=Column(Text, nullable=False)
+    )
+
+    phone_number: str = Field(
+        sa_column=Column(String(20), nullable=False)
+    )
+
+    # Relationships
+    firm: Optional["Firm"] = Relationship(back_populates="branches")
+    receipts: list["Receipt"] = Relationship(back_populates="branch")
+
+
+
 import re
 from pydantic import BaseModel, field_validator
 from pydantic_core.core_schema import FieldValidationInfo
