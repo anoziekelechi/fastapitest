@@ -1,3 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        /* Base styles for standard view */
+        body { font-family: 'Courier New', Courier, monospace; width: 300px; margin: 0 auto; }
+        .line { border-bottom: 1px dashed #000; margin: 5px 0; }
+        
+        /* The Magic: CSS optimized for POS Thermal Printers */
+        @media print {
+            body { 
+                width: 100%; 
+                margin: 0; 
+                padding: 0; 
+                font-size: 12px; 
+            }
+            /* Hides headers/footers added by browsers like Chrome/Safari */
+            @page { 
+                margin: 0; 
+            }
+            .no-print { 
+                display: none; 
+            }
+        }
+    </style>
+</head>
+<body>
+    <h3>--- ${receipt.shop_name} ---</h3>
+    <p>${receipt.location}</p>
+    <div class="line"></div>
+    <p>Item: ${receipt.item}</p>
+    <p>Total: ${receipt.amount}</p>
+    <p>Date: ${receipt.date}</p>
+    <div class="line"></div>
+    <p style="text-align:center;">Powered by YourApp</p>
+
+    <!-- Trigger button -->
+    <button class="no-print" onclick="window.print()">Print Receipt</button>
+</body>
+</html>
+
+
+
+
+
 # api/receipts/logics.py
 """Receipt business logic."""
 
