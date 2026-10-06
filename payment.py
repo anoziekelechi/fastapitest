@@ -1,53 +1,54 @@
+# api/receipts/logics.py
+"""Receipt business logic."""
 
-
-# api/payments/logics.py
-"""Payment methods business logic.
-
-Authorization model:
-    - Writes (create/update/delete) are gated at the ROUTE via
-      `admin: AdminUser`. The service trusts that the caller is an
-      admin and does not re-check.
-    - Reads (all/single) are gated by the `manage_payments`
-      permission, checked in the service because the check needs
-      the loaded resource to determine country scope.
-    - Public read by country has no authorization requirement.
-"""
-
+import csv
+import io
 import logging
+from datetime import datetime, timezone
+from decimal import Decimal
 
-from fastapi import HTTPException, status
+from fastapi import BackgroundTasks, HTTPException, status
+from fastapi_mail import FastMail
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
 
 from api.core.slug import generate_slug
-from api.home.logics import get_country_by_slug
+from api.firms.logics import (
+    _guard_firm_state,
+    _guard_user_state,
+    branch_id_of,
+    firm_id_of,
+)
+from api.firms.models import Branch, Firm
 from api.home.models import Country
 from api.payments.models import PaymentMethods
-from api.payments.schemas import (
-    AllPaymentMethodsRead,
-    CountryPaymentMethodsRead,
-    PaymentMethodCreate,
-    PaymentMethodRead,
-    PaymentMethodUpdate,
+from api.receipts.models import Receipt
+from api.receipts.schemas import (
+    AllReceiptsGroupedRead,
+    FirmReceiptsRead,
+    ReceiptCreate,
+    ReceiptListRead,
+    ReceiptRead,
 )
-from api.users.logics import has_permission
 from api.users.schemas import ReadUser
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# ID NARROWING HELPERS
+# ID NARROWING
 # =============================================================================
 
-def country_id_of(country: Country) -> int:
-    if country.id is None:
-        logger.error("Country row has no id — data integrity issue")
+def receipt_id_of(receipt: Receipt) -> int:
+    """Narrow receipt.id to int; raise on the impossible invariant violation."""
+    if receipt.id is None:
+        logger.error("Receipt row has no id — data integrity issue")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load country. Please try again.",
+            detail="Failed to load receipt. Please try again.",
         )
-    return country.id
+    return receipt.id
 
 
 def payment_method_id_of(method: PaymentMethods) -> int:
@@ -60,682 +61,868 @@ def payment_method_id_of(method: PaymentMethods) -> int:
     return method.id
 
 
+def country_id_of(country: Country) -> int:
+    if country.id is None:
+        logger.error("Country row has no id — data integrity issue")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load country. Please try again.",
+        )
+    return country.id
+
+
 # =============================================================================
-# SLUG HELPER
+# HELPERS
 # =============================================================================
 
-async def get_payment_by_slug(
+async def get_receipt_by_slug(
     db: AsyncSession,
     slug: str,
-) -> PaymentMethods | None:
-    """Fetch a payment method by slug (name-derived, no id prefix)."""
+) -> Receipt | None:
+    """Fetch a receipt by slug (name-derived, no id prefix)."""
     try:
         normalized = slug.strip().lower()
         result = await db.execute(
-            select(PaymentMethods).where(
-                PaymentMethods.slug == normalized
-            )
+            select(Receipt).where(col(Receipt.slug) == normalized)
         )
         return result.scalars().first()
     except Exception:
+        logger.exception("Failed to fetch receipt slug=%s", slug)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load receipt. Please try again.",
+        )
+
+
+def calculate_totals(
+    quantity: int,
+    unit_price: Decimal,
+    discount: Decimal | None = None,
+    tax: Decimal | None = None,
+    shipping: Decimal | None = None,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """
+    Calculate receipt totals.
+
+    None-safe: discount/tax/shipping default to Decimal("0.00").
+
+    Returns:
+        (subtotal, net_total, grand_total)
+    """
+    zero = Decimal("0.00")
+
+    quantity_dec = Decimal(str(quantity))
+    unit_price_dec = Decimal(str(unit_price))
+    discount_dec = Decimal(str(discount)) if discount is not None else zero
+    tax_dec = Decimal(str(tax)) if tax is not None else zero
+    shipping_dec = Decimal(str(shipping)) if shipping is not None else zero
+
+    subtotal = quantity_dec * unit_price_dec
+    net_total = subtotal - discount_dec
+    grand_total = net_total + tax_dec + shipping_dec
+
+    return subtotal, net_total, grand_total
+
+
+async def _load_owned_receipt(
+    slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> tuple[Receipt, Firm, Branch]:
+    """
+    Load a receipt + its firm + its branch, enforcing:
+        - caller user state (verified, active)
+        - firm state (not disabled)
+        - ownership (owner or admin)
+
+    Raises:
+        403 account_suspended / account_unverified
+        403 firm_suspended
+        403 wrong_permission
+        404 receipt not found
+    """
+    _guard_user_state(current_user)
+
+    receipt = await get_receipt_by_slug(db, slug)
+    if not receipt:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Receipt '{slug}' not found",
+        )
+
+    try:
+        firm = await db.get(Firm, receipt.firm_id)
+        branch = await db.get(Branch, receipt.branch_id)
+    except Exception:
         logger.exception(
-            "Failed to fetch payment method slug=%s", slug
+            "Failed to load firm/branch for receipt slug=%s", slug
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load receipt. Please try again.",
+        )
+
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Firm not found for this receipt",
+        )
+
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Branch not found for this receipt",
+        )
+
+    _guard_firm_state(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only access receipts from your own firms",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    return receipt, firm, branch
+
+
+# =============================================================================
+# CREATE
+# =============================================================================
+
+async def create_receipt(
+    data: ReceiptCreate,
+    db: AsyncSession,
+    current_user: ReadUser,
+    mailer: FastMail,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """
+    Create a receipt for a firm's branch.
+
+    Flow:
+        1. User-state guard (verified + not disabled)
+        2. Firm exists + owned by caller
+        3. Firm-state guard (not disabled)
+        4. Branch exists + belongs to firm
+        5. Payment method exists + matches user's country
+        6. Resolve currency from user's country
+        7. Calculate totals
+        8. Persist
+        9. Queue customer email (if customer_email provided)
+
+    Returns { message, receipt }.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. User state
+    # ------------------------------------------------------------------
+    _guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 2. Firm — exists + owned
+    # ------------------------------------------------------------------
+    try:
+        firm = await db.get(Firm, data.firm_id)
+    except Exception:
+        logger.exception("Failed to load firm id=%s", data.firm_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        )
+
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm with ID {data.firm_id} not found",
+        )
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only create receipts for your own firms",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Firm state
+    # ------------------------------------------------------------------
+    _guard_firm_state(firm)
+
+    fid = firm_id_of(firm)
+
+    # ------------------------------------------------------------------
+    # 4. Branch — exists + belongs to firm
+    # ------------------------------------------------------------------
+    try:
+        branch = await db.get(Branch, data.branch_id)
+    except Exception:
+        logger.exception("Failed to load branch id=%s", data.branch_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load branch. Please try again.",
+        )
+
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Branch with ID {data.branch_id} not found",
+        )
+
+    if branch.firm_id != fid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Selected branch does not belong to the specified firm"
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Payment method
+    # ------------------------------------------------------------------
+    try:
+        payment_method = await db.get(
+            PaymentMethods, data.payment_method_id
+        )
+    except Exception:
+        logger.exception(
+            "Failed to load payment method id=%s",
+            data.payment_method_id,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to load payment method. Please try again.",
         )
 
-
-# =============================================================================
-# CREATE — ADMIN ONLY (route enforces via `admin: AdminUser`)
-# =============================================================================
-
-async def create_payment_method(
-    data: PaymentMethodCreate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Create a payment method for a country.
-
-    Caller is guaranteed to be an admin — enforced by the route's
-    `admin: AdminUser` dependency before this function runs.
-
-    `current_user` is passed for audit logging only.
-    """
-
-    # ------------------------------------------------------------------
-    # Country must exist
-    # ------------------------------------------------------------------
-    try:
-        country = await db.get(Country, data.country_id)
-    except Exception:
-        logger.exception(
-            "Failed to load country id=%s", data.country_id
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load country. Please try again.",
-        )
-
-    if not country:
+    if not payment_method:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Country with ID {data.country_id} not found",
-        )
-
-    # ------------------------------------------------------------------
-    # Uniqueness within country.
-    #
-    # `data.name` is normalized (uppercase, whitespace-collapsed) by
-    # the schema validator, so direct equality is safe.
-    # ------------------------------------------------------------------
-    try:
-        existing = (
-            await db.execute(
-                select(PaymentMethods).where(
-                    col(PaymentMethods.name) == data.name,
-                    col(PaymentMethods.country_id) == data.country_id,
-                )
-            )
-        ).scalars().first()
-    except Exception:
-        logger.exception(
-            "Failed to check existing payment method name=%s country_id=%s",
-            data.name,
-            data.country_id,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create payment method. Please try again.",
-        )
-
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"Payment method '{data.name}' already exists "
-                f"in {country.name}"
+                f"Payment method with ID {data.payment_method_id} not found"
             ),
         )
 
-    # ------------------------------------------------------------------
-    # Slug — globally unique, prefixed with the country slug so the
-    # same method name in different countries doesn't collide.
-    # ------------------------------------------------------------------
-    country_slug = getattr(country, "slug", None) or str(data.country_id)
-    method_slug = generate_slug(f"{country_slug}-{data.name}")
+    if (
+        current_user.country_id
+        and payment_method.country_id != current_user.country_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Payment method must be from your assigned country",
+        )
 
-    method = PaymentMethods(
-        country_id=data.country_id,
-        name=data.name,
-        slug=method_slug,
+    # ------------------------------------------------------------------
+    # 6. Currency
+    # ------------------------------------------------------------------
+    currency = "USD"
+    if current_user.country_id:
+        try:
+            country = await db.get(Country, current_user.country_id)
+            if country:
+                currency = country.currency_code
+        except Exception:
+            logger.exception(
+                "Failed to load country id=%s; using default currency",
+                current_user.country_id,
+            )
+
+    # ------------------------------------------------------------------
+    # 7. Totals
+    # ------------------------------------------------------------------
+    subtotal, net_total, grand_total = calculate_totals(
+        quantity=data.quantity,
+        unit_price=data.unit_price,
+        discount=data.discount,
+        tax=data.tax,
+        shipping=data.shipping,
     )
 
     # ------------------------------------------------------------------
-    # Persist
+    # 8. Persist
     # ------------------------------------------------------------------
+    receipt = Receipt(
+        firm_id=fid,
+        payment_method_id=payment_method_id_of(payment_method),
+        branch_id=branch_id_of(branch),
+        prepared_by=data.prepared_by,
+        customer_fullname=data.customer_fullname,
+        customer_email=data.customer_email,
+        customer_address=data.customer_address,
+        customer_phone=data.customer_phone,
+        currency=currency,
+        product_name=data.product_name,
+        serial_number=data.serial_number,
+        quantity=data.quantity,
+        unit_price=data.unit_price,
+        discount=data.discount,
+        tax=data.tax,
+        shipping=data.shipping,
+        subtotal=subtotal,
+        net_total=net_total,
+        grand_total=grand_total,
+    )
+
     try:
-        db.add(method)
+        db.add(receipt)
+        await db.flush()
+        receipt.slug = generate_slug(receipt.receipt_number)
         await db.commit()
-        await db.refresh(method)
+        await db.refresh(receipt)
     except Exception:
         await db.rollback()
         logger.exception(
-            "Failed to create payment method name=%s country_id=%s",
-            data.name,
-            data.country_id,
+            "Failed to create receipt for firm_id=%s branch_id=%s user_id=%s",
+            fid,
+            data.branch_id,
+            current_user.id,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create payment method. Please try again.",
+            detail="Failed to create receipt. Please try again.",
+        )
+
+    # ------------------------------------------------------------------
+    # 9. Queue customer email
+    # ------------------------------------------------------------------
+    if data.customer_email:
+        background_tasks.add_task(
+            send_receipt_email,
+            receipt_slug=receipt.slug,
+            firm_id=fid,
+            mailer=mailer,
         )
 
     logger.info(
-        "Payment method '%s' (slug=%s) created in %s by admin user_id=%s",
-        method.name,
-        method.slug,
-        country.name,
+        "Receipt %s created for firm_id=%s branch_id=%s by user_id=%s "
+        "(prepared_by=%s, email_queued=%s)",
+        receipt.receipt_number,
+        fid,
+        data.branch_id,
         current_user.id,
+        receipt.prepared_by,
+        bool(data.customer_email),
     )
 
     return {
-        "message": (
-            f"Payment method '{method.name}' created "
-            f"successfully in {country.name}"
-        ),
-        "payment_method": PaymentMethodRead.model_validate(method),
+        "message": "Receipt created successfully",
+        "receipt": ReceiptRead.model_validate(receipt),
     }
 
 
 # =============================================================================
-# READ — all, grouped by country (manage_payments permission)
+# EMAIL (background task — opens its own session)
 # =============================================================================
 
-async def read_all_payment_methods(
+async def send_receipt_email(
+    receipt_slug: str,
+    firm_id: int,
+    mailer: FastMail,
+) -> None:
+    """
+    Send the receipt to the customer's email.
+
+    Must not raise. Runs in a BackgroundTask; opens its own session.
+    """
+    from api.db.session import async_session_maker
+    from api.core.pdf import render_pdf
+    from api.home.logics import get_home_settings_logic
+    from api.users.email import send_email
+
+    try:
+        async with async_session_maker() as db:
+            receipt = await get_receipt_by_slug(db, receipt_slug)
+            if not receipt or not receipt.customer_email:
+                logger.warning(
+                    "Receipt email skipped: slug=%s missing or no customer_email",
+                    receipt_slug,
+                )
+                return
+
+            firm = await db.get(Firm, firm_id)
+            if not firm:
+                logger.warning(
+                    "Receipt email skipped: firm_id=%s not found", firm_id
+                )
+                return
+
+            branch = await db.get(Branch, receipt.branch_id)
+
+            sitename = (await get_home_settings_logic(db)).sitename
+
+            context = {
+                "firm": firm,
+                "branch": branch,
+                "receipt": receipt,
+                "current_year": datetime.now(timezone.utc).year,
+                "sitename": sitename,
+                "full_names": receipt.customer_fullname,
+            }
+
+            attachments: list[dict] = []
+            try:
+                pdf_bytes = render_pdf(
+                    template_name="receipts/customer_receipt_pdf.html",
+                    context=context,
+                )
+                attachments.append(
+                    {
+                        "file": pdf_bytes,
+                        "filename": (
+                            f"receipt-{receipt.receipt_number}.pdf"
+                        ),
+                        "mime_type": "application",
+                        "mime_subtype": "pdf",
+                    }
+                )
+            except Exception:
+                logger.exception(
+                    "PDF generation failed for receipt=%s — "
+                    "sending HTML-only email",
+                    receipt.receipt_number,
+                )
+
+            await send_email(
+                recipient=receipt.customer_email,
+                subject=(
+                    f"Receipt #{receipt.receipt_number} from {firm.name}"
+                ),
+                mailer=mailer,
+                db=db,
+                full_names=receipt.customer_fullname,
+                template_name="receipts/customer_receipt.html",
+                template_body=context,
+                attachments=attachments,
+            )
+
+            logger.info(
+                "Receipt #%s emailed to %s (pdf_attached=%s)",
+                receipt.receipt_number,
+                receipt.customer_email,
+                bool(attachments),
+            )
+    except Exception:
+        logger.exception(
+            "Failed to send receipt email for slug=%s", receipt_slug
+        )
+
+
+# =============================================================================
+# PDF
+# =============================================================================
+
+async def render_receipt_pdf(
+    slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> bytes:
+    """
+    Render the receipt as a PDF and return raw bytes.
+
+    Ownership + state checks enforced by `_load_owned_receipt`.
+    Uses the same template as the email attachment.
+    """
+    from api.core.pdf import render_pdf
+    from api.home.logics import get_home_settings_logic
+
+    receipt, firm, branch = await _load_owned_receipt(
+        slug, db, current_user
+    )
+
+    sitename = (await get_home_settings_logic(db)).sitename
+
+    context = {
+        "firm": firm,
+        "branch": branch,
+        "receipt": receipt,
+        "current_year": datetime.now(timezone.utc).year,
+        "sitename": sitename,
+        "full_names": receipt.customer_fullname,
+    }
+
+    try:
+        return render_pdf(
+            template_name="receipts/customer_receipt_pdf.html",
+            context=context,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to render PDF for receipt slug=%s", slug
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate receipt PDF. Please try again.",
+        )
+
+
+# =============================================================================
+# READ — mine (receipts across all of the caller's firms)
+# =============================================================================
+
+async def read_my_receipts(
+    db: AsyncSession,
+    current_user: ReadUser,
+    firm_slug: str | None = None,
+    branch_no: int | None = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> ReceiptListRead:
+    """
+    Receipts for the current user's firms.
+
+    Optional filters:
+        firm_slug  — restrict to one firm
+        branch_no  — restrict to one branch within the firm
+    """
+    _guard_user_state(current_user)
+
+    base_query = (
+        select(Receipt)
+        .join(Branch, col(Receipt.branch_id) == col(Branch.id))
+        .join(Firm, col(Branch.firm_id) == col(Firm.id))
+        .where(col(Firm.user_id) == current_user.id)
+    )
+
+    if firm_slug:
+        from api.firms.logics import get_firm_by_slug
+
+        firm = await get_firm_by_slug(db, firm_slug)
+        if not firm or firm.user_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Firm '{firm_slug}' not found",
+            )
+        base_query = base_query.where(
+            col(Branch.firm_id) == firm_id_of(firm)
+        )
+
+    if branch_no is not None:
+        base_query = base_query.where(col(Branch.branch_no) == branch_no)
+
+    try:
+        total: int = (
+            await db.execute(
+                select(func.count()).select_from(base_query.subquery())
+            )
+        ).scalar() or 0
+
+        result = await db.execute(
+            base_query
+            .order_by(col(Receipt.created_at).desc())
+            .offset(skip)
+            .limit(limit)
+        )
+        receipts = result.scalars().all()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "Failed to load receipts for user_id=%s", current_user.id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load receipts. Please try again.",
+        )
+
+    return ReceiptListRead(
+        total=total,
+        receipts=[ReceiptRead.model_validate(r) for r in receipts],
+    )
+
+
+# =============================================================================
+# READ — per firm (optionally filtered by branch)
+# =============================================================================
+
+async def read_firm_receipts(
+    firm_slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+    branch_no: int | None = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> FirmReceiptsRead:
+    """
+    All receipts for a single firm. Owner or admin only.
+
+    Pass `branch_no` to view a single branch in isolation.
+    """
+    _guard_user_state(current_user)
+
+    from api.firms.logics import get_firm_by_slug
+
+    firm = await get_firm_by_slug(db, firm_slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{firm_slug}' not found",
+        )
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view receipts from your own firms",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    _guard_firm_state(firm)
+
+    fid = firm_id_of(firm)
+
+    base = (
+        select(Receipt)
+        .join(Branch, col(Receipt.branch_id) == col(Branch.id))
+        .where(col(Branch.firm_id) == fid)
+    )
+
+    if branch_no is not None:
+        base = base.where(col(Branch.branch_no) == branch_no)
+
+    try:
+        total: int = (
+            await db.execute(
+                select(func.count()).select_from(base.subquery())
+            )
+        ).scalar() or 0
+
+        result = await db.execute(
+            base
+            .order_by(col(Receipt.created_at).desc())
+            .offset(skip)
+            .limit(limit)
+        )
+        receipts = result.scalars().all()
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "Failed to load receipts for firm_id=%s", fid
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load receipts. Please try again.",
+        )
+
+    return FirmReceiptsRead(
+        firm_id=fid,
+        firm_name=firm.name,
+        firm_slug=firm.slug,
+        branch_no=branch_no,
+        total=total,
+        receipts=[ReceiptRead.model_validate(r) for r in receipts],
+    )
+
+
+# =============================================================================
+# READ — all grouped by firm
+# =============================================================================
+
+async def read_all_receipts_grouped(
     db: AsyncSession,
     current_user: ReadUser,
     skip: int = 0,
     limit: int = 100,
-) -> AllPaymentMethodsRead:
-    """Return all payment methods grouped by country."""
+) -> AllReceiptsGroupedRead:
+    """All receipts grouped by firm. Owner-scoped; admin sees all."""
+    _guard_user_state(current_user)
 
-    # Authorization OUTSIDE the try block so the 403 propagates.
-    await has_permission(
-        user=current_user,
-        required_perm="manage_payments",
-    )
+    firms_query = select(Firm).order_by(col(Firm.name))
+    if not current_user.is_admin:
+        firms_query = firms_query.where(
+            col(Firm.user_id) == current_user.id
+        )
+    firms_query = firms_query.offset(skip).limit(limit)
 
     try:
-        result = await db.execute(
-            select(Country)
-            .join(
-                PaymentMethods,
-                col(PaymentMethods.country_id) == col(Country.id),
-            )
-            .distinct()
-            .order_by(col(Country.name))
-            .offset(skip)
-            .limit(limit)
-        )
-        countries = result.scalars().all()
+        result = await db.execute(firms_query)
+        firms = result.scalars().all()
 
-        data: list[CountryPaymentMethodsRead] = []
-        for country in countries:
-            methods_result = await db.execute(
-                select(PaymentMethods)
-                .where(
-                    col(PaymentMethods.country_id) == country_id_of(country)
-                )
-                .order_by(col(PaymentMethods.name))
-            )
-            methods = methods_result.scalars().all()
+        grouped: list[FirmReceiptsRead] = []
+        total_receipts = 0
 
-            data.append(
-                CountryPaymentMethodsRead(
-                    country_id=country_id_of(country),
-                    country_name=country.name,
-                    payment_methods=[
-                        PaymentMethodRead.model_validate(m) for m in methods
+        for firm in firms:
+            fid = firm_id_of(firm)
+            receipts_result = await db.execute(
+                select(Receipt)
+                .join(Branch, col(Receipt.branch_id) == col(Branch.id))
+                .where(col(Branch.firm_id) == fid)
+                .order_by(col(Receipt.created_at).desc())
+            )
+            receipts = receipts_result.scalars().all()
+            total_receipts += len(receipts)
+
+            grouped.append(
+                FirmReceiptsRead(
+                    firm_id=fid,
+                    firm_name=firm.name,
+                    firm_slug=firm.slug,
+                    branch_no=None,
+                    total=len(receipts),
+                    receipts=[
+                        ReceiptRead.model_validate(r) for r in receipts
                     ],
                 )
             )
     except HTTPException:
-        # Nested helpers (country_id_of) may raise HTTPException —
-        # propagate as-is rather than wrapping in a 500.
         raise
     except Exception:
-        logger.exception("Failed to list payment methods")
+        logger.exception(
+            "Failed to load grouped receipts for user_id=%s",
+            current_user.id,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load payment methods. Please try again.",
+            detail="Failed to load receipts. Please try again.",
         )
 
-    return AllPaymentMethodsRead(
-        total_countries=len(data),
-        data=data,
+    return AllReceiptsGroupedRead(
+        total_firms=len(grouped),
+        total_receipts=total_receipts,
+        data=grouped,
     )
 
 
 # =============================================================================
-# READ — per country (PUBLIC)
+# READ — single
 # =============================================================================
 
-async def read_payment_methods_by_country(
-    country_slug: str,
+async def read_single_receipt(
+    slug: str,
     db: AsyncSession,
-) -> CountryPaymentMethodsRead:
-    """
-    Return payment methods for a specific country by country slug.
+    current_user: ReadUser,
+) -> ReceiptRead:
+    """Get a single receipt by slug. Owner or admin only."""
+    receipt, _, _ = await _load_owned_receipt(slug, db, current_user)
+    return ReceiptRead.model_validate(receipt)
 
-    Public — no authentication or permission required.
-    """
 
-    country = await get_country_by_slug(db, country_slug)
+# =============================================================================
+# CSV
+# =============================================================================
+
+async def export_firm_receipts_csv(
+    firm_slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+    branch_no: int | None = None,
+) -> tuple[bytes, str]:
+    """
+    Build a CSV of every receipt for a firm.
+
+    Pass `branch_no` to export a single branch's receipts.
+    Returns (csv_bytes, filename).
+    """
+    _guard_user_state(current_user)
+
+    from api.firms.logics import get_firm_by_slug
+
+    firm = await get_firm_by_slug(db, firm_slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{firm_slug}' not found",
+        )
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only export receipts from your own firms",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    _guard_firm_state(firm)
+
+    fid = firm_id_of(firm)
+
+    query = (
+        select(Receipt)
+        .join(Branch, col(Receipt.branch_id) == col(Branch.id))
+        .where(col(Branch.firm_id) == fid)
+    )
+
+    if branch_no is not None:
+        query = query.where(col(Branch.branch_no) == branch_no)
+
+    query = query.order_by(col(Receipt.created_at).asc())
 
     try:
-        result = await db.execute(
-            select(PaymentMethods)
-            .where(
-                col(PaymentMethods.country_id) == country_id_of(country)
-            )
-            .order_by(col(PaymentMethods.name))
-        )
-        methods = result.scalars().all()
+        result = await db.execute(query)
+        receipts = result.scalars().all()
     except HTTPException:
         raise
     except Exception:
         logger.exception(
-            "Failed to load payment methods for country slug=%s",
-            country_slug,
+            "Failed to load receipts for CSV export firm_id=%s", fid
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load payment methods. Please try again.",
+            detail="Failed to export receipts. Please try again.",
         )
 
-    return CountryPaymentMethodsRead(
-        country_id=country_id_of(country),
-        country_name=country.name,
-        payment_methods=[
-            PaymentMethodRead.model_validate(m) for m in methods
-        ],
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+
+    writer.writerow(
+        [
+            "Receipt Number",
+            "Date",
+            "Branch",
+            "Prepared By",
+            "Customer Name",
+            "Customer Email",
+            "Customer Phone",
+            "Customer Address",
+            "Product",
+            "Serial Number",
+            "Quantity",
+            "Unit Price",
+            "Currency",
+            "Subtotal",
+            "Discount",
+            "Net Total",
+            "Tax",
+            "Shipping",
+            "Grand Total",
+            "Status",
+        ]
     )
 
-
-# =============================================================================
-# READ — single (manage_payments permission, country-scoped)
-# =============================================================================
-
-async def read_single_payment_method(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> PaymentMethodRead:
-    """Get a single payment method by slug. Country-scoped permission."""
-
-    method = await get_payment_by_slug(db, slug)
-    if not method:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Payment method '{slug}' not found",
+    for r in receipts:
+        writer.writerow(
+            [
+                r.receipt_number,
+                r.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                r.branch_id,
+                r.prepared_by,
+                r.customer_fullname,
+                r.customer_email or "",
+                r.customer_phone,
+                r.customer_address,
+                r.product_name,
+                r.serial_number,
+                r.quantity,
+                f"{r.unit_price:.2f}",
+                r.currency,
+                f"{r.subtotal:.2f}",
+                f"{r.discount:.2f}",
+                f"{r.net_total:.2f}",
+                f"{r.tax:.2f}",
+                f"{r.shipping:.2f}",
+                f"{r.grand_total:.2f}",
+                r.status,
+            ]
         )
 
-    await has_permission(
-        user=current_user,
-        required_perm="manage_payments",
-        target_country_id=method.country_id,
-    )
-
-    return PaymentMethodRead.model_validate(method)
-
-
-# =============================================================================
-# UPDATE — ADMIN ONLY (route enforces via `admin: AdminUser`)
-# =============================================================================
-
-async def update_payment_method(
-    slug: str,
-    data: PaymentMethodUpdate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Update a payment method by slug.
-
-    Caller is guaranteed to be an admin — enforced by the route's
-    `admin: AdminUser` dependency before this function runs.
-
-    Only `name` is updatable.
-    Returns { message, payment_method }.
-    """
-
-    # ------------------------------------------------------------------
-    # Load
-    # ------------------------------------------------------------------
-    method = await get_payment_by_slug(db, slug)
-    if not method:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Payment method '{slug}' not found",
-        )
-
-    # ------------------------------------------------------------------
-    # Reject empty update payload
-    # ------------------------------------------------------------------
-    if all(value is None for value in (data.name,)):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided for update",
-        )
-
-    # ------------------------------------------------------------------
-    # Track actual changes
-    # ------------------------------------------------------------------
-    updated_fields: list[str] = []
-
-    if data.name is not None and data.name != method.name:
-        # `data.name` is already normalized by the schema validator.
-        try:
-            existing = (
-                await db.execute(
-                    select(PaymentMethods).where(
-                        col(PaymentMethods.name) == data.name,
-                        col(PaymentMethods.country_id)
-                        == method.country_id,
-                        col(PaymentMethods.id)
-                        != payment_method_id_of(method),
-                    )
-                )
-            ).scalars().first()
-        except HTTPException:
-            raise
-        except Exception:
-            logger.exception(
-                "Failed to check duplicate payment method name=%s",
-                data.name,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update payment method. Please try again.",
-            )
-
-        if existing:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"Payment method '{data.name}' already exists "
-                    f"in this country"
-                ),
-            )
-
-        old_slug = method.slug
-        method.name = data.name
-        method.slug = generate_slug(data.name)
-        updated_fields.append("name")
-
-        logger.info(
-            "Payment method name changed: slug '%s' -> '%s'",
-            old_slug,
-            method.slug,
-        )
-
-    # ------------------------------------------------------------------
-    # Reject no-op
-    # ------------------------------------------------------------------
-    if not updated_fields:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "No changes detected - all supplied values are "
-                "identical to the current ones"
-            ),
-        )
-
-    # ------------------------------------------------------------------
-    # Persist
-    # ------------------------------------------------------------------
-    try:
-        db.add(method)
-        await db.commit()
-        await db.refresh(method)
-    except Exception:
-        await db.rollback()
-        logger.exception(
-            "Failed to update payment method slug=%s", slug
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update payment method. Please try again.",
-        )
+    csv_bytes = buffer.getvalue().encode("utf-8")
+    suffix = f"-branch-{branch_no}" if branch_no is not None else ""
+    filename = f"receipts-{firm.slug or fid}{suffix}.csv"
 
     logger.info(
-        "Payment method id=%s updated by admin user_id=%s (fields=%s)",
-        payment_method_id_of(method),
-        current_user.id,
-        ",".join(updated_fields),
-    )
-
-    return {
-        "message": f"Payment method '{method.name}' updated successfully",
-        "payment_method": PaymentMethodRead.model_validate(method),
-    }
-
-
-# =============================================================================
-# DELETE — ADMIN ONLY (route enforces via `admin: AdminUser`)
-# =============================================================================
-
-async def delete_payment_method(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Delete a payment method by slug.
-
-    Caller is guaranteed to be an admin — enforced by the route's
-    `admin: AdminUser` dependency before this function runs.
-    """
-
-    method = await get_payment_by_slug(db, slug)
-    if not method:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Payment method '{slug}' not found",
-        )
-
-    method_name = method.name
-
-    try:
-        await db.delete(method)
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        logger.exception(
-            "Failed to delete payment method slug=%s", slug
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete payment method. Please try again.",
-        )
-
-    logger.info(
-        "Payment method '%s' deleted by admin user_id=%s",
-        method_name,
+        "CSV export generated for firm_id=%s branch_no=%s (%s rows) "
+        "by user_id=%s",
+        fid,
+        branch_no,
+        len(receipts),
         current_user.id,
     )
 
-    return {
-        "message": f"Payment method '{method_name}' deleted successfully"
-    }
-
-#new routes
-# api/payments/routes.py
-
-from fastapi import APIRouter, status
-
-from api.core.database import DBDep
-from api.payments.logics import (
-    create_payment_method,
-    delete_payment_method,
-    read_all_payment_methods,
-    read_payment_methods_by_country,
-    read_single_payment_method,
-    update_payment_method,
-)
-from api.payments.schemas import (
-    AllPaymentMethodsRead,
-    CountryPaymentMethodsRead,
-    CreatePaymentMethodResponse,
-    MessageResponse,
-    PaymentMethodCreate,
-    PaymentMethodRead,
-    PaymentMethodUpdate,
-    UpdatePaymentMethodResponse,
-)
-from api.users.deps import AdminUser, CurrentUser
-
-router = APIRouter(prefix="/payment-methods", tags=["Payment Methods"])
-
-
-# =============================================================================
-# PUBLIC
-#
-# Declared BEFORE /{slug} so `/country/nigeria` doesn't match
-# `/{slug}` with slug="country".
-# =============================================================================
-
-@router.get(
-    "/country/{country_slug}",
-    response_model=CountryPaymentMethodsRead,
-    status_code=status.HTTP_200_OK,
-    summary="List payment methods for a country (public)",
-)
-async def list_payment_methods_by_country(
-    country_slug: str,
-    db: DBDep,
-):
-    # No CurrentUser dependency — public endpoint.
-    return await read_payment_methods_by_country(
-        country_slug=country_slug, db=db
-    )
-
-
-# =============================================================================
-# AUTHENTICATED READS — permission-gated in the service
-# =============================================================================
-
-@router.get(
-    "",
-    response_model=AllPaymentMethodsRead,
-    status_code=status.HTTP_200_OK,
-    summary="List all payment methods grouped by country (manage_payments)",
-)
-async def list_all_payment_methods(
-    db: DBDep,
-    current_user: CurrentUser,
-    skip: int = 0,
-    limit: int = 100,
-):
-    return await read_all_payment_methods(
-        db=db,
-        current_user=current_user,
-        skip=skip,
-        limit=limit,
-    )
-
-
-@router.get(
-    "/{slug}",
-    response_model=PaymentMethodRead,
-    status_code=status.HTTP_200_OK,
-    summary="Get a single payment method (manage_payments)",
-)
-async def get_payment_method(
-    slug: str,
-    db: DBDep,
-    current_user: CurrentUser,
-):
-    return await read_single_payment_method(
-        slug=slug, db=db, current_user=current_user
-    )
-
-
-# =============================================================================
-# ADMIN-ONLY WRITES
-#
-# `admin: AdminUser` rejects non-admins with 403 before the service
-# function is called. The service trusts the caller is an admin.
-# =============================================================================
-
-@router.post(
-    "",
-    response_model=CreatePaymentMethodResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a payment method (admin only)",
-)
-async def create_method(
-    data: PaymentMethodCreate,
-    db: DBDep,
-    admin: AdminUser,
-):
-    return await create_payment_method(
-        data=data, db=db, current_user=admin
-    )
-
-
-@router.patch(
-    "/{slug}",
-    response_model=UpdatePaymentMethodResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Update a payment method (admin only)",
-)
-async def patch_payment_method(
-    slug: str,
-    data: PaymentMethodUpdate,
-    db: DBDep,
-    admin: AdminUser,
-):
-    return await update_payment_method(
-        slug=slug, data=data, db=db, current_user=admin
-    )
-
-
-@router.delete(
-    "/{slug}",
-    response_model=MessageResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Delete a payment method (admin only)",
-)
-async def remove_payment_method(
-    slug: str,
-    db: DBDep,
-    admin: AdminUser,
-):
-    return await delete_payment_method(
-        slug=slug, db=db, current_user=admin
-    )
-
-
-
-
-# api/payments/routes.py 0ld
-
-@router.get(
-    "",
-    response_model=AllPaymentMethodsRead,
-    status_code=status.HTTP_200_OK,
-    summary="List all payment methods grouped by country (manage_payments)",
-)
-async def list_all_payment_methods(
-    db: DBDep,
-    current_user: CurrentUser,
-    skip: int = 0,
-    limit: int = 100,
-):
-    return await read_all_payment_methods(
-        db=db,
-        current_user=current_user,
-        skip=skip,
-        limit=limit,
-    )
-
-
-@router.get(
-    "/country/{country_slug}",
-    response_model=CountryPaymentMethodsRead,
-    status_code=status.HTTP_200_OK,
-    summary="List payment methods for a country (public)",
-)
-async def list_payment_methods_by_country(
-    country_slug: str,
-    db: DBDep,
-):
-    # Public — no CurrentUser dependency
-    return await read_payment_methods_by_country(
-        country_slug=country_slug, db=db
-    )
-
-
-@router.get(
-    "/{slug}",
-    response_model=PaymentMethodRead,
-    status_code=status.HTTP_200_OK,
-    summary="Get a single payment method (manage_payments)",
-)
-async def get_payment_method(
-    slug: str,
-    db: DBDep,
-    current_user: CurrentUser,
-):
-    return await read_single_payment_method(
-        slug=slug, db=db, current_user=current_user
-  )
-
-
-
-
-
-
+    return csv_bytes, filename
