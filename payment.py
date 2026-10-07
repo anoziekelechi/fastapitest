@@ -1,75 +1,245 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        /* Base styles for standard view */
-        body { font-family: 'Courier New', Courier, monospace; width: 300px; margin: 0 auto; }
-        .line { border-bottom: 1px dashed #000; margin: 5px 0; }
-        
-        /* The Magic: CSS optimized for POS Thermal Printers */
-        @media print {
-            body { 
-                width: 100%; 
-                margin: 0; 
-                padding: 0; 
-                font-size: 12px; 
+# you said this earlier so am providing you with my full api/client file
+// src/lib/receiptPdfUrl.ts
+
+import api from "@/api/client";
+
+/**
+ * Build the absolute URL to a receipt's PDF endpoint.
+ *
+ * Uses the axios client's baseURL when present so the URL
+ * respects any environment prefix (e.g. "/api", "https://api.x.com").
+ * Falls back to a relative path when no baseURL is configured —
+ * the browser resolves it against the current origin.
+ */
+export function receiptPdfUrl(slug: string): string {
+  const base = (api.defaults.baseURL ?? "").replace(/\/$/, "");
+  return `${base}/receipts/${slug}/pdf`;
+}
+
+
+//then in both components 
+import { receiptPdfUrl } from "@/lib/receiptPdfUrl";
+
+// ...
+window.open(receiptPdfUrl(receipt.slug!), "_blank", "noopener,noreferrer");
+
+
+
+
+// my full api/client
+
+
+
+
+import axios, {
+  type AxiosError,
+  type InternalAxiosRequestConfig,
+} from "axios";
+
+const API_URL = import.meta.env.VITE_API_URL;
+
+const api = axios.create({
+  baseURL: API_URL || "http://127.0.0.1:8000",
+  withCredentials: true,
+});
+
+if (import.meta.env.DEV && !API_URL) {
+  console.warn(
+    "VITE_API_URL not configured! Using fallback: http://127.0.0.1:8000"
+  );
+}
+
+// ============================================================
+// CSRF TOKEN
+// ============================================================
+
+function getCsrfTokenFromCookie(): string | null {
+  const cookie = document.cookie
+    .split("; ")
+    .find((row) => row.startsWith("csrf_token="));
+
+  if (!cookie) {
+    return null;
+  }
+
+  const value = cookie.slice("csrf_token=".length);
+  return decodeURIComponent(value);
+}
+
+// ============================================================
+// AXIOS REQUEST CONFIG
+// ============================================================
+
+interface RetryableRequestConfig extends InternalAxiosRequestConfig {
+  _retry?: boolean;
+}
+
+// ============================================================
+// REQUEST INTERCEPTOR
+// ============================================================
+//
+// CSRF header is automatically attached to state-changing
+// requests.
+//
+// EXCEPTION:
+// /auth/refresh is intentionally NOT CSRF protected.
+//
+
+api.interceptors.request.use((config) => {
+  const method = (config.method || "get").toLowerCase();
+  const url = config.url || "";
+
+  const isStateChangingMethod = ["post", "put", "patch", "delete"].includes(
+    method
+  );
+
+  const isRefreshRequest = url.includes("/auth/refresh");
+
+  if (isStateChangingMethod && !isRefreshRequest) {
+    const csrfToken = getCsrfTokenFromCookie();
+
+    if (csrfToken) {
+      config.headers.set("X-CSRF-Token", csrfToken);
+    }
+  }
+
+  return config;
+});
+
+// ============================================================
+// RESPONSE INTERCEPTOR
+// ============================================================
+//
+// When an access token expires:
+//
+// Request → 401 → POST /auth/refresh → New cookies → Retry
+//
+// Concurrent 401 requests are queued so only ONE refresh
+// request is sent at a time.
+//
+
+let isRefreshing = false;
+
+let failedQueue: Array<{
+  resolve: () => void;
+  reject: (reason?: unknown) => void;
+}> = [];
+
+api.interceptors.response.use(
+  (response) => response,
+
+  async (error: AxiosError) => {
+    const originalRequest = error.config as
+      | RetryableRequestConfig
+      | undefined;
+
+    if (!originalRequest) {
+      return Promise.reject(error);
+    }
+
+    const url = originalRequest.url || "";
+    const isRefreshRequest = url.includes("/auth/refresh");
+    const isLogoutRequest = url.includes("/auth/logout");
+
+    // ========================================================
+    // ONLY REFRESH NORMAL AUTHENTICATED REQUESTS
+    // ========================================================
+
+    if (
+      error.response?.status === 401 &&
+      !originalRequest._retry &&
+      !isRefreshRequest &&
+      !isLogoutRequest
+    ) {
+      // ------------------------------------------------------
+      // Another request is already refreshing
+      // ------------------------------------------------------
+      if (isRefreshing) {
+        return new Promise<void>((resolve, reject) => {
+          failedQueue.push({ resolve, reject });
+        })
+          .then(() => {
+            // Make sure the retried request gets a fresh CSRF
+            if (originalRequest.headers) {
+              originalRequest.headers.delete("X-CSRF-Token");
             }
-            /* Hides headers/footers added by browsers like Chrome/Safari */
-            @page { 
-                margin: 0; 
-            }
-            .no-print { 
-                display: none; 
-            }
+            return api(originalRequest);
+          })
+          .catch((err) => Promise.reject(err));
+      }
+
+      // ------------------------------------------------------
+      // Start refresh
+      // ------------------------------------------------------
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        // /auth/refresh does NOT require CSRF.
+        // Browser automatically sends the HttpOnly refresh_token cookie.
+        await api.post("/auth/refresh");
+
+        // Refresh succeeded → release queued requests
+        failedQueue.forEach(({ resolve }) => resolve());
+        failedQueue = [];
+
+        // Important: remove the old CSRF header so the request
+        // interceptor will attach the NEW csrf_token cookie.
+        if (originalRequest.headers) {
+          originalRequest.headers.delete("X-CSRF-Token");
         }
-    </style>
-</head>
-<body>
-    <h3>--- ${receipt.shop_name} ---</h3>
-    <p>${receipt.location}</p>
-    <div class="line"></div>
-    <p>Item: ${receipt.item}</p>
-    <p>Total: ${receipt.amount}</p>
-    <p>Date: ${receipt.date}</p>
-    <div class="line"></div>
-    <p style="text-align:center;">Powered by YourApp</p>
 
-    <!-- Trigger button -->
-    <button class="no-print" onclick="window.print()">Print Receipt</button>
-</body>
-</html>
+        // Retry original request
+        return api(originalRequest);
+      } catch (refreshError) {
+        // Refresh failed → reject queued requests
+        failedQueue.forEach(({ reject }) => reject(refreshError));
+        failedQueue = [];
+
+        // Session is no longer valid
+        window.location.href = "/login";
+
+        return Promise.reject(refreshError);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+export default api;
 
 
-
-
-
+# so far we have done this receipt logics/routes
 # api/receipts/logics.py
-"""Receipt business logic."""
+#     #ReceiptCsvResponse,
 
+from api.core.slug import generate_slug
+from api.users.deps import _guard_firm_state, _guard_user_state
+from api.users.send_otp_email import send_receipt_email
+from api.users.schemas import ReadUser
+from api.users.email import send_email
 import csv
 import io
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
-
+from api.users.logics import branch_id_of, get_firm_by_slug
 from fastapi import BackgroundTasks, HTTPException, status
 from fastapi_mail import FastMail
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
+from api.users.logics import firm_id_of
+from api.core.pdf import render_pdf
+from api.home.logics import get_home_settings_logic
 
-from api.core.slug import generate_slug
-from api.firms.logics import (
-    _guard_firm_state,
-    _guard_user_state,
-    branch_id_of,
-    firm_id_of,
-)
-from api.firms.models import Branch, Firm
-from api.home.models import Country
-from api.payments.models import PaymentMethods
-from api.receipts.models import Receipt
-from api.receipts.schemas import (
+from api.models.users import Branch, Firm
+from api.models.home import Country,PaymentMethods
+from api.models.order import Receipt
+from api.order.schemas import (
     AllReceiptsGroupedRead,
     FirmReceiptsRead,
     ReceiptCreate,
@@ -383,7 +553,7 @@ async def create_receipt(
     )
 
     # ------------------------------------------------------------------
-    # 8. Persist
+    # 8. Persist branch_id_of
     # ------------------------------------------------------------------
     receipt = Receipt(
         firm_id=fid,
@@ -454,101 +624,6 @@ async def create_receipt(
     }
 
 
-# =============================================================================
-# EMAIL (background task — opens its own session)
-# =============================================================================
-
-async def send_receipt_email(
-    receipt_slug: str,
-    firm_id: int,
-    mailer: FastMail,
-) -> None:
-    """
-    Send the receipt to the customer's email.
-
-    Must not raise. Runs in a BackgroundTask; opens its own session.
-    """
-    from api.db.session import async_session_maker
-    from api.core.pdf import render_pdf
-    from api.home.logics import get_home_settings_logic
-    from api.users.email import send_email
-
-    try:
-        async with async_session_maker() as db:
-            receipt = await get_receipt_by_slug(db, receipt_slug)
-            if not receipt or not receipt.customer_email:
-                logger.warning(
-                    "Receipt email skipped: slug=%s missing or no customer_email",
-                    receipt_slug,
-                )
-                return
-
-            firm = await db.get(Firm, firm_id)
-            if not firm:
-                logger.warning(
-                    "Receipt email skipped: firm_id=%s not found", firm_id
-                )
-                return
-
-            branch = await db.get(Branch, receipt.branch_id)
-
-            sitename = (await get_home_settings_logic(db)).sitename
-
-            context = {
-                "firm": firm,
-                "branch": branch,
-                "receipt": receipt,
-                "current_year": datetime.now(timezone.utc).year,
-                "sitename": sitename,
-                "full_names": receipt.customer_fullname,
-            }
-
-            attachments: list[dict] = []
-            try:
-                pdf_bytes = render_pdf(
-                    template_name="receipts/customer_receipt_pdf.html",
-                    context=context,
-                )
-                attachments.append(
-                    {
-                        "file": pdf_bytes,
-                        "filename": (
-                            f"receipt-{receipt.receipt_number}.pdf"
-                        ),
-                        "mime_type": "application",
-                        "mime_subtype": "pdf",
-                    }
-                )
-            except Exception:
-                logger.exception(
-                    "PDF generation failed for receipt=%s — "
-                    "sending HTML-only email",
-                    receipt.receipt_number,
-                )
-
-            await send_email(
-                recipient=receipt.customer_email,
-                subject=(
-                    f"Receipt #{receipt.receipt_number} from {firm.name}"
-                ),
-                mailer=mailer,
-                db=db,
-                full_names=receipt.customer_fullname,
-                template_name="receipts/customer_receipt.html",
-                template_body=context,
-                attachments=attachments,
-            )
-
-            logger.info(
-                "Receipt #%s emailed to %s (pdf_attached=%s)",
-                receipt.receipt_number,
-                receipt.customer_email,
-                bool(attachments),
-            )
-    except Exception:
-        logger.exception(
-            "Failed to send receipt email for slug=%s", receipt_slug
-        )
 
 
 # =============================================================================
@@ -858,8 +933,6 @@ async def export_firm_receipts_csv(
     """
     _guard_user_state(current_user)
 
-    from api.firms.logics import get_firm_by_slug
-
     firm = await get_firm_by_slug(db, firm_slug)
     if not firm:
         raise HTTPException(
@@ -971,3 +1044,270 @@ async def export_firm_receipts_csv(
     )
 
     return csv_bytes, filename
+
+
+
+
+from fastapi import APIRouter, BackgroundTasks, Response, status
+
+from api.core.database import DBDep
+from api.core.mail import MailDep
+from api.order.logics import (
+    create_receipt,
+    read_firm_receipts,
+    read_all_receipts_grouped,
+    read_my_receipts,
+    read_single_receipt,
+    render_receipt_pdf,
+    export_firm_receipts_csv,
+    read_all_receipts_grouped
+    
+)
+from api.order.schemas import (
+    CreateReceiptResponse,
+    ReceiptCreate,
+    ReceiptListRead,
+    ReceiptRead,
+    AllReceiptsGroupedRead,
+    FirmReceiptsRead,
+
+)
+from api.users.deps import CurrentUser
+
+router = APIRouter(prefix="/receipts", tags=["Receipts"])
+
+
+
+@router.get(
+    "/mine",
+    response_model=ReceiptListRead,
+    status_code=status.HTTP_200_OK,
+    summary="List receipts from the caller's firms",
+)
+async def list_my_receipts(
+    db: DBDep,
+    current_user: CurrentUser,
+    firm_slug: str | None = None,
+    branch_no: int | None = None,
+    skip: int = 0,
+    limit: int = 100,
+):
+    """
+    Optional filters:
+        firm_slug  — restrict to one firm
+        branch_no  — restrict to one branch within that firm
+    """
+    return await read_my_receipts(
+        db=db,
+        current_user=current_user,
+        firm_slug=firm_slug,
+        branch_no=branch_no,
+        skip=skip,
+        limit=limit,
+    )
+
+
+# -----------------------------------------------------------------------------
+# /all — grouped by firm
+# -----------------------------------------------------------------------------
+
+@router.get(
+    "/all",
+    response_model=AllReceiptsGroupedRead,
+    status_code=status.HTTP_200_OK,
+    summary="List all receipts grouped by firm (owner-scoped; admin = all)",
+)
+async def list_all_receipts(
+    db: DBDep,
+    current_user: CurrentUser,
+    skip: int = 0,
+    limit: int = 100,
+):
+    return await read_all_receipts_grouped(
+        db=db,
+        current_user=current_user,
+        skip=skip,
+        limit=limit,
+    )
+
+
+# -----------------------------------------------------------------------------
+# /by-firm/{firm_slug} — receipts for one firm (optionally one branch)
+# -----------------------------------------------------------------------------
+
+@router.get(
+    "/by-firm/{firm_slug}",
+    response_model=FirmReceiptsRead,
+    status_code=status.HTTP_200_OK,
+    summary="List receipts for a specific firm (owner or admin)",
+)
+async def list_firm_receipts(
+    firm_slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+    branch_no: int | None = None,
+    skip: int = 0,
+    limit: int = 100,
+):
+    """
+    Pass `branch_no` to view a single branch in isolation.
+    Omit it to see all receipts across every branch of the firm.
+    """
+    return await read_firm_receipts(
+        firm_slug=firm_slug,
+        db=db,
+        current_user=current_user,
+        branch_no=branch_no,
+        skip=skip,
+        limit=limit,
+    )
+
+
+# -----------------------------------------------------------------------------
+# /by-firm/{firm_slug}/csv — CSV export (optionally one branch)
+# -----------------------------------------------------------------------------
+
+@router.get(
+    "/by-firm/{firm_slug}/csv",
+    response_class=Response,
+    status_code=status.HTTP_200_OK,
+    responses={
+        200: {
+            "content": {"text/csv": {}},
+            "description": "CSV export of the firm's receipts",
+        },
+    },
+    summary="Download a firm's receipts as CSV (owner or admin)",
+)
+async def download_firm_receipts_csv(
+    firm_slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+    branch_no: int | None = None,
+):
+    """
+    Pass `branch_no` to export a single branch's receipts.
+    Omit it to export every receipt across the firm.
+    """
+    csv_bytes, filename = await export_firm_receipts_csv(
+        firm_slug=firm_slug,
+        db=db,
+        current_user=current_user,
+        branch_no=branch_no,
+    )
+
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+# -----------------------------------------------------------------------------
+# POST /receipts — create
+# -----------------------------------------------------------------------------
+
+@router.post(
+    "",
+    response_model=CreateReceiptResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a receipt and queue the customer email",
+)
+async def create(
+    data: ReceiptCreate,
+    background_tasks: BackgroundTasks,
+    db: DBDep,
+    mailer: MailDep,
+    current_user: CurrentUser,
+):
+    return await create_receipt(
+        data=data,
+        db=db,
+        current_user=current_user,
+        mailer=mailer,
+        background_tasks=background_tasks,
+    )
+
+
+# -----------------------------------------------------------------------------
+# /{slug} — single receipt
+# -----------------------------------------------------------------------------
+
+@router.get(
+    "/{slug}",
+    response_model=ReceiptRead,
+    status_code=status.HTTP_200_OK,
+    summary="Get a single receipt (owner or admin)",
+)
+async def get_receipt(
+    slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    return await read_single_receipt(
+        slug=slug, db=db, current_user=current_user
+    )
+
+
+# -----------------------------------------------------------------------------
+# /{slug}/pdf — streamed PDF
+# -----------------------------------------------------------------------------
+
+@router.get(
+    "/{slug}/pdf",
+    response_class=Response,
+    status_code=status.HTTP_200_OK,
+    responses={
+        200: {
+            "content": {"application/pdf": {}},
+            "description": "Receipt PDF (inline view)",
+        },
+    },
+    summary="Open/download the receipt as PDF (owner or admin)",
+)
+async def receipt_pdf(
+    slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    """
+    Stream the receipt as a PDF.
+
+    `Content-Disposition: inline` tells the browser to display the
+    PDF in a new tab. The user prints or saves from the native viewer.
+    """
+    pdf_bytes = await render_receipt_pdf(
+        slug=slug, db=db, current_user=current_user
+    )
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": (
+                f'inline; filename="receipt-{slug}.pdf"'
+            ),
+            "Cache-Control": "private, max-age=300",
+        },
+)
+
+
+
+
+#previously we make use of this
+ReceiptCsvResponse, but on your updated version you ommited it
+
+now i want to design my frontend on this in mind all types must follow our design patterns of types,
+all messages,errors,exceptions must come from backend 
+no hardcoded anything
+
+after saving the receipt in db and showing success message then redirect to page that show the contents of
+receipt.html/receipt.pdf so they can see exactly what the receipt looks like then under it you show
+"print this receipt now" which will send the receipt to printer machine for printout
+
+
+
+
