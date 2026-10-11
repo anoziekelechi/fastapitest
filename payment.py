@@ -1,3 +1,39 @@
+
+// src/hooks/useAvailablePaymentMethods.ts
+
+export function useAvailablePaymentMethods(): UseAvailablePaymentMethodsResult {
+  const [data, setData] = useState<AvailablePaymentMethodsRead | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let mounted = true;
+
+    api
+      .get<AvailablePaymentMethodsRead>("/payment-methods/available", {
+        signal: controller.signal,
+      })
+      .then((res) => {
+        if (mounted) setData(res.data);
+      })
+      .catch((err) => {
+        // ... handles cancel + errors ...
+      })
+      .finally(() => {
+        if (mounted && !controller.signal.aborted) setLoading(false);
+      });
+
+    return () => {
+      mounted = false;
+      controller.abort();
+    };
+  }, []);
+
+  return { data, loading, error };
+}
+
+
 types/payment/
 ├── read.ts       → PaymentMethodRead, CountryPaymentMethodsRead, AllPaymentMethodsRead, AvailablePaymentMethodRead, AvailablePaymentMethodsRead
 ├── create.ts     → PaymentMethodCreate, CreatePaymentMethodResponse
