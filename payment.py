@@ -159,20 +159,7 @@ async def patch_payment_method(
     )
 
 
-@router.delete(
-    "/{slug}",
-    response_model=MessageResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Delete a payment method (admin only)",
-)
-async def remove_payment_method(
-    slug: str,
-    db: DBDep,
-    admin: AdminUser,
-):
-    return await delete_payment_method(
-        slug=slug, db=db, current_user=admin
-    )
+
 
 
 
