@@ -1,3 +1,75 @@
+// src/hooks/useAvailablePaymentMethods.ts
+
+import { useEffect, useState } from "react";
+import axios from "axios";
+
+import api from "@/api/client";
+import type { AvailablePaymentMethodsRead } from "@/types";
+
+
+interface UseAvailablePaymentMethodsResult {
+  data: AvailablePaymentMethodsRead | null;
+  loading: boolean;
+  error: string | null;
+}
+
+
+/**
+ * Fetch the deduplicated list of payment methods accepted across
+ * the entire platform.
+ *
+ * Public endpoint — no authentication. Cancels on unmount.
+ */
+export function useAvailablePaymentMethods(): UseAvailablePaymentMethodsResult {
+  const [data, setData] = useState<AvailablePaymentMethodsRead | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let mounted = true;
+
+    api
+      .get<AvailablePaymentMethodsRead>("/payment-methods/available", {
+        signal: controller.signal,
+      })
+      .then((res) => {
+        if (mounted) setData(res.data);
+      })
+      .catch((err) => {
+        if (axios.isCancel(err)) return;
+        if (!mounted) return;
+
+        const detail = axios.isAxiosError(err)
+          ? err.response?.data?.detail
+          : null;
+        const status = axios.isAxiosError(err)
+          ? err.response?.status
+          : undefined;
+
+        setError(
+          typeof detail === "string"
+            ? detail
+            : `Request failed (${status ?? "unknown"}).`
+        );
+      })
+      .finally(() => {
+        if (mounted && !controller.signal.aborted) setLoading(false);
+      });
+
+    return () => {
+      mounted = false;
+      controller.abort();
+    };
+  }, []);
+
+  return { data, loading, error };
+}
+
+
+
+
+
 
 // src/hooks/useAvailablePaymentMethods.ts
 
