@@ -1,3 +1,33 @@
+# read_all_payment_methods — inside the loop
+payment_methods=[
+    to_payment_method_read(m) for m in methods
+],
+
+# read_payment_methods_by_country
+payment_methods=[
+    to_payment_method_read(m) for m in methods
+],
+
+# read_single_payment_method
+return to_payment_method_read(method)
+
+# read_available_payment_methods
+methods=[
+    AvailablePaymentMethodRead(
+        id=payment_method_id_of(m),
+        name=m.name,
+        slug=m.slug,
+        payment_logo_url=(
+            get_public_url(m.payment_logo_key)
+            if m.payment_logo_key
+            else None
+        ),
+    )
+    for m in methods
+],
+
+
+
 from fastapi import APIRouter, File, Form, UploadFile, status
 
 from api.core.database import DBDep
