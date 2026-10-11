@@ -1,4 +1,96 @@
 
+// src/hooks/usePaymentMethodsByCountry.ts
+
+import { useEffect, useState } from "react";
+import axios from "axios";
+
+import api from "@/api/client";
+import type { CountryPaymentMethodsRead } from "@/types";
+
+
+interface UsePaymentMethodsByCountryResult {
+  data: CountryPaymentMethodsRead | null;
+  loading: boolean;
+  error: string | null;
+  /** HTTP status of the error, when available (401, 403, 404, …). */
+  errorStatus: number | null;
+}
+
+
+/**
+ * Fetch the payment methods for a country by country slug.
+ *
+ * Authenticated endpoint — the axios client sends the session
+ * cookie automatically.
+ *
+ * @param countrySlug  Country slug (e.g. "liberia"). Pass null/undefined
+ *                     to skip the fetch.
+ */
+export function usePaymentMethodsByCountry(
+  countrySlug: string | null | undefined
+): UsePaymentMethodsByCountryResult {
+  const [data, setData] = useState<CountryPaymentMethodsRead | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [errorStatus, setErrorStatus] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!countrySlug) {
+      setData(null);
+      setError(null);
+      setErrorStatus(null);
+      setLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    let mounted = true;
+    setLoading(true);
+    setError(null);
+    setErrorStatus(null);
+
+    api
+      .get<CountryPaymentMethodsRead>(
+        `/payment-methods/country/${countrySlug}`,
+        { signal: controller.signal }
+      )
+      .then((res) => {
+        if (mounted) setData(res.data);
+      })
+      .catch((err) => {
+        if (axios.isCancel(err)) return;
+        if (!mounted) return;
+
+        if (!axios.isAxiosError(err)) {
+          setError("An unexpected error occurred.");
+          return;
+        }
+
+        const status = err.response?.status;
+        const detail = err.response?.data?.detail;
+
+        setErrorStatus(status ?? null);
+        setError(
+          typeof detail === "string"
+            ? detail
+            : `Request failed (${status ?? "unknown"}).`
+        );
+      })
+      .finally(() => {
+        if (mounted && !controller.signal.aborted) setLoading(false);
+      });
+
+    return () => {
+      mounted = false;
+      controller.abort();
+    };
+  }, [countrySlug]);
+
+  return { data, loading, error, errorStatus };
+}
+
+
+
 
 
 
