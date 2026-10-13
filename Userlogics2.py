@@ -183,3 +183,38 @@ async def has_permission(
             )
 
 
+
+
+# api/users/logics.py
+
+async def has_permission(
+    user: ReadUser,
+    required_perm: str,
+) -> None:
+    """
+    Pure in-memory permission check.
+    No DB queries - permission already loaded in get_current_user.
+    
+    Hierarchy:
+        1. Admin → all permissions ✅
+        2. User with matching permission → allowed ✅
+        3. Everyone else → 403 ❌
+    
+    Args:
+        user: ReadUser with .permission already set
+        required_perm: Required permission string
+    
+    Raises:
+        HTTPException: 403 if permission denied
+    """
+    # Admins bypass all permission checks
+    if user.is_admin:
+        return
+
+    # No permission or wrong permission
+    if user.permission != required_perm:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied - requires '{required_perm}' permission",
+        )
+
