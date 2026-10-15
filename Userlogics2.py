@@ -1,588 +1,353 @@
 
+ALLOWED_MIME_TYPES: set[str] = {
+    "image/jpeg",
+    "image/png",
+}
+
+ALLOWED_EXTENSIONS: set[str] = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+}
+
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MiB
+
+
+LOGO_FOLDER = "home/logo"
+BANNER_FOLDER = "home/banner"
+PAYMENT_LOGO = "home/paymentlogo" 
+
+LOGO_MAX_SIZE = 5 * 1024 * 1024       # 5 MiB
+BANNER_MAX_SIZE = 8 * 1024 * 1024     # 8 MiB
+PAYMENT_LOGO_MAX_SIZE = 2 * 1024 * 1024   # 2 MiB — logos are small
+
+
 # =============================================================================
-# READ — all (admin only)
+# FILE VALIDATION
 # =============================================================================
 
-async def read_all_payment_methods(
-    db: AsyncSession,
-    skip: int = 0,
-    limit: int = 100,
-) -> AvailablePaymentMethodsRead:
+async def validate_image_file_securely(
+    file: UploadFile,
+    max_size: int = MAX_FILE_SIZE,
+) -> str:
     """
-    Return every payment method.
+    Securely validate an uploaded image.
 
-    Admin-only — enforced by the route's `admin: AdminUser` dependency.
+    Validation:
+        1. Filename exists.
+        2. Extension is allowed.
+        3. Uploaded size is within the configured limit.
+        4. libmagic detects an allowed MIME type.
+        5. filetype verifies the file signature.
+        6. Pillow verifies that the image is valid.
+
+    Returns:
+        Detected MIME type.
+
+    Raises:
+        HTTPException: If the file is invalid or unsupported.
     """
-    try:
-        total: int = (
-            await db.execute(
-                select(func.count()).select_from(PaymentMethods)
-            )
-        ).scalar() or 0
 
-        result = await db.execute(
-            select(PaymentMethods)
-            .order_by(col(PaymentMethods.name))
-            .offset(skip)
-            .limit(limit)
-        )
-        methods = result.scalars().all()
-    except Exception:
-        logger.exception("Failed to list payment methods")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load payment methods. Please try again.",
-        )
-
-    return AvailablePaymentMethodsRead(
-        total=total,
-        methods=[to_payment_method_read(m) for m in methods],
-    )
-
-
-# =============================================================================
-# READ — available (public, deduplicated — for the Footer widget)
-# =============================================================================
-
-async def read_available_payment_methods(
-    db: AsyncSession,
-) -> AvailablePaymentMethodsRead:
-    """
-    Return one instance of each unique payment method.
-
-    Public — no authentication. Used by the public "We accept"
-    widget on the Footer and landing page.
-
-    In single-country mode, "deduplicated" is a no-op since names
-    are globally unique. Kept for API stability if multi-country
-    returns later.
-    """
-    try:
-        result = await db.execute(
-            select(PaymentMethods).order_by(col(PaymentMethods.name))
-        )
-        methods = result.scalars().all()
-    except Exception:
-        logger.exception("Failed to load available payment methods")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load payment methods. Please try again.",
-        )
-
-    return AvailablePaymentMethodsRead(
-        total=len(methods),
-        methods=[to_payment_method_read(m) for m in methods],
-    )
-
-
-# =============================================================================
-# READ — single (admin only)
-# =============================================================================
-
-async def read_single_payment_method(
-    slug: str,
-    db: AsyncSession,
-) -> PaymentMethodRead:
-    """Get a single payment method by slug. Admin-only via route."""
-    method = await get_payment_by_slug(db, slug)
-    if not method:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Payment method '{slug}' not found",
-        )
-    return to_payment_method_read(method)
-
-
-# =============================================================================
-# UPDATE — ADMIN ONLY
-# =============================================================================
-
-async def update_payment_method(
-    slug: str,
-    data: PaymentMethodUpdate,
-    payment_logo: UploadFile | None,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Update a payment method by slug.
-
-    Admin only — enforced by the route's `admin: AdminUser` dependency.
-
-    `name` and `payment_logo` are both optional. Passing a new logo
-    replaces the old one; omitting it leaves the existing logo intact.
-    """
-    method = await get_payment_by_slug(db, slug)
-    if not method:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Payment method '{slug}' not found",
-        )
-
-    if data.name is None and payment_logo is None:
+    if not file.filename:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided for update",
+            detail="Filename is required",
         )
 
-    updated_fields: list[str] = []
+    # -------------------------------------------------------------------------
+    # Extension validation
+    # -------------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Name change
-    # ------------------------------------------------------------------
-    if data.name is not None and data.name != method.name:
-        try:
-            existing = (
-                await db.execute(
-                    select(PaymentMethods).where(
-                        col(PaymentMethods.name) == data.name,
-                        col(PaymentMethods.id)
-                        != payment_method_id_of(method),
-                    )
-                )
-            ).scalars().first()
-        except Exception:
-            logger.exception(
-                "Failed to check duplicate payment method name=%s",
-                data.name,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update payment method. Please try again.",
-            )
+    extension = Path(file.filename).suffix.lower()
 
-        if existing:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Payment method '{data.name}' already exists",
-            )
-
-        old_slug = method.slug
-        method.name = data.name
-        method.slug = generate_slug(data.name)
-        updated_fields.append("name")
-
-        logger.info(
-            "Payment method name changed: slug '%s' -> '%s'",
-            old_slug,
-            method.slug,
-        )
-
-    # ------------------------------------------------------------------
-    # Logo replacement
-    # ------------------------------------------------------------------
-    old_logo_key = method.payment_logo_key
-    new_logo_key: str | None = None
-
-    if payment_logo is not None:
-        try:
-            new_logo_key = await handle_file_update(
-                file=payment_logo,
-                current_key=old_logo_key,
-                prefix=PAYMENT_LOGO,
-                max_size=PAYMENT_LOGO_MAX_SIZE,
-            )
-        except HTTPException:
-            raise
-        except Exception:
-            logger.exception(
-                "Failed to upload new logo for payment method slug=%s",
-                slug,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update payment method. Please try again.",
-            )
-
-        method.payment_logo_key = new_logo_key
-        updated_fields.append("payment_logo")
-
-    if not updated_fields:
+    if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail=(
-                "No changes detected - all supplied values are "
-                "identical to the current ones"
+                f"File extension '{extension}' is not allowed. "
+                "Only JPG, JPEG and PNG images are supported."
             ),
         )
 
-    # ------------------------------------------------------------------
-    # Persist
-    # ------------------------------------------------------------------
-    try:
-        db.add(method)
-        await db.commit()
-        await db.refresh(method)
-    except Exception:
-        await db.rollback()
-        logger.exception("Failed to update payment method slug=%s", slug)
+    # -------------------------------------------------------------------------
+    # Size validation
+    # -------------------------------------------------------------------------
 
-        if new_logo_key and new_logo_key != old_logo_key:
-            try:
-                delete_from_r2(new_logo_key)
-            except Exception:
-                logger.exception(
-                    "Failed to clean up new logo key=%s", new_logo_key
-                )
-
+    if file.size is not None and file.size > max_size:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update payment method. Please try again.",
-        )
-
-    if (
-        new_logo_key
-        and old_logo_key
-        and new_logo_key != old_logo_key
-    ):
-        try:
-            delete_from_r2(old_logo_key)
-        except Exception:
-            logger.exception(
-                "Failed to delete old payment logo key=%s", old_logo_key
-            )
-
-    logger.info(
-        "Payment method id=%s updated by admin user_id=%s (fields=%s)",
-        payment_method_id_of(method),
-        current_user.id,
-        ",".join(updated_fields),
-    )
-
-    return {
-        "message": f"Payment method '{method.name}' updated successfully",
-        "payment_method": to_payment_method_read(method),
-    }
-
-
-# =============================================================================
-# DELETE — ADMIN ONLY
-# =============================================================================
-
-async def delete_payment_method(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """Delete a payment method by slug. Admin-only via route."""
-    method = await get_payment_by_slug(db, slug)
-    if not method:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Payment method '{slug}' not found",
-        )
-
-    method_name = method.name
-
-    try:
-        await db.delete(method)
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        logger.exception("Failed to delete payment method slug=%s", slug)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete payment method. Please try again.",
-        )
-
-    logger.info(
-        "Payment method '%s' deleted by admin user_id=%s",
-        method_name,
-        current_user.id,
-    )
-
-    return {
-        "message": f"Payment method '{method_name}' deleted successfully"
-    }
-
-
-
-from fastapi import HTTPException, UploadFile, status
-from sqlalchemy import col, select
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
-
-
-# =============================================================================
-# CREATE PAYMENT METHOD — ADMIN ONLY
-# =============================================================================
-
-async def create_payment_method(
-    data: PaymentMethodCreate,
-    payment_logo: UploadFile | None,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Create a payment method.
-
-    Admin access is enforced by the route's AdminUser dependency.
-
-    The payment method name is globally unique.
-    The logo is optional and stored in Cloudflare R2.
-
-    A failed database transaction triggers a rollback and a best-effort
-    cleanup of the newly uploaded logo.
-    """
-
-    # ------------------------------------------------------------------
-    # 1. Check for an existing payment method name
-    # ------------------------------------------------------------------
-    try:
-        result = await db.execute(
-            select(PaymentMethods).where(
-                col(PaymentMethods.name) == data.name,
-            
-        )
-        existing = result.scalars().first()
-
-    except SQLAlchemyError:
-        await db.rollback()
-
-        logger.exception(
-            "Database error checking payment method name=%s",
-            data.name,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create payment method. Please try again.",
-        )
-
-    if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Payment method '{data.name}' already exists.",
-        )
-
-    # ------------------------------------------------------------------
-    # 2. Upload the optional logo
-    # ------------------------------------------------------------------
-    new_logo_key: str | None = None
-
-    if payment_logo is not None:
-        new_logo_key = await handle_file_update(
-            file=payment_logo,
-            current_key=None,
-            prefix=PAYMENT_LOGO,
-            max_size=PAYMENT_LOGO_MAX_SIZE,
-        )
-
-    # ------------------------------------------------------------------
-    # 3. Prepare the model
-    # ------------------------------------------------------------------
-    method = PaymentMethods(
-        name=data.name,
-        slug=generate_slug(data.name),
-        payment_logo_key=new_logo_key,
-    )
-
-    # ------------------------------------------------------------------
-    # 4. Best-effort cleanup for a failed database transaction
-    # ------------------------------------------------------------------
-    def cleanup_new_logo() -> None:
-        if new_logo_key is None:
-            return
-
-        try:
-            delete_from_r2(new_logo_key)
-
-        except Exception:
-            logger.exception(
-                "Failed to clean up payment logo in R2: key=%s",
-                new_logo_key,
-            )
-
-    # ------------------------------------------------------------------
-    # 5. Persist the payment method
-    # ------------------------------------------------------------------
-    try:
-        db.add(method)
-
-        # Execute the INSERT and surface database constraints before commit.
-        await db.flush()
-
-        # Load database-generated values while the transaction is active.
-        await db.refresh(method)
-
-        # Commit only after the preceding operations succeed.
-        await db.commit()
-
-    except IntegrityError:
-        await db.rollback()
-
-        logger.warning(
-            "Payment method creation violated a database integrity "
-            "constraint: name=%s",
-            data.name,
-        )
-
-        cleanup_new_logo()
-
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=(
-                f"Payment method '{data.name}' already exists "
-                "or conflicts with a database constraint."
+                f"File too large. Maximum allowed size is "
+                f"{max_size // (1024 * 1024)} MiB."
             ),
         )
 
-    except SQLAlchemyError:
-        await db.rollback()
+    # -------------------------------------------------------------------------
+    # Read header
+    # -------------------------------------------------------------------------
 
-        logger.exception(
-            "Database error creating payment method name=%s",
-            data.name,
-        )
+    header_bytes = await file.read(8192)
+    await file.seek(0)
 
-        cleanup_new_logo()
-
+    if not header_bytes:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create payment method. Please try again.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty",
         )
 
-    except Exception:
-        # Covers unexpected failures during persistence or refresh.
-        # The transaction has not been committed if this block is reached.
-        await db.rollback()
+    # -------------------------------------------------------------------------
+    # libmagic MIME detection
+    # -------------------------------------------------------------------------
 
-        logger.exception(
-            "Unexpected error creating payment method name=%s",
-            data.name,
+    try:
+        detected_mime = magic.from_buffer(
+            header_bytes,
+            mime=True,
         )
-
-        cleanup_new_logo()
-
+    except Exception as exc:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create payment method. Please try again.",
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Could not determine uploaded file type",
+        ) from exc
+
+    if detected_mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported image type: {detected_mime}",
         )
 
-    # ------------------------------------------------------------------
-    # 6. Log successful creation
-    # ------------------------------------------------------------------
-    logger.info(
-        "Payment method '%s' (slug=%s) created by admin user_id=%s",
-        method.name,
-        method.slug,
-        current_user.id,
-    )
+    # -------------------------------------------------------------------------
+    # File signature validation
+    # -------------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # 7. Return the response
-    # ------------------------------------------------------------------
-    return {
-        "message": (
-            f"Payment method '{method.name}' created successfully."
-        ),
-        "payment_method": to_payment_method_read(method),
-            }
+    kind = filetype.guess(header_bytes)
+
+    if kind is None:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Could not determine file signature",
+        )
+
+    if kind.mime not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="File signature does not match an allowed image type",
+        )
+
+    # -------------------------------------------------------------------------
+    # Pillow validation
+    # -------------------------------------------------------------------------
+
+    try:
+        await file.seek(0)
+
+        image = Image.open(file.file)
+        image.verify()
+
+        await file.seek(0)
+
+    except UnidentifiedImageError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Uploaded file is not a valid image",
+        ) from exc
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Uploaded image is corrupted or invalid",
+        ) from exc
+
+    return detected_mime
 
 
 # =============================================================================
-# CREATE — ADMIN ONLY
+# FILENAME / KEY GENERATION
 # =============================================================================
 
-async def create_payment_method(
-    data: PaymentMethodCreate,
-    payment_logo: UploadFile | None,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
+def sanitize_filename(name: str) -> str:
     """
-    Create a payment method.
-
-    Admin only — enforced by the route's `admin: AdminUser` dependency.
-
-    `payment_logo` is optional. Uploaded to R2 before the DB insert;
-    cleaned up if the insert fails.
+    Convert an original filename into a safe filename component.
     """
 
-    # ------------------------------------------------------------------
-    # Uniqueness — name is globally unique now
-    # ------------------------------------------------------------------
-    try:
-        existing = (
-            await db.execute(
-                select(PaymentMethods).where(
-                    col(PaymentMethods.name) == data.name,
-                )
-            )
-        ).scalars().first()
-    except Exception:
-        logger.exception(
-            "Failed to check existing payment method name=%s", data.name
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create payment method. Please try again.",
-        )
+    name = name.replace(" ", "-")
 
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Payment method '{data.name}' already exists",
-        )
-
-    # ------------------------------------------------------------------
-    # Upload logo (before DB write so we can clean up on failure)
-    # ------------------------------------------------------------------
-    new_logo_key: str | None = None
-    if payment_logo is not None:
-        new_logo_key = await handle_file_update(
-            file=payment_logo,
-            current_key=None,
-            prefix=PAYMENT_LOGO,
-            max_size=PAYMENT_LOGO_MAX_SIZE,
-        )
-
-    # ------------------------------------------------------------------
-    # Slug — derived from name only
-    # ------------------------------------------------------------------
-    method_slug = generate_slug(data.name)
-
-    method = PaymentMethods(
-        name=data.name,
-        slug=method_slug,
-        payment_logo_key=new_logo_key,
+    name = re.sub(
+        r"[^a-zA-Z0-9\-_]",
+        "",
+        name,
     )
 
-    # ------------------------------------------------------------------
-    # Persist
-    # ------------------------------------------------------------------
+    name = name.strip("-").lower()
+
+    return name or "image"
+
+
+def generate_image_key(
+    prefix: str,
+    original_name: str | None,
+) -> str:
+    """
+    Generate a unique R2 object key.
+
+    Example:
+        home/logo/company-logo-a83f21c4.png
+    """
+
+    if original_name:
+        path = Path(original_name)
+
+        raw_stem = path.stem or "image"
+        base_name = sanitize_filename(raw_stem)
+
+        extension = path.suffix.lower()
+
+        if extension not in ALLOWED_EXTENSIONS:
+            extension = ".jpg"
+
+    else:
+        base_name = "image"
+        extension = ".jpg"
+
+    unique_id = uuid.uuid4().hex[:8]
+
+    filename = f"{base_name}-{unique_id}{extension}"
+
+    return f"{prefix}/{filename}"
+
+
+# =============================================================================
+# R2 OPERATIONS
+# =============================================================================
+
+async def upload_to_r2(
+    file,
+    key: str,
+    content_type: str,
+) -> str:
+    """
+    Upload a file to Cloudflare R2.
+    """
+
     try:
-        db.add(method)
-        await db.commit()
-        await db.refresh(method)
-    except Exception:
-        await db.rollback()
-        logger.exception(
-            "Failed to create payment method name=%s", data.name
+        r2_client.upload_fileobj(
+            file,
+            get_settings().r2_bucket_name,
+            key,
+            ExtraArgs={
+                "ContentType": content_type,
+                "CacheControl": "public, max-age=31536000",
+            },
         )
 
-        if new_logo_key:
-            try:
-                delete_from_r2(new_logo_key)
-            except Exception:
-                logger.exception(
-                    "Failed to clean up orphaned logo key=%s",
-                    new_logo_key,
-                )
+        return key
 
+    except ClientError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create payment method. Please try again.",
-        )
+            detail="Failed to upload file",
+        ) from exc
 
-    logger.info(
-        "Payment method '%s' (slug=%s) created by admin user_id=%s",
-        method.name,
-        method.slug,
-        current_user.id,
+
+def delete_from_r2(key: str | None) -> None:
+    """
+    Best-effort deletion of an R2 object.
+
+    Failure is intentionally ignored because deletion should not
+    break an otherwise successful database operation.
+    """
+
+    if not key:
+        return
+
+    try:
+        r2_client.delete_object(
+            Bucket=get_settings().r2_bucket_name,
+            Key=key,
+        )
+    except Exception:
+        # In production, log this.
+        pass
+
+
+def get_public_url(
+    key: str | None,
+) -> str | None:
+    """
+    Convert an R2 object key into its public URL.
+    """
+
+    if not key:
+        return None
+
+    settings = get_settings()
+
+    if settings.r2_public_domain:
+        return f"https://{settings.r2_public_domain}/{key}"
+
+    return (
+        f"https://{settings.r2_bucket_name}."
+        f"{settings.r2_account_id}.r2.cloudflarestorage.com/{key}"
     )
 
-    return {
-        "message": f"Payment method '{method.name}' created successfully",
-        "payment_method": to_payment_method_read(method),
-    }
+
+# =============================================================================
+# FILE UPDATE
+# =============================================================================
+
+async def handle_file_update(
+    file: UploadFile | None,
+    current_key: str | None,
+    prefix: str,
+    max_size: int = MAX_FILE_SIZE,
+) -> str | None:
+    """
+    Upload a replacement image.
+
+    Flow:
+
+        No new file
+            ↓
+        Keep current key
+
+        New file
+            ↓
+        Validate
+            ↓
+        Generate unique key
+            ↓
+        Upload new file
+            ↓
+        Return new key
+
+    IMPORTANT:
+        This function does NOT delete the old file.
+
+    The old file should only be deleted after the database
+    transaction succeeds.
+    """
+
+    if file is None:
+        return current_key
+
+    detected_mime = await validate_image_file_securely(
+        file=file,
+        max_size=max_size,
+    )
+
+    base_key = generate_image_key(
+        prefix=prefix,
+        original_name=file.filename,
+    )
+
+    environment_prefix = get_settings().image_prefix.rstrip("/")
+
+    final_key = f"{environment_prefix}/{base_key}"
+
+    await upload_to_r2(
+        file=file.file,
+        key=final_key,
+        content_type=detected_mime,
+    )
+
+    return final_key
