@@ -110,9 +110,6 @@ export interface UpdatePaymentMethodResponse {
   payment_method: PaymentMethodRead;
 }
 
-export * from "./read";
-export * from "./create";
-export * from "./update";
 
 
 
@@ -126,11 +123,13 @@ import axios from "axios";
 import api from "@/api/client";
 import type { AvailablePaymentMethodsRead } from "@/types";
 
+
 interface UseAvailablePaymentMethodsResult {
   data: AvailablePaymentMethodsRead | null;
   loading: boolean;
   error: string | null;
 }
+
 
 /**
  * Fetch every payment method accepted on the platform.
@@ -182,15 +181,7 @@ export function useAvailablePaymentMethods(): UseAvailablePaymentMethodsResult {
   }, []);
 
   return { data, loading, error };
-
-
-
-
-          
-
-
-
-
+}
 
 
 
