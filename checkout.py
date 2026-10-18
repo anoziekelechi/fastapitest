@@ -1,3 +1,192 @@
+@new 
+
+
+
+# scripts/provision_momo.py
+
+import asyncio
+from pathlib import Path
+from uuid import uuid4
+
+import httpx
+from dotenv import dotenv_values, set_key
+
+
+# Project root is the parent of scripts/.
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = BASE_DIR / ".env"
+
+
+def save_env(key: str, value: str) -> None:
+    """Create or update a variable in .env."""
+    set_key(
+        str(ENV_FILE),
+        key,
+        value,
+        quote_mode="always",
+    )
+
+
+async def provision_momo() -> None:
+    if not ENV_FILE.is_file():
+        raise RuntimeError(
+            f".env file not found: {ENV_FILE}"
+        )
+
+    env = dotenv_values(ENV_FILE)
+
+    base_url = (
+        env.get("MTN_MOMO_BASE_URL") or ""
+    ).rstrip("/")
+
+    subscription_key = env.get(
+        "MTN_MOMO_SUBSCRIPTION_KEY"
+    )
+    callback_host = env.get(
+        "MTN_MOMO_CALLBACK_HOST"
+    )
+    ngrok_domain = env.get("NGROK_DOMAIN")
+
+    api_user = env.get("MTN_MOMO_API_USER")
+    api_key = env.get("MTN_MOMO_API_KEY")
+    registered_host = env.get(
+        "MTN_MOMO_CALLBACK_HOST"
+    )
+
+    if not base_url.endswith("/v1_0"):
+        raise RuntimeError(
+            "MTN_MOMO_BASE_URL must end in /v1_0."
+        )
+
+    if not subscription_key:
+        raise RuntimeError(
+            "MTN_MOMO_SUBSCRIPTION_KEY is missing."
+        )
+
+    if not callback_host or not ngrok_domain:
+        raise RuntimeError(
+            "MTN_MOMO_CALLBACK_HOST and NGROK_DOMAIN "
+            "must both be configured."
+        )
+
+    # MTN expects the hostname only, without a scheme or path.
+    if (
+        "://" in callback_host
+        or "/" in callback_host
+        or callback_host != ngrok_domain
+    ):
+        raise RuntimeError(
+            "MTN_MOMO_CALLBACK_HOST must exactly match "
+            "NGROK_DOMAIN and contain only the hostname."
+        )
+
+    if api_key and not api_user:
+        raise RuntimeError(
+            "MTN_MOMO_API_KEY exists but MTN_MOMO_API_USER "
+            "is missing. Check .env."
+        )
+
+    if api_user and api_key:
+        print("API User and API Key already exist in .env.")
+        print("Provisioning skipped.")
+        return
+
+    headers = {
+        "Ocp-Apim-Subscription-Key": subscription_key,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+
+        # Step 1: Create the API User if missing.
+        if not api_user:
+            api_user = str(uuid4())
+
+            response = await client.post(
+                f"{base_url}/apiuser",
+                headers={
+                    **headers,
+                    "X-Reference-Id": api_user,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "providerCallbackHost": callback_host,
+                },
+            )
+
+            if response.status_code != 201:
+                raise RuntimeError(
+                    "API User creation failed: "
+                    f"HTTP {response.status_code}: "
+                    f"{response.text[:500]}"
+                )
+
+            # Save immediately after successful creation.
+            save_env("MTN_MOMO_API_USER", api_user)
+            print("MTN API User created and saved.")
+
+        elif registered_host and registered_host != callback_host:
+            raise RuntimeError(
+                "The saved callback hostname differs from "
+                "the configured hostname. Do not assume that "
+                "changing .env updates MTN's registration."
+            )
+
+        # Step 2: Generate the API Key if missing.
+        if not api_key:
+            response = await client.post(
+                f"{base_url}/apiuser/{api_user}/apikey",
+                headers=headers,
+            )
+
+            if response.status_code != 201:
+                raise RuntimeError(
+                    "API Key generation failed: "
+                    f"HTTP {response.status_code}: "
+                    f"{response.text[:500]}. "
+                    "The API User UUID remains saved in .env."
+                )
+
+            try:
+                result = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    "MTN returned a non-JSON API Key response. "
+                    "Inspect the result before retrying."
+                ) from exc
+
+            generated_key = result.get("apiKey")
+
+            if not isinstance(generated_key, str) or not generated_key:
+                raise RuntimeError(
+                    "MTN response did not contain a valid apiKey."
+                )
+
+            save_env("MTN_MOMO_API_KEY", generated_key)
+            print("MTN API Key generated and saved.")
+
+    print("\nProvisioning completed.")
+    print(f"API User UUID: {api_user}")
+    print("API Key: saved securely in .env")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(provision_momo())
+    except (httpx.RequestError, RuntimeError, ValueError) as exc:
+        print(f"Provisioning failed: {exc}")
+        raise SystemExit(1)
+
+
+
+
+
+
+
+
+
+
+
+
 showman-giddiness-sulfite.ngrok-free.dev
 
 
