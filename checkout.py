@@ -180,6 +180,152 @@ if __name__ == "__main__":
 
 
 
+# main.py
+
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, status
+from pyngrok import ngrok
+
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+
+load_dotenv(ENV_FILE, override=True)
+
+LOCAL_HOST = "127.0.0.1"
+LOCAL_PORT = 8000
+
+NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN")
+NGROK_DOMAIN = os.getenv("NGROK_DOMAIN")
+
+MTN_MOMO_CALLBACK_HOST = os.getenv(
+    "MTN_MOMO_CALLBACK_HOST"
+)
+
+MTN_MOMO_API_USER = os.getenv("MTN_MOMO_API_USER")
+MTN_MOMO_API_KEY = os.getenv("MTN_MOMO_API_KEY")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Open the ngrok tunnel and close it during shutdown."""
+
+    if not NGROK_AUTHTOKEN:
+        raise RuntimeError(
+            "NGROK_AUTHTOKEN is missing from .env."
+        )
+
+    if not NGROK_DOMAIN:
+        raise RuntimeError(
+            "NGROK_DOMAIN is missing from .env."
+        )
+
+    if MTN_MOMO_CALLBACK_HOST != NGROK_DOMAIN:
+        raise RuntimeError(
+            "MTN_MOMO_CALLBACK_HOST must match NGROK_DOMAIN. "
+            "Update .env and confirm the hostname registered "
+            "with MTN before starting the app."
+        )
+
+    if not MTN_MOMO_API_USER or not MTN_MOMO_API_KEY:
+        raise RuntimeError(
+            "MTN API credentials are missing. Run "
+            "'python scripts/provision_momo.py' first."
+        )
+
+    tunnel = None
+
+    try:
+        ngrok.set_auth_token(NGROK_AUTHTOKEN)
+
+        tunnel = ngrok.connect(
+            addr=LOCAL_PORT,
+            domain=NGROK_DOMAIN,
+        )
+
+        app.state.ngrok_public_url = tunnel.public_url
+        app.state.momo_callback_host = NGROK_DOMAIN
+
+        print(f"Local FastAPI: http://{LOCAL_HOST}:{LOCAL_PORT}")
+        print(f"Public HTTPS: {tunnel.public_url}")
+        print(
+            "Callback URL: "
+            f"{tunnel.public_url}/momo/callback"
+        )
+
+        yield
+
+    finally:
+        if tunnel is not None:
+            ngrok.disconnect(tunnel.public_url)
+            print("ngrok tunnel disconnected.")
+
+
+app = FastAPI(
+    title="MTN MoMo Sandbox App",
+    lifespan=lifespan,
+)
+
+
+@app.api_route(
+    "/momo/callback",
+    methods=["POST", "PUT"],
+    status_code=status.HTTP_200_OK,
+)
+async def momo_callback(request: Request):
+    """Receive callback notifications from MTN."""
+
+    try:
+        payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON callback payload.",
+        ) from exc
+
+    # Development diagnostic only; avoid logging sensitive
+    # payment data in production.
+    print("MTN MoMo callback received.")
+
+    # TODO:
+    # 1. Validate the notification.
+    # 2. Verify transaction status with MTN.
+    # 3. Update your database idempotently.
+
+    return {"status": "received"}
+
+
+@app.get("/system/status")
+async def system_status(request: Request):
+    return {
+        "ngrok_public_url": getattr(
+            request.app.state,
+            "ngrok_public_url",
+            None,
+        ),
+        "callback_host": getattr(
+            request.app.state,
+            "momo_callback_host",
+            None,
+        ),
+        "api_user_configured": bool(MTN_MOMO_API_USER),
+        "api_key_configured": bool(MTN_MOMO_API_KEY),
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host=LOCAL_HOST,
+        port=LOCAL_PORT,
+        reload=False,
+    )
+
 
 
 
