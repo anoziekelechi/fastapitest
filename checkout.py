@@ -1,3 +1,14 @@
+addr=LOCAL_PORT,
+Argument of type "Literal[8000]" cannot be assigned to parameter "addr" of type "str | None" 
+in function "connect"
+
+
+ngrok.disconnect(tunnel.public_url)
+Argument of type "str | None" cannot be assigned to parameter "public_url" of type "str" in 
+function "disconnect"
+
+
+
 @new 
 
 
