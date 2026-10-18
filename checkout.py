@@ -1,3 +1,188 @@
+
+# app/main.py
+
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, status
+from pyngrok import ngrok
+
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = BASE_DIR / ".env"
+
+load_dotenv(ENV_FILE, override=True)
+
+LOCAL_HOST = "127.0.0.1"
+LOCAL_PORT = 8000
+
+NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN")
+NGROK_DOMAIN = os.getenv("NGROK_DOMAIN")
+
+MTN_MOMO_CALLBACK_HOST = os.getenv(
+    "MTN_MOMO_CALLBACK_HOST"
+)
+
+MTN_MOMO_API_USER = os.getenv("MTN_MOMO_API_USER")
+MTN_MOMO_API_KEY = os.getenv("MTN_MOMO_API_KEY")
+
+
+# --------------------------------------------------
+# FastAPI lifespan
+# --------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the ngrok tunnel and clean it up on shutdown."""
+
+    if not NGROK_AUTHTOKEN:
+        raise RuntimeError(
+            "NGROK_AUTHTOKEN is missing from .env."
+        )
+
+    if not NGROK_DOMAIN:
+        raise RuntimeError(
+            "NGROK_DOMAIN is missing from .env."
+        )
+
+    if MTN_MOMO_CALLBACK_HOST != NGROK_DOMAIN:
+        raise RuntimeError(
+            "MTN_MOMO_CALLBACK_HOST must match NGROK_DOMAIN. "
+            "Check .env and confirm the hostname registered with MTN."
+        )
+
+    if not MTN_MOMO_API_USER or not MTN_MOMO_API_KEY:
+        raise RuntimeError(
+            "MTN API credentials are missing. Run "
+            "'python scripts/provision_momo.py' first."
+        )
+
+    tunnel_url: str | None = None
+
+    try:
+        # Authenticate pyngrok.
+        ngrok.set_auth_token(NGROK_AUTHTOKEN)
+
+        # Start an HTTPS tunnel to the local FastAPI server.
+        tunnel = ngrok.connect(
+            addr=str(LOCAL_PORT),
+            domain=NGROK_DOMAIN,
+        )
+
+        tunnel_url = tunnel.public_url
+
+        if tunnel_url is None:
+            raise RuntimeError(
+                "ngrok did not return a public URL."
+            )
+
+        app.state.ngrok_public_url = tunnel_url
+        app.state.momo_callback_host = NGROK_DOMAIN
+
+        print(f"Local FastAPI: http://{LOCAL_HOST}:{LOCAL_PORT}")
+        print(f"Public HTTPS URL: {tunnel_url}")
+        print(f"MTN callback URL: {tunnel_url}/momo/callback")
+
+        # Start serving requests.
+        yield
+
+    finally:
+        if tunnel_url is not None:
+            ngrok.disconnect(tunnel_url)
+            print("ngrok tunnel disconnected.")
+
+
+# --------------------------------------------------
+# Application
+# --------------------------------------------------
+
+app = FastAPI(
+    title="MTN MoMo Sandbox App",
+    lifespan=lifespan,
+)
+
+
+# --------------------------------------------------
+# MTN callback endpoint
+# --------------------------------------------------
+
+@app.api_route(
+    "/momo/callback",
+    methods=["POST", "PUT"],
+    status_code=status.HTTP_200_OK,
+)
+async def momo_callback(request: Request):
+    """Receive callback notifications from MTN."""
+
+    try:
+        payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON callback payload.",
+        ) from exc
+
+    # Development diagnostic only.
+    # Avoid logging payment details in production.
+    print("MTN MoMo callback received.")
+
+    # TODO:
+    # 1. Validate the callback.
+    # 2. Verify the payment status with MTN.
+    # 3. Update the transaction in your database idempotently.
+
+    return {"status": "received"}
+
+
+# --------------------------------------------------
+# Diagnostic endpoint
+# --------------------------------------------------
+
+@app.get("/system/status")
+async def system_status(request: Request):
+    """Show service status without exposing credentials."""
+
+    return {
+        "ngrok_public_url": getattr(
+            request.app.state,
+            "ngrok_public_url",
+            None,
+        ),
+        "callback_host": getattr(
+            request.app.state,
+            "momo_callback_host",
+            None,
+        ),
+        "api_user_configured": bool(MTN_MOMO_API_USER),
+        "api_key_configured": bool(MTN_MOMO_API_KEY),
+    }
+
+
+# --------------------------------------------------
+# Optional direct execution
+# --------------------------------------------------
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host=LOCAL_HOST,
+        port=LOCAL_PORT,
+        reload=False,
+    )
+
+
+
+
+
+
+
 addr=LOCAL_PORT,
 Argument of type "Literal[8000]" cannot be assigned to parameter "addr" of type "str | None" 
 in function "connect"
