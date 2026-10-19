@@ -1,11 +1,5 @@
 
-(momo_app) anoziekelechi@Anozies-MacBook-Pro momo_app % python -c "import sys;print(sys.executable)"
-/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
-(momo_app) anoziekelechi@Anozies-MacBook-Pro momo_app % pipenv run python -c "import sys;print(sys.executable)"
-Loading .env environment variables...
-/Users/anoziekelechi/.local/share/virtualenvs/momo_app-aw865Lli/bin/python
-(mo 
-
+API User creation failed: HTTP 500: { "statusCode": 500, "message": "Internal server error", "activityId": "c3c03141-e0c7-4aab-9713-7a6a2b4536b3" }
 
 
 # scripts/provision_momo.py
