@@ -1,4 +1,189 @@
+# api/subscriptions/schemas.py
+"""Subscription schemas."""
+from datetime import datetime
+from decimal import Decimal
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+
+# =============================================================================
+# SERVICE
+# =============================================================================
+
+class ServiceCreate(BaseModel):
+    """Admin creates a service."""
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=2, max_length=50)
+    description: str = Field(..., min_length=10)
+    trial_days: int = Field(default=30, gt=0)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return v.strip().lower().replace(" ", "_")
+
+
+class ServiceRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: str
+    slug: str | None = None
+    is_active: bool
+    trial_days: int
+    created_at: datetime
+
+
+# =============================================================================
+# TIER
+# =============================================================================
+
+class TierCreate(BaseModel):
+    """Admin creates a tier for a service."""
+    model_config = ConfigDict(extra="forbid")
+
+    service_id: int = Field(..., gt=0)
+    name: str = Field(..., min_length=2, max_length=50)
+    description: str | None = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return v.strip().lower()
+        # e.g. "starter", "pro", "enterprise"
+
+
+class TierRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    service_id: int
+    name: str
+    slug: str | None = None
+    description: str | None = None
+    is_active: bool
+    created_at: datetime
+
+
+class TierWithPlansRead(BaseModel):
+    """Tier with all its plans - for frontend pricing page."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    service_id: int
+    name: str
+    slug: str | None = None
+    description: str | None = None
+    is_active: bool
+    plans: list["PlanRead"] = []
+
+
+# =============================================================================
+# PLAN
+# =============================================================================
+
+class PlanCreate(BaseModel):
+    """Admin creates a plan for a tier."""
+    model_config = ConfigDict(extra="forbid")
+
+    tier_id: int = Field(..., gt=0)
+    name: str = Field(..., min_length=2, max_length=50)
+    description: str | None = None
+    duration_days: int = Field(..., gt=0)
+    price: Decimal = Field(..., gt=Decimal("0"))
+    currency: str = Field(default="NGN", min_length=3, max_length=3)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return v.strip().lower()
+        # e.g. "monthly", "quarterly", "biannual", "annual"
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def validate_currency(cls, v: str) -> str:
+        return v.strip().upper()
+
+
+class PlanRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    tier_id: int
+    name: str
+    slug: str | None = None
+    description: str | None = None
+    duration_days: int
+    price: Decimal
+    currency: str
+    is_active: bool
+    created_at: datetime
+
+
+# =============================================================================
+# SUBSCRIPTION
+# =============================================================================
+
+class SubscriptionActivate(BaseModel):
+    """Activate paid subscription for a firm."""
+    model_config = ConfigDict(extra="forbid")
+
+    firm_id: int = Field(..., gt=0)
+    service_id: int = Field(..., gt=0)
+    tier_id: int = Field(..., gt=0)
+    plan_id: int = Field(..., gt=0)
+
+
+class SubscriptionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    firm_id: int
+    service_id: int
+    tier_id: int | None = None
+    plan_id: int | None = None
+
+    # Trial
+    is_on_trial: bool
+    trial_started_at: datetime
+    trial_ends_at: datetime | None = None
+
+    # Paid
+    is_active: bool
+    subscription_started_at: datetime | None = None
+    subscription_ends_at: datetime | None = None
+    auto_renew: bool
+
+    created_at: datetime
+
+    # Computed
+    days_remaining: int | None = None
+    status_label: str | None = None
+    can_access: bool = False
+
+
+class SubscriptionStatusRead(BaseModel):
+    """Quick status check response."""
+    firm_id: int
+    service_id: int
+    service_name: str
+    tier_name: str | None = None
+    plan_name: str | None = None
+    is_active: bool
+    is_on_trial: bool
+    days_remaining: int
+    status_label: str
+    can_access: bool
+
+
+class ServiceWithTiersRead(BaseModel):
+    """Service with tiers and plans - for pricing page."""
+    id: int
+    name: str
+    description: str
+    trial_days: int
+    tiers: list[TierWithPlansRead] = []
 # api/subscriptions/models.py
 """Subscription models."""
 from datetime import datetime, timezone, timedelta
