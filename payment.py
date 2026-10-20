@@ -399,7 +399,19 @@ def _subscription_id(sub: Subscription) -> int:
         raise HTTPException(500, "Failed to load subscription.")
     return sub.id
 
+# api/subscriptions/logics.py
 
+from api.core.settings import get_settings
+
+settings = get_settings()
+
+
+def to_plan_read(plan: SubscriptionPlan) -> PlanRead:
+    """Build a PlanRead with currency resolved from settings."""
+    read = PlanRead.model_validate(plan)
+    return read.model_copy(
+        update={"currency": settings.currency_code}
+    )
 # =============================================================================
 # LOOKUP HELPERS
 # =============================================================================
@@ -2213,7 +2225,47 @@ async def patch_subscription(
 )
 
 
+Now every place that returns PlanRead uses this helper:
 
+```python
+# Before
+plans=[PlanRead.model_validate(p) for p in visible_plans]
+
+# After
+plans=[to_plan_read(p) for p in visible_plans]
+```
+
+```python
+# Before (in read_plans_for_tier)
+return [PlanRead.model_validate(p) for p in plans]
+
+# After
+return [to_plan_read(p) for p in plans]
+```
+
+```python
+# Before (in read_plan_by_id)
+return PlanRead.model_validate(plan)
+
+# After
+return to_plan_read(plan)
+```
+
+```python
+# Before (in create_plan response)
+"plan": PlanRead.model_validate(plan),
+
+# After
+"plan": to_plan_read(plan),
+```
+
+```python
+# Before (in update_plan response)
+"plan": PlanRead.model_validate(plan),
+
+# After
+"plan": to_plan_read(plan),
+```
 
 
 
