@@ -1,3 +1,27 @@
+def normalize_payment_option(value: str,field_name: str ="Input") -> str:
+    """
+    Normalize a single option.
+    Trims whitespace, collapses internal multiple spaces, and forces uppercase.
+    
+    Valid:
+        "momo  liberia"       → "MOMO LIBERIA"
+        "bank transfer"       → "BANK TRANSFER"
+        "opay"                → "OPAY"
+        "receipt              > RECEIPT 
+    Invalid:
+        ""                    → Error (empty selection)
+        None                  → Error (missing selection)
+    """
+    if not value or not value.strip():
+        raise ValueError(
+            f"{field_name} Cannot be empty"
+            )
+        
+        
+    # Collapse multiple internal spaces down to one, and capitalize everything
+    return re.sub(r"\s+", " ", value.strip()).upper()
+
+
 #VALIDATOR
 def normalize_user_message(value: str, field_name: str = "Message") -> str:
     """
