@@ -39,6 +39,51 @@ def normalize_user_message(value: str, field_name: str = "Message") -> str:
 # SCHEMAS
 
 
+from pydantic import BaseModel, Field, field_validator
+
+from api.core.validators import (
+    normalize_payment_option,
+    normalize_user_message,
+)
+
+
+class ServiceCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=50)
+    description: str = Field(min_length=10)
+    trial_days: int = Field(default=30, gt=0)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = normalize_payment_option(
+            value,
+            field_name="Service name",
+        )
+        if not 2 <= len(value) <= 50:
+            raise ValueError(
+                "Service name must be between 2 and 50 characters."
+            )
+        return value
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def validate_description(cls, value: str) -> str:
+        value = normalize_user_message(
+            value,
+            field_name="Service description",
+        )
+        if len(value) < 10:
+            raise ValueError(
+                "Service description must contain at least 10 characters."
+            )
+        return value
+
+
+
+
+
+
+
 class ServiceCreate(BaseModel):
     """Admin creates a service."""
     model_config = ConfigDict(extra="forbid")
