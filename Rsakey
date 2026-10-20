@@ -20,3 +20,79 @@ tail -n 10 .env
 private_key.pem
 public_key.pem
 *.pem
+
+
+
+
+import subprocess
+from pathlib import Path
+
+
+def generate_jwt_keys() -> None:
+    """
+    Generate 2048-bit RSA keys for JWT RS256 and append them
+    to the .env file as single-line environment variables.
+    """
+    env_file = Path(".env")
+    private_key_file = Path("private_key.pem")
+    public_key_file = Path("public_key.pem")
+
+    try:
+        # Generate the 2048-bit RSA private key.
+        subprocess.run(
+            [
+                "openssl",
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-out",
+                str(private_key_file),
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+            ],
+            check=True,
+        )
+
+        # Extract the public key.
+        subprocess.run(
+            [
+                "openssl",
+                "rsa",
+                "-pubout",
+                "-in",
+                str(private_key_file),
+                "-out",
+                str(public_key_file),
+            ],
+            check=True,
+        )
+
+        # Read both keys and remove newlines.
+        private_key = private_key_file.read_text().replace("\n", "")
+        public_key = public_key_file.read_text().replace("\n", "")
+
+        # Append the keys to .env.
+        with env_file.open("a", encoding="utf-8") as file:
+            file.write(f'\nPRIVATE_KEY="{private_key}"\n')
+            file.write(f'PUBLIC_KEY="{public_key}"\n')
+
+        print("JWT RS256 keys successfully generated and added to .env!")
+
+    except FileNotFoundError:
+        print("Error: OpenSSL was not found. Install OpenSSL and try again.")
+
+    except subprocess.CalledProcessError as exc:
+        print(f"Error: OpenSSL failed with exit code {exc.returncode}.")
+
+    except OSError as exc:
+        print(f"Error writing key files or .env: {exc}")
+
+
+if __name__ == "__main__":
+    generate_jwt_keys()
+
+
+
+# run in same dir with your .env
+python generate_jwt_keys.py
+
