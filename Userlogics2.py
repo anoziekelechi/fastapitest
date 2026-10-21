@@ -1,134 +1,43 @@
-# api/subscriptions/logics.py (top of file, after existing imports)
-
-from typing import Any
-from sqlalchemy.orm import selectinload
-
-
-def _load_relationship(attr: Any):
-    """
-    Wrap `selectinload` with a type-hiding shim.
-
-    SQLModel declares relationships as their Python type
-    (e.g. `list[SubscriptionPlan]`), but SQLAlchemy's metaclass
-    replaces them with `InstrumentedAttribute` at runtime. Pyright
-    sees the Python type and rejects the call. This helper keeps the
-    suppression localized to one place instead of every call site.
-    """
-    return selectinload(attr)
-
-
-
-
-from sqlalchemy.exc import SQLAlchemyError
-from sqlmodel import col, select
-
-
-async def read_service_with_tiers(
-    slug: str,
+async def _require_firm_access(
     db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> ServiceWithTiersRead:
+    *,
+    firm_id: int,
+    current_user: ReadUser,
+) -> Firm:
     """
-    Read a subscription service with its tiers and plans.
+    Verify the firm exists and the caller owns it or is an administrator.
 
-    Public callers see only active services, tiers, and plans.
-    Admins can see inactive services, tiers, and plans.
+    This assumes ReadUser.id is the user's primary key and Firm has an
+    owner/user relationship represented by user_id. If your Firm model uses
+    a different ownership column, change this one helper.
     """
-    service = await get_service_by_slug(db, slug)
-    is_admin = _is_admin(current_user)
+    try:
+        firm = await db.get(Firm, firm_id)
+    except SQLAlchemyError as exc:
+        raise _database_error("checking firm access", exc) from exc
 
-    if not service.is_active and not is_admin:
+    if firm is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription service not found.",
+            detail="Firm not found.",
         )
 
-    tier_query = (
-        select(SubscriptionTier)
-        .where(
-            col(SubscriptionTier.service_id)
-            == _service_id(service)
-        )
-    )
-
-    if not is_admin:
-        tier_query = tier_query.where(
-            col(SubscriptionTier.is_active).is_(True)
-        )
-
-    tier_query = (
-        tier_query
-        .options(
-            _load_relationship(SubscriptionTier.plans)
-        )
-        .order_by(col(SubscriptionTier.name))
-    )
-
-    try:
-        result = await db.execute(tier_query)
-        tiers = result.scalars().all()
-
-    except SQLAlchemyError as exc:
-        logger.exception(
-            "Failed to read tiers for service slug=%s",
-            slug,
-        )
-        raise _database_error(
-            "reading service tiers",
-            exc,
-        ) from exc
-
-    tier_reads: list[TierWithPlansRead] = []
-
-    for tier in tiers:
-        plans = sorted(
-            tier.plans or [],
-            key=lambda plan: plan.name,
-        )
-
-        visible_plans = [
-            plan
-            for plan in plans
-            if is_admin or plan.is_active
-        ]
-
-        tier_reads.append(
-            TierWithPlansRead.model_validate(tier).model_copy(
-                update={
-                    "plans": [
-                        to_plan_read(plan)
-                        for plan in visible_plans
-                    ],
-                }
-            )
-        )
-
-    return ServiceWithTiersRead(
-        **ServiceRead.model_validate(service).model_dump(),
-        tiers=tier_reads,
-    )
-
-
-
-#replace
-
-async def _count_subscriptions(
-    db: AsyncSession,
-    **filters: Any,
-) -> int:
-    try:
-        query = select(func.count()).select_from(Subscription)
-
-        for field_name, value in filters.items():
-            query = query.where(
-                getattr(Subscription, field_name) == value
+    if not _is_admin(current_user):
+        owner_id = getattr(firm, "user_id", None)
+        if owner_id is None or owner_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to this firm.",
             )
 
-        result = await db.execute(query)
-        return int(result.scalar_one())
+    return firm
 
-    except SQLAlchemyError as exc:
-        raise _database_error("counting subscriptions", exc) from exc
+
+
+
+
+
+
 
 # ---------------------------------------------------------------------------
 # Subscription activation
@@ -544,6 +453,38 @@ async def create_trial_subscriptions_for_firm(
 
 
 vs
+
+
+def guard_user_state(current_user: ReadUser) -> None:
+    """Reject disabled or unverified callers."""
+    if current_user.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account is suspended. Please contact admin.",
+            headers={"X-Error-Code": "account_suspended"},
+        )
+    if not current_user.verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account is not verified. Please verify your email.",
+            headers={"X-Error-Code": "account_unverified"},
+        )
+
+
+def guard_firm_state(firm: Firm) -> None:
+    """Reject operations on a disabled firm."""
+    if firm.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Firm '{firm.name}' is suspended. "
+                f"Please contact admin."
+            ),
+            headers={"X-Error-Code": "firm_suspended"},
+        )
+
+
+
 
 
 async def activate_subscription(
