@@ -1,4 +1,59 @@
- """
+
+async def _commit_or_rollback(
+    db: AsyncSession,
+    *,
+    operation: str,
+) -> None:
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        logger.warning("Constraint violation during %s", operation)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The operation conflicts with an existing record.",
+        ) from exc
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise _database_error(operation, exc) from exc
+
+
+async def _refresh_or_raise(
+    db: AsyncSession,
+    instance: Any,
+    *,
+    operation: str,
+) -> None:
+    try:
+        await db.refresh(instance)
+    except SQLAlchemyError as exc:
+        raise _database_error(operation, exc) from exc
+
+# already enforce via routes
+def _require_admin(current_user: ReadUser) -> None:
+    if not _is_admin(current_user):
+    #if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator access is required.",
+        )
+
+
+
+def _database_error(
+    operation: str,
+    exc: SQLAlchemyError,
+) -> HTTPException:
+    logger.exception("Database failure during %s", operation, exc_info=exc)
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="A database error occurred. Please try again.",
+    )
+
+
+
+
+"""
      SubscriptionService model now has
     service_logo_key: str | None = Field(
     default=None,
