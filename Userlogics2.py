@@ -1,3 +1,115 @@
+# api/subscriptions/logics.py (top of file, after existing imports)
+
+from typing import Any
+from sqlalchemy.orm import selectinload
+
+
+def _load_relationship(attr: Any):
+    """
+    Wrap `selectinload` with a type-hiding shim.
+
+    SQLModel declares relationships as their Python type
+    (e.g. `list[SubscriptionPlan]`), but SQLAlchemy's metaclass
+    replaces them with `InstrumentedAttribute` at runtime. Pyright
+    sees the Python type and rejects the call. This helper keeps the
+    suppression localized to one place instead of every call site.
+    """
+    return selectinload(attr)
+
+
+
+
+from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel import col, select
+
+
+async def read_service_with_tiers(
+    slug: str,
+    db: AsyncSession,
+    current_user: ReadUser | None = None,
+) -> ServiceWithTiersRead:
+    """
+    Read a subscription service with its tiers and plans.
+
+    Public callers see only active services, tiers, and plans.
+    Admins can see inactive services, tiers, and plans.
+    """
+    service = await get_service_by_slug(db, slug)
+    is_admin = _is_admin(current_user)
+
+    if not service.is_active and not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription service not found.",
+        )
+
+    tier_query = (
+        select(SubscriptionTier)
+        .where(
+            col(SubscriptionTier.service_id)
+            == _service_id(service)
+        )
+    )
+
+    if not is_admin:
+        tier_query = tier_query.where(
+            col(SubscriptionTier.is_active).is_(True)
+        )
+
+    tier_query = (
+        tier_query
+        .options(
+            _load_relationship(SubscriptionTier.plans)
+        )
+        .order_by(col(SubscriptionTier.name))
+    )
+
+    try:
+        result = await db.execute(tier_query)
+        tiers = result.scalars().all()
+
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to read tiers for service slug=%s",
+            slug,
+        )
+        raise _database_error(
+            "reading service tiers",
+            exc,
+        ) from exc
+
+    tier_reads: list[TierWithPlansRead] = []
+
+    for tier in tiers:
+        plans = sorted(
+            tier.plans or [],
+            key=lambda plan: plan.name,
+        )
+
+        visible_plans = [
+            plan
+            for plan in plans
+            if is_admin or plan.is_active
+        ]
+
+        tier_reads.append(
+            TierWithPlansRead.model_validate(tier).model_copy(
+                update={
+                    "plans": [
+                        to_plan_read(plan)
+                        for plan in visible_plans
+                    ],
+                }
+            )
+        )
+
+    return ServiceWithTiersRead(
+        **ServiceRead.model_validate(service).model_dump(),
+        tiers=tier_reads,
+    )
+
+
+
 #replace
 
 async def _count_subscriptions(
@@ -426,3 +538,435 @@ async def create_trial_subscriptions_for_firm(
             "creating trial subscriptions",
             exc,
         ) from exc
+
+
+
+
+
+vs
+
+
+async def activate_subscription(
+    data: SubscriptionActivate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Activate or extend a paid subscription for a firm.
+
+    Admin-only.
+
+    Guards applied:
+        - user.state: enabled + verified
+        - firm.state: not disabled
+    """
+
+    from api.models.users import Firm
+    from api.core.guards import guard_user_state, guard_firm_state
+
+    # ------------------------------------------------------------------
+    # 1. User state — must be enabled + verified
+    # ------------------------------------------------------------------
+    guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 2. Load firm and check state
+    # ------------------------------------------------------------------
+    try:
+        firm = await db.get(Firm, data.firm_id)
+    except Exception:
+        logger.exception("Failed to load firm id=%s", data.firm_id)
+        raise HTTPException(500, "Failed to load firm. Please try again.")
+
+    if not firm:
+        raise HTTPException(404, f"Firm with ID {data.firm_id} not found")
+
+    guard_firm_state(firm)
+
+    # ------------------------------------------------------------------
+    # 3. Service / tier / plan chain validation
+    # ------------------------------------------------------------------
+    try:
+        service = await db.get(SubscriptionService, data.service_id)
+    except Exception:
+        logger.exception(
+            "Failed to load service id=%s", data.service_id
+        )
+        raise HTTPException(500, "Failed to load service. Please try again.")
+
+    if not service or not service.is_active:
+        raise HTTPException(
+            404,
+            f"Service with ID {data.service_id} not found or inactive",
+        )
+
+    tier = await get_tier_by_id(db, data.tier_id)
+    if not tier or not tier.is_active:
+        raise HTTPException(
+            404, f"Tier with ID {data.tier_id} not found or inactive"
+        )
+
+    if tier.service_id != data.service_id:
+        raise HTTPException(
+            400,
+            f"Tier '{tier.name}' does not belong to service "
+            f"'{service.name}'",
+        )
+
+    plan = await get_plan_by_id(db, data.plan_id)
+    if not plan or not plan.is_active:
+        raise HTTPException(
+            404, f"Plan with ID {data.plan_id} not found or inactive"
+        )
+
+    if plan.tier_id != data.tier_id:
+        raise HTTPException(
+            400,
+            f"Plan '{plan.name}' does not belong to tier '{tier.name}'",
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Apply the subscription change
+    # ------------------------------------------------------------------
+    sub = await get_subscription_by_firm_service(
+        db, data.firm_id, data.service_id
+    )
+
+    now = datetime.now(timezone.utc)
+    ends_at = now + timedelta(days=plan.duration_days)
+
+    if sub is None:
+        sub = Subscription(
+            firm_id=data.firm_id,
+            service_id=data.service_id,
+            tier_id=data.tier_id,
+            plan_id=data.plan_id,
+            is_on_trial=False,
+            trial_started_at=now,
+            trial_ends_at=None,
+            is_active=True,
+            subscription_started_at=now,
+            subscription_ends_at=ends_at,
+            auto_renew=False,
+        )
+    else:
+        same_plan = (
+            sub.tier_id == data.tier_id
+            and sub.plan_id == data.plan_id
+            and not sub.is_on_trial
+            and sub.is_active
+            and sub.subscription_ends_at
+            and sub.subscription_ends_at > now
+        )
+
+        if same_plan:
+            ends_at = sub.subscription_ends_at + timedelta(
+                days=plan.duration_days
+            )
+            sub.subscription_ends_at = ends_at
+        else:
+            sub.tier_id = data.tier_id
+            sub.plan_id = data.plan_id
+            sub.is_on_trial = False
+            sub.trial_ends_at = None
+            sub.is_active = True
+            sub.subscription_started_at = now
+            sub.subscription_ends_at = ends_at
+
+    try:
+        db.add(sub)
+        await db.commit()
+        await db.refresh(sub)
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "Failed to activate subscription firm_id=%s service_id=%s",
+            data.firm_id,
+            data.service_id,
+        )
+        raise HTTPException(
+            500, "Failed to activate subscription. Please try again."
+        )
+
+    logger.info(
+        "Subscription activated for firm_id=%s service_id=%s "
+        "tier_id=%s plan_id=%s by admin user_id=%s",
+        data.firm_id,
+        data.service_id,
+        data.tier_id,
+        data.plan_id,
+        current_user.id,
+    )
+
+    return {
+        "message": (
+            f"Subscription activated for '{service.name}' until "
+            f"{ends_at.strftime('%Y-%m-%d')}"
+        ),
+        "subscription": _compute_subscription_read(sub),
+            }
+
+
+
+
+
+async def update_subscription(
+    firm_id: int,
+    service_id: int,
+    data: SubscriptionUpdate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Owner of the firm, or admin. Only `auto_renew` is editable.
+
+    Guards:
+        - user.state: enabled + verified
+        - firm.state: not disabled
+    """
+
+    from api.models.users import Firm
+    from api.core.guards import guard_user_state, guard_firm_state
+
+    # ------------------------------------------------------------------
+    # 1. User state
+    # ------------------------------------------------------------------
+    guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 2. Load firm + ownership check
+    # ------------------------------------------------------------------
+    try:
+        firm = await db.get(Firm, firm_id)
+    except Exception:
+        logger.exception("Failed to load firm id=%s", firm_id)
+        raise HTTPException(500, "Failed to load firm. Please try again.")
+
+    if not firm:
+        raise HTTPException(404, f"Firm with ID {firm_id} not found")
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            403,
+            "You can only update subscriptions for your own firms",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Firm state
+    # ------------------------------------------------------------------
+    guard_firm_state(firm)
+
+    # ------------------------------------------------------------------
+    # 4. Load subscription
+    # ------------------------------------------------------------------
+    sub = await get_subscription_by_firm_service(db, firm_id, service_id)
+    if not sub:
+        raise HTTPException(
+            404,
+            f"No subscription found for firm {firm_id} on service "
+            f"{service_id}",
+        )
+
+    if data.auto_renew is None:
+        raise HTTPException(
+            400, "At least one field must be provided for update"
+        )
+
+    if data.auto_renew == sub.auto_renew:
+        raise HTTPException(
+            400,
+            "No changes detected - auto_renew is already set to "
+            f"{sub.auto_renew}",
+        )
+
+    sub.auto_renew = data.auto_renew
+
+    try:
+        db.add(sub)
+        await db.commit()
+        await db.refresh(sub)
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "Failed to update subscription firm_id=%s service_id=%s",
+            firm_id,
+            service_id,
+        )
+        raise HTTPException(
+            500, "Failed to update subscription. Please try again."
+        )
+
+    logger.info(
+        "Subscription auto_renew=%s for firm_id=%s service_id=%s "
+        "by user_id=%s",
+        sub.auto_renew,
+        firm_id,
+        service_id,
+        current_user.id,
+    )
+
+    return {
+        "message": (
+            f"Auto-renew {'enabled' if sub.auto_renew else 'disabled'} "
+            f"successfully"
+        ),
+        "subscription": _compute_subscription_read(sub),
+        }
+
+
+
+
+
+
+async def read_subscriptions_for_firm(
+    firm_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> list[SubscriptionRead]:
+    """
+    Owner of the firm, or admin.
+
+    Guards:
+        - user.state: enabled + verified
+        - NO firm.state guard — owner must always see their own
+          subscriptions, including when the firm is disabled
+          (so they can reconcile and contact admin).
+    """
+
+    from api.models.users import Firm
+    from api.core.guards import guard_user_state
+
+    # ------------------------------------------------------------------
+    # 1. User state
+    # ------------------------------------------------------------------
+    guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 2. Load firm + ownership
+    # ------------------------------------------------------------------
+    try:
+        firm = await db.get(Firm, firm_id)
+    except Exception:
+        logger.exception("Failed to load firm id=%s", firm_id)
+        raise HTTPException(500, "Failed to load firm. Please try again.")
+
+    if not firm:
+        raise HTTPException(404, f"Firm with ID {firm_id} not found")
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            403,
+            "You can only view subscriptions for your own firms",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    # No firm.state guard here — reads remain available to the owner
+    # even when the firm is disabled, so they can diagnose the state.
+
+    try:
+        result = await db.execute(
+            select(Subscription)
+            .where(col(Subscription.firm_id) == firm_id)
+            .order_by(col(Subscription.service_id))
+        )
+        subs = result.scalars().all()
+    except Exception:
+        logger.exception(
+            "Failed to list subscriptions for firm_id=%s", firm_id
+        )
+        raise HTTPException(
+            500, "Failed to load subscriptions. Please try again."
+        )
+
+    return [_compute_subscription_read(s) for s in subs]
+
+
+
+async def read_subscription_status(
+    firm_id: int,
+    service_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> SubscriptionStatusRead:
+    """
+    Owner of the firm, or admin.
+
+    Guards:
+        - user.state: enabled + verified
+        - NO firm.state guard — read-only status check must work
+          even when the firm is disabled.
+    """
+
+    from api.models.users import Firm
+    from api.core.guards import guard_user_state
+
+    # ------------------------------------------------------------------
+    # 1. User state
+    # ------------------------------------------------------------------
+    guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 2. Load firm + ownership
+    # ------------------------------------------------------------------
+    try:
+        firm = await db.get(Firm, firm_id)
+    except Exception:
+        logger.exception("Failed to load firm id=%s", firm_id)
+        raise HTTPException(500, "Failed to load firm. Please try again.")
+
+    if not firm:
+        raise HTTPException(404, f"Firm with ID {firm_id} not found")
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            403,
+            "You can only view subscriptions for your own firms",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    # No firm.state guard — read-only status must remain accessible
+
+    service = await db.get(SubscriptionService, service_id)
+    if not service:
+        raise HTTPException(
+            404, f"Service with ID {service_id} not found"
+        )
+
+    sub = await get_subscription_by_firm_service(db, firm_id, service_id)
+    if not sub:
+        raise HTTPException(
+            404,
+            f"No subscription found for firm {firm_id} "
+            f"on service '{service.name}'",
+        )
+
+    tier = (
+        await get_tier_by_id(db, sub.tier_id) if sub.tier_id else None
+    )
+    plan = (
+        await get_plan_by_id(db, sub.plan_id) if sub.plan_id else None
+    )
+
+    read = _compute_subscription_read(sub)
+
+    return SubscriptionStatusRead(
+        firm_id=firm_id,
+        service_id=service_id,
+        service_name=service.name,
+        tier_name=tier.name if tier else None,
+        plan_name=plan.name if plan else None,
+        is_active=read.is_active,
+        is_on_trial=read.is_on_trial,
+        days_remaining=read.days_remaining or 0,
+        status_label=read.status_label or "unknown",
+        can_access=read.can_access,
+    )
+
+
+
+
+
+
+
+
