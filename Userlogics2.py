@@ -17,399 +17,51 @@ from api.core.validators import (
 )
 
 
-# ============================================================
-# SERVICE SCHEMAS
-# ============================================================
-
-class ServiceCreate(BaseModel):
-    name: str = Field(min_length=2, max_length=50)
-    description: str = Field(min_length=10)
-    trial_days: int = Field(default=30, gt=0)
-
-    @field_validator("name", mode="before")
-    @classmethod
-    def validate_name(cls, value: str) -> str:
-        value = normalize_user_message(
-            value,
-            field_name="Service name",
-        )
-
-        if not 2 <= len(value) <= 50:
-            raise ValueError(
-                "Service name must be between 2 and 50 characters."
-            )
-
-        return value
-
-    @field_validator("description", mode="before")
-    @classmethod
-    def validate_description(cls, value: str) -> str:
-        value = normalize_user_message(
-            value,
-            field_name="Service description",
-        )
-
-        if len(value) < 10:
-            raise ValueError(
-                "Service description must contain at least 10 characters."
-            )
-
-        return value
 
 
-class ServiceUpdate(BaseModel):
-    # Omitted means unchanged. Explicit null is rejected by the validator.
-    description: str | None = None
-    trial_days: int | None = Field(default=None, gt=0)
-    is_active: bool | None = None
-
-    @field_validator("description", mode="before")
-    @classmethod
-    def validate_description(cls, value: str | None) -> str:
-        if value is None:
-            raise ValueError("Service description cannot be null.")
-
-        value = normalize_user_message(
-            value,
-            field_name="Service description",
-        )
-
-        if len(value) < 10:
-            raise ValueError(
-                "Service description must contain at least 10 characters."
-            )
-
-        return value
-
-    @model_validator(mode="after")
-    def validate_patch_fields(self) -> Self:
-        if not self.model_fields_set:
-            raise ValueError("At least one field must be provided.")
-
-        return self
 
 
-class ServiceRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    name: str
-    description: str
-    slug: str | None = None
-    is_active: bool
-    trial_days: int
-    created_at: datetime
-    updated_at: datetime
 
 
-# ============================================================
-# TIER SCHEMAS
-# ============================================================
-
-class TierCreate(BaseModel):
-    service_id: int = Field(gt=0)
-    name: str = Field(min_length=2, max_length=50)
-    description: str = Field(min_length=10)
-
-    @field_validator("name", mode="before")
-    @classmethod
-    def validate_name(cls, value: str) -> str:
-        value = normalize_user_message(
-            value,
-            field_name="Tier name",
-        )
-
-        if not 2 <= len(value) <= 50:
-            raise ValueError(
-                "Tier name must be between 2 and 50 characters."
-            )
-
-        return value
-
-    @field_validator("description", mode="before")
-    @classmethod
-    def validate_description(cls, value: str) -> str:
-        value = normalize_user_message(
-            value,
-            field_name="Tier description",
-        )
-
-        if len(value) < 10:
-            raise ValueError(
-                "Tier description must contain at least 10 characters."
-            )
-
-        return value
 
 
-class TierUpdate(BaseModel):
-    # Omitted means unchanged. Explicit null is rejected.
-    description: str | None = None
-    is_active: bool | None = None
-
-    @field_validator("description", mode="before")
-    @classmethod
-    def validate_description(cls, value: str | None) -> str:
-        if value is None:
-            raise ValueError("Tier description cannot be null.")
-
-        value = normalize_user_message(
-            value,
-            field_name="Tier description",
-        )
-
-        if len(value) < 10:
-            raise ValueError(
-                "Tier description must contain at least 10 characters."
-            )
-
-        return value
-
-    @model_validator(mode="after")
-    def validate_patch_fields(self) -> Self:
-        if not self.model_fields_set:
-            raise ValueError("At least one field must be provided.")
-
-        return self
-
-
-class TierRead(BaseModel):
+class TierWithPlansRead(BaseModel):
+    """Tier with all its plans — for pricing pages."""
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     service_id: int
     name: str
     slug: str | None = None
-    description: str
+    description: str | None = None
     is_active: bool
-    created_at: datetime
-    updated_at: datetime
+    plans: list["PlanRead"] = []
 
+# my earlier version has this schema
 
-# ============================================================
-# PLAN SCHEMAS
-# ============================================================
-
-class PlanCreate(BaseModel):
-    tier_id: int = Field(gt=0)
-    name: str = Field(min_length=2, max_length=50)
-    description: str | None = None
-    duration_days: int = Field(gt=0)
-    price: Decimal = Field(
-        gt=Decimal("0"),
-        max_digits=10,
-        decimal_places=2,
-    )
-
-    @field_validator("name", mode="before")
-    @classmethod
-    def validate_name(cls, value: str) -> str:
-        value = normalize_user_message(
-            value,
-            field_name="Plan name",
-        )
-
-        if not 2 <= len(value) <= 50:
-            raise ValueError(
-                "Plan name must be between 2 and 50 characters."
-            )
-
-        return value
-
-    @field_validator("description", mode="before")
-    @classmethod
-    def validate_description(
-        cls,
-        value: str | None,
-    ) -> str | None:
-        if value is None:
-            return None
-
-        return normalize_user_message(
-            value,
-            field_name="Plan description",
-        )
-
-
-class PlanUpdate(BaseModel):
-    # Omitted means unchanged. Explicit null clears the description.
-    description: str | None = None
-    duration_days: int | None = Field(default=None, gt=0)
-    price: Decimal | None = Field(
-        default=None,
-        gt=Decimal("0"),
-        max_digits=10,
-        decimal_places=2,
-    )
-    is_active: bool | None = None
-
-    @field_validator("description", mode="before")
-    @classmethod
-    def validate_description(
-        cls,
-        value: str | None,
-    ) -> str | None:
-        if value is None:
-            return None
-
-        return normalize_user_message(
-            value,
-            field_name="Plan description",
-        )
-
-    @model_validator(mode="after")
-    def validate_patch_fields(self) -> Self:
-        if not self.model_fields_set:
-            raise ValueError("At least one field must be provided.")
-
-        return self
-
-
-class PlanRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    tier_id: int
-    name: str
-    slug: str | None = None
-    description: str | None = None
-    duration_days: int
-    price: Decimal
-    currency: str
-    is_active: bool
-    created_at: datetime
-    updated_at: datetime
-
-
-# ============================================================
-# NESTED CATALOGUE SCHEMAS
-# ============================================================
-
-class TierWithPlansRead(TierRead):
-    plans: list[PlanRead] = Field(default_factory=list)
-
-
-class ServiceWithTiersRead(ServiceRead):
-    tiers: list[TierWithPlansRead] = Field(default_factory=list)
 
 
 # ============================================================
 # SUBSCRIPTION ACTION SCHEMAS
 # ============================================================
 
-class SubscriptionActivate(BaseModel):
-    firm_id: int = Field(gt=0)
-    service_id: int = Field(gt=0)
-    tier_id: int = Field(gt=0)
-    plan_id: int = Field(gt=0)
 
-
-class SubscriptionUpdate(BaseModel):
-    # This update requires auto_renew to be provided and non-null.
-    auto_renew: bool
-
-    @model_validator(mode="before")
-    @classmethod
-    def require_auto_renew(cls, value: object) -> object:
-        if not isinstance(value, dict):
-            raise ValueError("A valid update object is required.")
-
-        if "auto_renew" not in value:
-            raise ValueError("auto_renew must be provided.")
-
-        if value["auto_renew"] is None:
-            raise ValueError("auto_renew cannot be null.")
-
-        return value
 
 
 # ============================================================
 # SUBSCRIPTION READ SCHEMAS
 # ============================================================
 
-class SubscriptionRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    firm_id: int
-    service_id: int
-    tier_id: int | None = None
-    plan_id: int | None = None
-    is_on_trial: bool
-    trial_started_at: datetime
-    trial_ends_at: datetime | None = None
-    is_active: bool
-    subscription_started_at: datetime | None = None
-    subscription_ends_at: datetime | None = None
-    auto_renew: bool
-    created_at: datetime
-    updated_at: datetime
-
-    # Computed by business logic, not read directly from the model.
-    days_remaining: int | None = None
-    status_label: str | None = None
-    can_access: bool = False
 
 
-class SubscriptionStatusRead(BaseModel):
-    firm_id: int
-    service_id: int
-    service_name: str
-    tier_name: str | None = None
-    plan_name: str | None = None
-    is_active: bool
-    is_on_trial: bool
-    days_remaining: int | None = None
-    status_label: str
-    can_access: bool
+
+
 
 
 # ============================================================
 # RESPONSE ENVELOPES
 # ============================================================
 
-class CreateServiceResponse(BaseModel):
-    message: str
-    service: ServiceRead
-
-
-class UpdateServiceResponse(BaseModel):
-    message: str
-    service: ServiceRead
-
-
-class CreateTierResponse(BaseModel):
-    message: str
-    tier: TierRead
-
-
-class UpdateTierResponse(BaseModel):
-    message: str
-    tier: TierRead
-
-
-class CreatePlanResponse(BaseModel):
-    message: str
-    plan: PlanRead
-
-
-class UpdatePlanResponse(BaseModel):
-    message: str
-    plan: PlanRead
-
-
-class ActivateSubscriptionResponse(BaseModel):
-    message: str
-    subscription: SubscriptionRead
-
-
-class UpdateSubscriptionResponse(BaseModel):
-    message: str
-    subscription: SubscriptionRead
-
-
-class MessageResponse(BaseModel):
-    message: str
 
 
 # helpers
@@ -418,10 +70,6 @@ class MessageResponse(BaseModel):
 from datetime import datetime, timezone
 from math import ceil
 
-
-def utc_now() -> datetime:
-    """Return the current timezone-aware UTC timestamp."""
-    return datetime.now(timezone.utc)
 
 
 def as_utc(value: datetime | None) -> datetime | None:
