@@ -1,428 +1,4 @@
 
-# logics
-
-
-import logging
-from datetime import timedelta
-from decimal import Decimal
-from typing import Any
-
-from fastapi import HTTPException, status
-from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import selectinload
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
-
-from api.core.settings import get_settings
-from api.core.slug import generate_slug
-from api.models.subscriptions import (
-    Subscription,
-    SubscriptionPlan,
-    SubscriptionService,
-    SubscriptionTier,
-)
-from api.models.users import Firm
-from api.subscriptions.helpers import (
-    get_subscription_status,
-    is_unexpired,
-    utc_now,
-)
-from api.subscriptions.schemas import (
-    ActivateSubscriptionResponse,
-    CreatePlanResponse,
-    CreateServiceResponse,
-    CreateTierResponse,
-    MessageResponse,
-    PlanCreate,
-    PlanRead,
-    PlanUpdate,
-    ServiceCreate,
-    ServiceRead,
-    ServiceUpdate,
-    ServiceWithTiersRead,
-    SubscriptionActivate,
-    SubscriptionRead,
-    SubscriptionStatusRead,
-    SubscriptionUpdate,
-    TierCreate,
-    TierRead,
-    TierUpdate,
-    TierWithPlansRead,
-    UpdatePlanResponse,
-    UpdateServiceResponse,
-    UpdateSubscriptionResponse,
-    UpdateTierResponse,
-)
-from api.users.schemas import ReadUser
-
-
-logger = logging.getLogger(__name__)
-settings = get_settings()
-
-
-# ---------------------------------------------------------------------------
-# Common error handling and conversion helpers
-# ---------------------------------------------------------------------------
-
-def _http_error(
-    code: int,
-    message: str,
-) -> HTTPException:
-    return HTTPException(status_code=code, detail=message)
-
-
-def _database_error(
-    operation: str,
-    exc: SQLAlchemyError,
-) -> HTTPException:
-    logger.exception("Database failure during %s", operation, exc_info=exc)
-    return HTTPException(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail="A database error occurred. Please try again.",
-    )
-
-
-def _is_admin(user: ReadUser | None) -> bool:
-    return bool(user and getattr(user, "is_admin", False))
-
-
-def _service_id(service: SubscriptionService) -> int:
-    if service.id is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="The service has no database ID.",
-        )
-    return service.id
-
-
-def _tier_id(tier: SubscriptionTier) -> int:
-    if tier.id is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="The tier has no database ID.",
-        )
-    return tier.id
-
-
-def _plan_id(plan: SubscriptionPlan) -> int:
-    if plan.id is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="The plan has no database ID.",
-        )
-    return plan.id
-
-
-def _subscription_id(sub: Subscription) -> int:
-    if sub.id is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="The subscription has no database ID.",
-        )
-    return sub.id
-
-
-def to_plan_read(plan: SubscriptionPlan) -> PlanRead:
-    """Build a PlanRead with currency supplied by application settings."""
-    result = PlanRead.model_validate(plan)
-    return result.model_copy(
-        update={"currency": settings.currency_code}
-    )
-
-
-def _compute_subscription_read(
-    sub: Subscription,
-) -> SubscriptionRead:
-    remaining, label, can_access = get_subscription_status(
-        is_active=sub.is_active,
-        is_on_trial=sub.is_on_trial,
-        trial_ends_at=sub.trial_ends_at,
-        subscription_ends_at=sub.subscription_ends_at,
-    )
-
-    return SubscriptionRead.model_validate(sub).model_copy(
-        update={
-            "days_remaining": remaining,
-            "status_label": label,
-            "can_access": can_access,
-        }
-    )
-
-
-async def _commit_or_rollback(
-    db: AsyncSession,
-    *,
-    operation: str,
-) -> None:
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        await db.rollback()
-        logger.warning("Constraint violation during %s", operation)
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The operation conflicts with an existing record.",
-        ) from exc
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise _database_error(operation, exc) from exc
-
-
-async def _refresh_or_raise(
-    db: AsyncSession,
-    instance: Any,
-    *,
-    operation: str,
-) -> None:
-    try:
-        await db.refresh(instance)
-    except SQLAlchemyError as exc:
-        raise _database_error(operation, exc) from exc
-
-
-def _require_admin(current_user: ReadUser) -> None:
-    if not _is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator access is required.",
-        )
-
-
-async def _require_firm_access(
-    db: AsyncSession,
-    *,
-    firm_id: int,
-    current_user: ReadUser,
-) -> Firm:
-    """
-    Verify the firm exists and the caller owns it or is an administrator.
-
-    This assumes ReadUser.id is the user's primary key and Firm has an
-    owner/user relationship represented by user_id. If your Firm model uses
-    a different ownership column, change this one helper.
-    """
-    try:
-        firm = await db.get(Firm, firm_id)
-    except SQLAlchemyError as exc:
-        raise _database_error("checking firm access", exc) from exc
-
-    if firm is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Firm not found.",
-        )
-
-    if not _is_admin(current_user):
-        owner_id = getattr(firm, "user_id", None)
-        if owner_id is None or owner_id != current_user.id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You do not have access to this firm.",
-            )
-
-    return firm
-
-
-# ---------------------------------------------------------------------------
-# Lookup helpers
-# ---------------------------------------------------------------------------
-
-async def get_service_by_slug(
-    db: AsyncSession,
-    slug: str,
-) -> SubscriptionService:
-    try:
-        result = await db.execute(
-            select(SubscriptionService).where(
-                SubscriptionService.slug == slug
-            )
-        )
-        service = result.scalars().first()
-    except SQLAlchemyError as exc:
-        raise _database_error("looking up a service by slug", exc) from exc
-
-    if service is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription service not found.",
-        )
-
-    return service
-
-
-async def get_tier_by_id(
-    db: AsyncSession,
-    tier_id: int,
-) -> SubscriptionTier:
-    try:
-        result = await db.execute(
-            select(SubscriptionTier).where(
-                SubscriptionTier.id == tier_id
-            )
-        )
-        tier = result.scalars().first()
-    except SQLAlchemyError as exc:
-        raise _database_error("looking up a tier", exc) from exc
-
-    if tier is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription tier not found.",
-        )
-
-    return tier
-
-
-async def get_plan_by_id(
-    db: AsyncSession,
-    plan_id: int,
-) -> SubscriptionPlan:
-    try:
-        result = await db.execute(
-            select(SubscriptionPlan).where(
-                SubscriptionPlan.id == plan_id
-            )
-        )
-        plan = result.scalars().first()
-    except SQLAlchemyError as exc:
-        raise _database_error("looking up a plan", exc) from exc
-
-    if plan is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription plan not found.",
-        )
-
-    return plan
-
-
-async def get_subscription_by_firm_service(
-    db: AsyncSession,
-    firm_id: int,
-    service_id: int,
-) -> Subscription | None:
-    try:
-        result = await db.execute(
-            select(Subscription).where(
-                Subscription.firm_id == firm_id,
-                Subscription.service_id == service_id,
-            )
-        )
-        return result.scalars().first()
-    except SQLAlchemyError as exc:
-        raise _database_error(
-            "looking up a firm's subscription",
-            exc,
-        ) from exc
-
-
-async def _count_subscriptions(
-    db: AsyncSession,
-    *,
-    **filters: Any,
-) -> int:
-    try:
-        query = select(func.count()).select_from(Subscription)
-
-        for field_name, value in filters.items():
-            query = query.where(
-                getattr(Subscription, field_name) == value
-            )
-
-        result = await db.execute(query)
-        return int(result.scalar_one())
-    except SQLAlchemyError as exc:
-        raise _database_error("counting subscriptions", exc) from exc
-
-
-# ---------------------------------------------------------------------------
-# Service CRUD
-# ---------------------------------------------------------------------------
-
-async def create_service(
-    data: ServiceCreate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> CreateServiceResponse:
-    _require_admin(current_user)
-
-    try:
-        existing = await db.execute(
-            select(SubscriptionService).where(
-                func.lower(SubscriptionService.name)
-                == data.name.lower()
-            )
-        )
-        if existing.scalars().first():
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A subscription service with this name already exists.",
-            )
-
-        service = SubscriptionService(
-            name=data.name,
-            description=data.description,
-            slug=generate_slug(data.name),
-            trial_days=data.trial_days,
-            is_active=True,
-        )
-        db.add(service)
-        await _commit_or_rollback(db, operation="creating a service")
-        await _refresh_or_raise(
-            db, service, operation="refreshing a new service"
-        )
-
-        return CreateServiceResponse(
-            message="Subscription service created successfully.",
-            service=ServiceRead.model_validate(service),
-        )
-    except HTTPException:
-        raise
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise _database_error("creating a service", exc) from exc
-
-
-async def read_services(
-    db: AsyncSession,
-    *,
-    current_user: ReadUser | None = None,
-    skip: int = 0,
-    limit: int = 50,
-) -> list[ServiceRead]:
-    query = select(SubscriptionService).order_by(
-        SubscriptionService.name
-    )
-
-    if not _is_admin(current_user):
-        query = query.where(SubscriptionService.is_active.is_(True))
-
-    try:
-        result = await db.execute(query.offset(skip).limit(limit))
-        return [
-            ServiceRead.model_validate(item)
-            for item in result.scalars().all()
-        ]
-    except SQLAlchemyError as exc:
-        raise _database_error("reading subscription services", exc) from exc
-
-
-async def read_service_by_slug(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> ServiceRead:
-    service = await get_service_by_slug(db, slug)
-
-    if not service.is_active and not _is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription service not found.",
-        )
-
-    return ServiceRead.model_validate(service)
-
 
 async def read_service_with_tiers(
     slug: str,
@@ -478,470 +54,102 @@ async def read_service_with_tiers(
         tiers=tier_reads,
     )
 
-
-async def update_service(
-    slug: str,
-    data: ServiceUpdate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> UpdateServiceResponse:
-    _require_admin(current_user)
-    service = await get_service_by_slug(db, slug)
-
-    changes = data.model_dump(exclude_unset=True)
-
-    if not changes:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided.",
-        )
-
-    changed = False
-
-    for field_name, value in changes.items():
-        if getattr(service, field_name) != value:
-            setattr(service, field_name, value)
-            changed = True
-
-    if not changed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No changes were made.",
-        )
-
-    await _commit_or_rollback(db, operation="updating a service")
-    await _refresh_or_raise(db, service, operation="refreshing a service")
-
-    return UpdateServiceResponse(
-        message="Subscription service updated successfully.",
-        service=ServiceRead.model_validate(service),
-    )
+vs
 
 
-async def delete_service(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> MessageResponse:
-    _require_admin(current_user)
-    service = await get_service_by_slug(db, slug)
-
-    count = await _count_subscriptions(
-        db,
-        service_id=_service_id(service),
-    )
-    if count:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This service cannot be deleted because subscriptions reference it.",
-        )
-
-    try:
-        await db.delete(service)
-        await _commit_or_rollback(db, operation="deleting a service")
-    except HTTPException:
-        raise
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise _database_error("deleting a service", exc) from exc
-
-    logger.info(
-        "Subscription service %s deleted by administrator %s",
-        slug,
-        current_user.id,
-    )
-    return MessageResponse(message="Subscription service deleted successfully.")
-
-
-# ---------------------------------------------------------------------------
-# Tier CRUD
-# ---------------------------------------------------------------------------
-
-async def create_tier(
-    data: TierCreate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> CreateTierResponse:
-    _require_admin(current_user)
-
-    try:
-        service = await db.get(SubscriptionService, data.service_id)
-    except SQLAlchemyError as exc:
-        raise _database_error("loading a service for tier creation", exc) from exc
-
-    if service is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription service not found.",
-        )
-
-    try:
-        existing = await db.execute(
-            select(SubscriptionTier).where(
-                SubscriptionTier.service_id == data.service_id,
-                func.lower(SubscriptionTier.name) == data.name.lower(),
-            )
-        )
-        if existing.scalars().first():
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A tier with this name already exists for the service.",
-            )
-
-        tier = SubscriptionTier(
-            service_id=data.service_id,
-            name=data.name,
-            description=data.description,
-            slug=generate_slug(
-                f"{service.slug or service.name}-{data.name}"
-            ),
-            is_active=True,
-        )
-        db.add(tier)
-        await _commit_or_rollback(db, operation="creating a tier")
-        await _refresh_or_raise(db, tier, operation="refreshing a tier")
-
-        return CreateTierResponse(
-            message="Subscription tier created successfully.",
-            tier=TierRead.model_validate(tier),
-        )
-    except HTTPException:
-        raise
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise _database_error("creating a tier", exc) from exc
-
-
-async def read_tiers_for_service(
+async def read_service_with_tiers(
     slug: str,
     db: AsyncSession,
     current_user: ReadUser | None = None,
-) -> list[TierRead]:
-    service = await get_service_by_slug(db, slug)
-    is_admin = _is_admin(current_user)
+) -> ServiceWithTiersRead:
+    """
+    service + tiers + plans for pricing page
+    public callers see only active ties and plans
 
-    if not service.is_active and not is_admin:
+    """
+    service = await get_service_by_slug(db, slug)
+    #is_admin = _is_admin(current_user)
+
+    if (
+        not service.is_active 
+        and (current_user is None or not current_user.is_admin)
+        ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription service not found.",
+            detail=f"{slug} Subscription service not found.",
+        )
+      
+    is_admin= _require_admin
+    tier_query = await db.execute(
+    select(SubscriptionTier)
+    .where(SubscriptionTier.service_id == _service_id(service))
+    .order_by(col(SubscriptionTier.name))
+    )
+    tiers = tier_query.scalars().all()
+    if not is_admin:
+        result = tiers.where(
+            #Cannot access attribute "where" for class "Sequence[SubscriptionTier]"
+            #Attribute "where" is unknownPylancereportAttributeAccessIssue
+
+            #SubscriptionTier.is_active == True # no error if i do this
+            #Cannot access attribute "is_" for class "bool"
+            SubscriptionTier.is_active.is_(True) #
         )
 
-    query = select(SubscriptionTier).where(
-        SubscriptionTier.service_id == _service_id(service)
-    )
-
-    if not is_admin:
-        query = query.where(SubscriptionTier.is_active.is_(True))
-
-    query = query.order_by(SubscriptionTier.name)
+    tier_query = tier_query.options( #Cannot access attribute "options" for class "Result[Tuple[SubscriptionTier]]"
+  #Attribute "options" is unknown
+        selectinload(SubscriptionTier.plans)
+       #Argument of type "list[SubscriptionPlan]" cannot be assigned to parameter "keys" of 
+       # type "_AttrType" in function "selectinload" 
+    ).order_by(SubscriptionTier.name)
 
     try:
-        result = await db.execute(query)
-        return [
-            TierRead.model_validate(item)
-            for item in result.scalars().all()
-        ]
+        result = await db.execute(tier_query)
+        tiers = result.scalars().unique().all()
     except SQLAlchemyError as exc:
         raise _database_error("reading service tiers", exc) from exc
 
+    tier_reads: list[TierWithPlansRead] = []
 
-async def read_tier_by_id(
-    tier_id: int,
-    db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> TierRead:
-    tier = await get_tier_by_id(db, tier_id)
-    is_admin = _is_admin(current_user)
-
-    if not is_admin:
-        if not tier.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Subscription tier not found.",
-            )
-
-        service = await db.get(
-            SubscriptionService,
-            tier.service_id,
-        )
-        if service is None or not service.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Subscription tier not found.",
-            )
-
-    return TierRead.model_validate(tier)
-
-
-async def update_tier(
-    tier_id: int,
-    data: TierUpdate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> UpdateTierResponse:
-    _require_admin(current_user)
-    tier = await get_tier_by_id(db, tier_id)
-    changes = data.model_dump(exclude_unset=True)
-
-    if not changes:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided.",
-        )
-
-    changed = False
-    for field_name, value in changes.items():
-        if getattr(tier, field_name) != value:
-            setattr(tier, field_name, value)
-            changed = True
-
-    if not changed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No changes were made.",
-        )
-
-    await _commit_or_rollback(db, operation="updating a tier")
-    await _refresh_or_raise(db, tier, operation="refreshing a tier")
-
-    return UpdateTierResponse(
-        message="Subscription tier updated successfully.",
-        tier=TierRead.model_validate(tier),
-    )
-
-
-async def delete_tier(
-    tier_id: int,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> MessageResponse:
-    _require_admin(current_user)
-    tier = await get_tier_by_id(db, tier_id)
-
-    count = await _count_subscriptions(
-        db,
-        tier_id=_tier_id(tier),
-    )
-    if count:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This tier cannot be deleted because subscriptions reference it.",
-        )
-
-    try:
-        await db.delete(tier)
-        await _commit_or_rollback(db, operation="deleting a tier")
-    except HTTPException:
-        raise
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise _database_error("deleting a tier", exc) from exc
-
-    return MessageResponse(message="Subscription tier deleted successfully.")
-
-
-# ---------------------------------------------------------------------------
-# Plan CRUD
-# ---------------------------------------------------------------------------
-
-async def create_plan(
-    data: PlanCreate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> CreatePlanResponse:
-    _require_admin(current_user)
-
-    try:
-        tier = await db.get(SubscriptionTier, data.tier_id)
-    except SQLAlchemyError as exc:
-        raise _database_error("loading a tier for plan creation", exc) from exc
-
-    if tier is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription tier not found.",
-        )
-
-    try:
-        existing = await db.execute(
-            select(SubscriptionPlan).where(
-                SubscriptionPlan.tier_id == data.tier_id,
-                func.lower(SubscriptionPlan.name) == data.name.lower(),
-            )
-        )
-        if existing.scalars().first():
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A plan with this name already exists for the tier.",
-            )
-
-        plan = SubscriptionPlan(
-            tier_id=data.tier_id,
-            name=data.name,
-            description=data.description,
-            duration_days=data.duration_days,
-            price=data.price,
-            slug=generate_slug(
-                f"{tier.slug or tier.name}-{data.name}"
-            ),
-            is_active=True,
-        )
-        db.add(plan)
-        await _commit_or_rollback(db, operation="creating a plan")
-        await _refresh_or_raise(db, plan, operation="refreshing a plan")
-
-        return CreatePlanResponse(
-            message="Subscription plan created successfully.",
-            plan=to_plan_read(plan),
-        )
-    except HTTPException:
-        raise
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise _database_error("creating a plan", exc) from exc
-
-
-async def read_plans_for_tier(
-    tier_id: int,
-    db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> list[PlanRead]:
-    tier = await get_tier_by_id(db, tier_id)
-    is_admin = _is_admin(current_user)
-
-    if not is_admin:
-        if not tier.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Subscription tier not found.",
-            )
-
-        service = await db.get(
-            SubscriptionService,
-            tier.service_id,
-        )
-        if service is None or not service.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Subscription tier not found.",
-            )
-
-    query = select(SubscriptionPlan).where(
-        SubscriptionPlan.tier_id == _tier_id(tier)
-    )
-
-    if not is_admin:
-        query = query.where(SubscriptionPlan.is_active.is_(True))
-
-    query = query.order_by(SubscriptionPlan.duration_days)
-
-    try:
-        result = await db.execute(query)
-        return [
+    for tier in tiers:
+        plans = [
             to_plan_read(plan)
-            for plan in result.scalars().all()
+            for plan in sorted(tier.plans, key=lambda p: p.name)
+            if is_admin or plan.is_active
         ]
-    except SQLAlchemyError as exc:
-        raise _database_error("reading tier plans", exc) from exc
 
-
-async def read_plan_by_id(
-    plan_id: int,
-    db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> PlanRead:
-    plan = await get_plan_by_id(db, plan_id)
-    is_admin = _is_admin(current_user)
-
-    if not is_admin:
-        if not plan.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Subscription plan not found.",
+        tier_reads.append(
+            TierWithPlansRead(
+                **TierRead.model_validate(tier).model_dump(),
+                plans=plans,
             )
-
-        tier = await db.get(SubscriptionTier, plan.tier_id)
-        if tier is None or not tier.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Subscription plan not found.",
-            )
-
-        service = await db.get(
-            SubscriptionService,
-            tier.service_id,
-        )
-        if service is None or not service.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Subscription plan not found.",
-            )
-
-    return to_plan_read(plan)
-
-
-async def update_plan(
-    plan_id: int,
-    data: PlanUpdate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> UpdatePlanResponse:
-    _require_admin(current_user)
-    plan = await get_plan_by_id(db, plan_id)
-    changes = data.model_dump(exclude_unset=True)
-
-    if not changes:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided.",
         )
 
-    changed = False
-    for field_name, value in changes.items():
-        if getattr(plan, field_name) != value:
-            setattr(plan, field_name, value)
-            changed = True
-
-    if not changed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No changes were made.",
-        )
-
-    await _commit_or_rollback(db, operation="updating a plan")
-    await _refresh_or_raise(db, plan, operation="refreshing a plan")
-
-    return UpdatePlanResponse(
-        message="Subscription plan updated successfully.",
-        plan=to_plan_read(plan),
+    return ServiceWithTiersRead(
+        **ServiceRead.model_validate(service).model_dump(),
+        tiers=tier_reads,
     )
 
 
-async def delete_plan(
-    plan_id: int,
+# got error too on this code
+
+
+
+async def _count_subscriptions(
     db: AsyncSession,
-    current_user: ReadUser,
-) -> MessageResponse:
-    _require_admin(current_user)
-    plan = await get_plan_by_id(db, plan_id)
-
-    count = await _count_subscriptions(
-        db,
-        plan_id=_plan_id(plan),
-    )
-    if count:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This plan cannot be deleted because subscriptions reference it.",
-        )
-
+    *,
+    **filters: Any,#One or more keyword parameters must follow "*" parameterPylance
+) -> int:
     try:
-        await db.delete(plan)
-        await _commit_or_rollback(db, operation="deleting a plan")
-    except HTTPException:
-        raise
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise _database_error("deleting a plan", exc) from exc
+        query = select(func.count()).select_from(Subscription)
 
-    return MessageResponse(message="Subscription plan deleted successfully.")
+        for field_name, value in filters.items():
+            query = query.where(
+                getattr(Subscription, field_name) == value
+            )
+
+        result = await db.execute(query)
+        return int(result.scalar_one())
+    except SQLAlchemyError as exc:
+        raise _database_error("counting subscriptions", exc) from exc
+
