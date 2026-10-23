@@ -1,27 +1,6 @@
 
 
 
-async def get_tier_by_slug(
-    db: AsyncSession,
-    tier_slug: str,
-) -> SubscriptionTier:
-    try:
-        result = await db.execute(
-            select(SubscriptionTier).where(
-                col(SubscriptionTier.slug) == tier_slug
-            )
-        )
-        tier = result.scalars().first()
-    except SQLAlchemyError as exc:
-        raise _database_error("looking up a tier by slug", exc) from exc
-
-    if tier is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription tier not found.",
-        )
-    return tier
-
 
 async def read_tier_by_slug(
     service_slug: str,
@@ -92,71 +71,6 @@ async def read_tier_by_slug(
         update={"plans": [to_plan_read(p) for p in plans]}
     )
 
-
-
-@router.get(
-    "/services/{service_slug}/{tier_slug}",
-    response_model=TierWithPlansRead,
-    status_code=status.HTTP_200_OK,
-    summary="Tier detail by slug (public: active only)",
-)
-async def get_tier_by_slug_route(
-    service_slug: str,
-    tier_slug: str,
-    db: DBDep,
-    current_user: OptionalCurrentUser,
-):
-    return await read_tier_by_slug(
-        service_slug=service_slug,
-        tier_slug=tier_slug,
-        db=db,
-        current_user=current_user,
-    )
-
-
-
-async def read_tiers_for_service(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> list[TierRead]:
-    service = await get_service_by_slug(db, slug)
-    is_admin = _is_admin(current_user)
-
-    if not service.is_active and not is_admin:
-        raise HTTPException(404, "Subscription service not found.")
-
-    query = (
-        select(SubscriptionTier)
-        .where(
-            col(SubscriptionTier.service_id) == _service_id(service)
-        )
-        .order_by(col(SubscriptionTier.name))
-    )
-
-    if not is_admin:
-        # Only active tiers
-        has_active_plan = (
-            select(SubscriptionPlan.id)
-            .where(
-                col(SubscriptionPlan.tier_id) == col(SubscriptionTier.id),
-                col(SubscriptionPlan.is_active).is_(True),
-            )
-            .exists()
-        )
-        query = query.where(
-            col(SubscriptionTier.is_active).is_(True),
-            has_active_plan,
-        )
-
-    try:
-        result = await db.execute(query)
-        return [
-            TierRead.model_validate(item)
-            for item in result.scalars().all()
-        ]
-    except SQLAlchemyError as exc:
-        raise _database_error("reading service tiers", exc) from exc
 
 
 
