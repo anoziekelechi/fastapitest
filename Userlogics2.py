@@ -1,4 +1,130 @@
+# api/core/guards.py
 
+from fastapi import HTTPException, status
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from api.models.users import Firm
+from api.users.schemas import ReadUser
+
+
+# =============================================================================
+# USER STATE
+# =============================================================================
+
+def guard_user_state(current_user: ReadUser) -> None:
+    """Reject disabled or unverified users."""
+    if current_user.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account is suspended. Please contact admin.",
+            headers={"X-Error-Code": "account_suspended"},
+        )
+    if not current_user.verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account is not verified. Please verify your email.",
+            headers={"X-Error-Code": "account_unverified"},
+        )
+
+
+# =============================================================================
+# FIRM STATE — pure predicate on a loaded firm
+# =============================================================================
+
+def guard_firm_state(firm: Firm) -> None:
+    """
+    Reject operations on a disabled firm.
+
+    Pure state check — does not load the firm, does not check ownership.
+    Use when you already have the firm and only need the state check
+    (e.g. after loading it inside a loop, or from a background task).
+    """
+    if firm.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Firm '{firm.name}' is suspended. Please contact admin.",
+            headers={"X-Error-Code": "firm_suspended"},
+        )
+
+
+# =============================================================================
+# FIRM ACCESS — load + ownership + optional state
+# =============================================================================
+
+async def require_firm_access(
+    db: AsyncSession,
+    *,
+    firm_id: int,
+    current_user: ReadUser,
+    require_active: bool = True,
+) -> Firm:
+    """
+    Load a firm and verify the caller can act on it.
+
+    Steps:
+        1. Load the firm (404 if missing).
+        2. Reject if the caller is neither the owner nor an admin.
+        3. When `require_active=True` (default), reject disabled firms.
+
+    Does NOT check user state — callers that need it should call
+    `guard_user_state(current_user)` first.
+
+    Default is `require_active=True` because 99% of call sites are
+    money-touching operations where acting on a disabled firm is wrong.
+    The 1% that need to *read* a disabled firm should pass
+    `require_active=False` explicitly, so the choice is deliberate.
+    """
+    from api.core.logging import logger  # or wherever your logger lives
+
+    try:
+        firm = await db.get(Firm, firm_id)
+    except SQLAlchemyError as exc:
+        logger.exception("Failed to load firm id=%s", firm_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        ) from exc
+
+    if firm is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Firm not found.",
+        )
+
+    if not _is_admin(current_user) and firm.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this firm.",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    if require_active:
+        guard_firm_state(firm)
+
+    return firm
+
+
+def _is_admin(user: ReadUser | None) -> bool:
+    return bool(user and getattr(user, "is_admin", False))
+
+
+# 1. USER STATE — always applied when the operation is user-initiated
+guard_user_state(current_user)
+
+# 2. FIRM ACCESS — when the operation targets a specific firm
+#    (loads, checks ownership, optionally checks disabled state)
+firm = await require_firm_access(
+    db,
+    firm_id=data.firm_id,
+    current_user=current_user,
+    require_active=True,   # default — explicit is fine
+)
+
+# 3. FIRM STATE — only when you ALREADY have the firm and just want
+#    the disabled check (e.g. inside a loop, or in a helper that
+#    receives the firm as a parameter)
+guard_firm_state(firm)
 
 
 
