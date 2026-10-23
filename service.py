@@ -1,6 +1,70 @@
 implement this in any of the 3 logics and lets use only 1 logics
 this 3 logics is not attainable to my goals
 
+# any service selected here calls a function that filter the service name and its tiers and plans to 
+#public assuming in read_service i see receipt clicking it in frontends redirect me to
+# a function that filters tiers and plans for it
+
+# then he will see this
+# starter,1 month 5$,[buy now ],3 months 10$[buy now]
+# pro ,1 month 10$ [buy now ]3 months 15$[buy now ]
+# redirect to select payment optionswith listof available gateways 
+# after selecting payment options it calls this initiate_subscription_purchase
+# after read_service user lands here with slug assuming service/{debt}
+# then he will see this
+# starter,1 month 5$,[buy now ],3 months 10$[buy now]
+# pro ,1 month 10$ [buy now ]3 months 15$[buy now ]
+# redirect to select payment optionswith listof available gateways 
+# after selecting payment options it calls this initiate_subscription_purchase
+async def read_services(
+    db: AsyncSession,
+    *,
+    current_user: ReadUser | None = None,
+    skip: int = 0,
+    limit: int = 50,
+) -> list[ServiceRead]:
+    """
+    List all available active service with tiers and plans 
+    to public view so they can subscribe
+    eg Receipt->stater->1 month 5$, etc
+    This prevent showing service the user cant buy
+    Admin sees all 
+    
+    """
+    query = (
+        select(SubscriptionService)
+        .order_by(col(SubscriptionService.name))
+        .offset(skip)
+        .limit(limit)
+    )
+    if not is_admin(current_user):
+        # Only service that are active And have at least one active
+        # tier with at least one active plan
+        buyable_exist = (
+            select(SubscriptionTier.id)
+            .join(
+                SubscriptionPlan,
+                col(SubscriptionPlan.tier_id) == col(SubscriptionTier.id),  
+            )
+            .where(
+                col(SubscriptionTier.service_id)
+                == col(SubscriptionTier.is_active).is_(True),
+                col(SubscriptionPlan.is_active).is_(True),
+            )
+            .exists()
+        )
+        query = query.where(
+            col(SubscriptionService.is_active).is_(True),
+            buyable_exist,
+        )
+    try:
+        result = await db.execute(query)
+        service = result.scalars().all()
+    except SQLAlchemyError as exc:
+        raise database_error("reading subscription services", exc) from exc
+    return [to_service_read(s) for s in service]
+        
+
 # after read_service user lands here with slug assuming service/{receipt}
 # then he will see this
 # starter,1 month 5$,[buy now ],3 months 10$[buy now]
