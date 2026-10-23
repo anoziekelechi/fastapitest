@@ -1,21 +1,3 @@
-implement this in any of the 3 logics and lets use only 1 logics
-this 3 logics is not attainable to my goals
-
-# any service selected here calls a function that filter the service name and its tiers and plans to 
-#public assuming in read_service i see receipt clicking it in frontends redirect me to
-# a function that filters tiers and plans for it
-
-# then he will see this
-# starter,1 month 5$,[buy now ],3 months 10$[buy now]
-# pro ,1 month 10$ [buy now ]3 months 15$[buy now ]
-# redirect to select payment optionswith listof available gateways 
-# after selecting payment options it calls this initiate_subscription_purchase
-# after read_service user lands here with slug assuming service/{debt}
-# then he will see this
-# starter,1 month 5$,[buy now ],3 months 10$[buy now]
-# pro ,1 month 10$ [buy now ]3 months 15$[buy now ]
-# redirect to select payment optionswith listof available gateways 
-# after selecting payment options it calls this initiate_subscription_purchase
 async def read_services(
     db: AsyncSession,
     *,
@@ -24,163 +6,78 @@ async def read_services(
     limit: int = 50,
 ) -> list[ServiceRead]:
     """
-    List all available active service with tiers and plans 
-    to public view so they can subscribe
-    eg Receipt->stater->1 month 5$, etc
-    This prevent showing service the user cant buy
-    Admin sees all 
-    
+    List subscription services.
+
+    Public users:
+        - See active services only.
+        - A service must have at least one active tier.
+        - That tier must have at least one active plan.
+
+    Administrators:
+        - Can see all services, including inactive services.
+
+    Args:
+        db: Async database session.
+        current_user: Authenticated user or None for public access.
+        skip: Number of records to skip.
+        limit: Maximum number of records to return.
+
+    Returns:
+        A list of ServiceRead objects.
     """
+    admin = is_admin(current_user)
+
     query = (
         select(SubscriptionService)
         .order_by(col(SubscriptionService.name))
         .offset(skip)
         .limit(limit)
     )
-    if not is_admin(current_user):
-        # Only service that are active And have at least one active
-        # tier with at least one active plan
-        buyable_exist = (
+
+    if not admin:
+        # A service is buyable when an active tier contains
+        # at least one active plan.
+        buyable_exists = (
             select(SubscriptionTier.id)
             .join(
                 SubscriptionPlan,
-                col(SubscriptionPlan.tier_id) == col(SubscriptionTier.id),  
+                col(SubscriptionPlan.tier_id)
+                == col(SubscriptionTier.id),
             )
             .where(
                 col(SubscriptionTier.service_id)
-                == col(SubscriptionTier.is_active).is_(True),
+                == col(SubscriptionService.id),
+                col(SubscriptionTier.is_active).is_(True),
                 col(SubscriptionPlan.is_active).is_(True),
             )
+            .correlate(SubscriptionService)
             .exists()
         )
+
         query = query.where(
             col(SubscriptionService.is_active).is_(True),
-            buyable_exist,
+            buyable_exists,
         )
+
     try:
         result = await db.execute(query)
-        service = result.scalars().all()
+        services = result.scalars().all()
+
     except SQLAlchemyError as exc:
-        raise database_error("reading subscription services", exc) from exc
-    return [to_service_read(s) for s in service]
-        
+        raise database_error(
+            "reading subscription services",
+            exc,
+        ) from exc
 
-# after read_service user lands here with slug assuming service/{receipt}
-# then he will see this
-# starter,1 month 5$,[buy now ],3 months 10$[buy now]
-# pro ,1 month 10$ [buy now ]3 months 15$[buy now ]
-# redirect to select payment optionswith listof available gateways 
-# after selecting payment options it calls this initiate_subscription_purchase
-# after read_service user lands here with slug assuming service/{debt}
-# then he will see this
-# starter,1 month 5$,[buy now ],3 months 10$[buy now]
-# pro ,1 month 10$ [buy now ]3 months 15$[buy now ]
-# redirect to select payment optionswith listof available gateways 
-# after selecting payment options it calls this initiate_subscription_purchase
-async def read_tier_by_slug(
-    service_slug: str,
-    tier_slug: str,
-    db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> TierWithPlansRead:
-    """
-    Fetch a tier (and its plans) by service slug + tier slug.
-
-    Public: 404 if the service is inactive/unbuyable, the tier is
-    inactive, or the tier has no active plans.
-
-    Admin: sees everything.
-    """
-    #is_admin = is_admin(current_user)
-
-    # 1. Service must exist
-    service = await get_service_by_slug(db, service_slug)
-
-    if not is_admin(current_user):
-        if not service.is_active:
-            raise HTTPException(
-                404, "Subscription tier not found."
-            )
-        buyable = await service_has_buyable(db, service_id(service))
-        if not buyable:
-            raise HTTPException(
-                404, "Subscription tier not found."
-            )
-
-    # 2. Tier must exist AND belong to this service
-    tier = await get_tier_by_slug(db, tier_slug)
-
-    if tier.service_id != service_id(service):
-        raise HTTPException(
-            404, "Subscription tier not found."
-        )
-
-    if not is_admin and not tier.is_active:
-        raise HTTPException(
-            404, "Subscription tier not found."
-        )
- 
-    # 3. Load plans
-    plans_query = (
-        select(SubscriptionPlan)
-        .where(col(SubscriptionPlan.tier_id) == tier_id(tier))
-        .order_by(col(SubscriptionPlan.duration_days))
-    )
-    if not is_admin:
-        plans_query = plans_query.where(
-            col(SubscriptionPlan.is_active).is_(True)
-        )
-
-    try:
-        result = await db.execute(plans_query)
-        plans = result.scalars().all()
-    except SQLAlchemyError as exc:
-        raise database_error("reading tier plans", exc) from exc
-
-    if not is_admin and not plans:
-        raise HTTPException(
-            404, "Subscription tier not found."
-        )
-
-    return TierWithPlansRead.model_validate(tier).model_copy(
-        update={"plans": [to_plan_read(p) for p in plans]}
-    )
+    return [
+        to_service_read(service)
+        for service in services
+    ]
 
 
 
-#read_service_by_slug and  read_service_with_tiers serve same purpose
-# do we still need this since we have this read_tier_by_slug
-async def read_service_by_slug(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> ServiceRead:
-    
-    """
-    non admin are allowed to access  active service with tiers and plans via slug
-    if non admin try to access service that has no tiers and plans reject the request
-    eg Receipt->stater->1 month 5$, etc
-    Admin access all 
-    
-    """
-    service = await get_service_by_slug(db, slug)
-    if not is_admin(current_user):
-        # ACTIVE SERVICE REQUIRED
-        if not service.is_active:
-            raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"{slug} Subscription service not found.",
-            )
-        # At least one buyable tier/plan pair required
-        buyable = await service_has_buyable(db, service_id(service))
-        if not buyable:
-            raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"{slug} Subscription service not found.",
-            )
-    return to_service_read(service)
-            
-  # do we still need this since  we ave this read_tier_by_slug
+
+
 async def read_service_with_tiers(
     slug: str,
     db: AsyncSession,
@@ -189,39 +86,71 @@ async def read_service_with_tiers(
     """
     Read a subscription service with its tiers and plans.
 
-    Public callers see only active services, tiers, and plans.
-    Admins can see inactive services, tiers, and plans.
-    """
-    service = await get_service_by_slug(db, slug)
-    #is_admin = is_admin(current_user)
+    Public users:
+        - Can access active services only.
+        - Must have at least one active tier with an active plan.
+        - See active tiers only.
+        - See active plans only.
 
-    if not service.is_active and not is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription service not found.",
+    Administrators:
+        - Can access active and inactive services.
+        - Can see active and inactive tiers.
+        - Can see active and inactive plans.
+
+    Args:
+        slug: Subscription service slug.
+        db: Async database session.
+        current_user: Authenticated user or None for public access.
+
+    Returns:
+        ServiceWithTiersRead containing the service, tiers, and plans.
+    """
+    admin = is_admin(current_user)
+
+    # 1. Retrieve the service.
+    service = await get_service_by_slug(db, slug)
+
+    # 2. Restrict public access to active, buyable services.
+    if not admin:
+        if not service.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Subscription service not found.",
+            )
+
+        buyable = await service_has_buyable(
+            db,
+            service_id(service),
         )
 
+        if not buyable:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Subscription service not found.",
+            )
+
+    # 3. Build the tier query.
     tier_query = (
         select(SubscriptionTier)
         .where(
             col(SubscriptionTier.service_id)
             == service_id(service)
         )
+        .options(
+            _load_relationship(SubscriptionTier.plans)
+        )
+        .order_by(
+            col(SubscriptionTier.name)
+        )
     )
 
-    if not is_admin:
+    # Public users can see active tiers only.
+    if not admin:
         tier_query = tier_query.where(
             col(SubscriptionTier.is_active).is_(True)
         )
 
-    tier_query = (
-        tier_query
-        .options(
-            _load_relationship(SubscriptionTier.plans)
-        )
-        .order_by(col(SubscriptionTier.name))
-    )
-
+    # 4. Retrieve the tiers.
     try:
         result = await db.execute(tier_query)
         tiers = result.scalars().all()
@@ -231,11 +160,13 @@ async def read_service_with_tiers(
             "Failed to read tiers for service slug=%s",
             slug,
         )
+
         raise database_error(
             "reading service tiers",
             exc,
         ) from exc
 
+    # 5. Build the response tiers and filter their plans.
     tier_reads: list[TierWithPlansRead] = []
 
     for tier in tiers:
@@ -247,21 +178,26 @@ async def read_service_with_tiers(
         visible_plans = [
             plan
             for plan in plans
-            if is_admin or plan.is_active
+            if admin or plan.is_active
         ]
 
-        tier_reads.append(
-            TierWithPlansRead.model_validate(tier).model_copy(
-                update={
-                    "plans": [
-                        to_plan_read(plan)
-                        for plan in visible_plans
-                    ],
-                }
-            )
+        tier_read = TierWithPlansRead.model_validate(
+            tier
+        ).model_copy(
+            update={
+                "plans": [
+                    to_plan_read(plan)
+                    for plan in visible_plans
+                ]
+            }
         )
 
+        tier_reads.append(tier_read)
+
+    # 6. Build the complete service response.
     return ServiceWithTiersRead(
-        **ServiceRead.model_validate(service).model_dump(),
+        **ServiceRead.model_validate(
+            service
+        ).model_dump(),
         tiers=tier_reads,
-    )
+        )
