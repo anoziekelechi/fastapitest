@@ -1,3 +1,410 @@
+# api/subscriptions/routes.py
+
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    Response,
+    UploadFile,
+    status,
+)
+
+from api.core.database import DBDep
+from api.subscriptions.logics import (
+    create_plan,
+    create_service,
+    create_tier,
+    delete_plan,
+    delete_service,
+    delete_tier,
+    read_plan_by_id,
+    read_plans_for_tier,
+    read_service_by_slug,
+    read_service_with_tiers,
+    read_services,
+    read_tier_by_id,
+    read_tiers_for_service,
+    update_plan,
+    update_service,
+    update_tier,
+)
+from api.subscriptions.schemas import (
+    CreatePlanResponse,
+    CreateServiceResponse,
+    CreateTierResponse,
+    PlanCreate,
+    PlanRead,
+    PlanUpdate,
+    ServiceCreate,
+    ServiceRead,
+    ServiceUpdate,
+    ServiceWithTiersRead,
+    TierCreate,
+    TierRead,
+    TierUpdate,
+    UpdatePlanResponse,
+    UpdateServiceResponse,
+    UpdateTierResponse,
+)
+from api.users.deps import AdminUser, OptionalCurrentUser
+
+
+router = APIRouter(prefix="/subscriptions", tags=["Subscriptions"])
+
+
+# =============================================================================
+# ORDERING RULE
+#
+# Literal paths must come BEFORE paths with a dynamic segment at the
+# same depth. E.g.:
+#
+#   /services                   ← literal
+#   /services/{slug}            ← dynamic
+#   /services/{slug}/pricing    ← dynamic + literal suffix (safe after)
+#   /services/{slug}/tiers      ← dynamic + literal suffix (safe after)
+#
+# FastAPI matches top-to-bottom, so /services/{slug} would swallow
+# /services/anything if declared first. This file follows that order.
+# =============================================================================
+
+
+# =============================================================================
+# SERVICE — public reads
+# =============================================================================
+
+@router.get(
+    "/services",
+    response_model=list[ServiceRead],
+    status_code=status.HTTP_200_OK,
+    summary="List services (public: buyable only; admin: all)",
+)
+async def list_services(
+    db: DBDep,
+    current_user: OptionalCurrentUser,
+    skip: int = 0,
+    limit: int = 50,
+):
+    """
+    Public callers see only services with at least one active tier
+    and one active plan. Admins see every service.
+    """
+    return await read_services(
+        db=db,
+        current_user=current_user,
+        skip=skip,
+        limit=limit,
+    )
+
+
+# =============================================================================
+# SERVICE — public detail (before /{slug} to keep route ordering explicit)
+#
+# This block uses literal suffixes on the {slug} segment, which are
+# safe to declare before the bare /{slug} route.
+# =============================================================================
+
+@router.get(
+    "/services/{slug}/pricing",
+    response_model=ServiceWithTiersRead,
+    status_code=status.HTTP_200_OK,
+    summary="Service with tiers and plans (public: active only)",
+)
+async def service_pricing(
+    slug: str,
+    db: DBDep,
+    current_user: OptionalCurrentUser,
+):
+    return await read_service_with_tiers(
+        slug=slug, db=db, current_user=current_user
+    )
+
+
+@router.get(
+    "/services/{slug}/tiers",
+    response_model=list[TierRead],
+    status_code=status.HTTP_200_OK,
+    summary="Tiers for a service (public: active only)",
+)
+async def list_tiers_for_service(
+    slug: str,
+    db: DBDep,
+    current_user: OptionalCurrentUser,
+):
+    return await read_tiers_for_service(
+        slug=slug, db=db, current_user=current_user
+    )
+
+
+@router.get(
+    "/services/{slug}",
+    response_model=ServiceRead,
+    status_code=status.HTTP_200_OK,
+    summary="Service detail (public: active + buyable only)",
+)
+async def get_service(
+    slug: str,
+    db: DBDep,
+    current_user: OptionalCurrentUser,
+):
+    return await read_service_by_slug(
+        slug=slug, db=db, current_user=current_user
+    )
+
+
+# =============================================================================
+# SERVICE — admin writes (multipart)
+# =============================================================================
+
+@router.post(
+    "/services",
+    response_model=CreateServiceResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a subscription service (admin only)",
+)
+async def create_service_route(
+    db: DBDep,
+    admin: AdminUser,
+    name: str = Form(...),
+    description: str = Form(...),
+    trial_days: int = Form(30),
+    service_image: UploadFile | None = File(None),
+):
+    """
+    Multipart endpoint.
+
+    FastAPI cannot read a Pydantic body and a file from the same
+    request. So each field is declared individually and re-assembled
+    into `ServiceCreate` before hitting the logic — that way the
+    schema validators still run.
+    """
+    data = ServiceCreate(
+        name=name,
+        description=description,
+        trial_days=trial_days,
+    )
+
+    return await create_service(
+        data=data,
+        service_image=service_image,
+        db=db,
+        current_user=admin,
+    )
+
+
+@router.patch(
+    "/services/{slug}",
+    response_model=UpdateServiceResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update a subscription service (admin only)",
+)
+async def patch_service(
+    slug: str,
+    db: DBDep,
+    admin: AdminUser,
+    description: str | None = Form(None),
+    trial_days: int | None = Form(None),
+    is_active: bool | None = Form(None),
+    service_image: UploadFile | None = File(None),
+):
+    data = ServiceUpdate(
+        description=description,
+        trial_days=trial_days,
+        is_active=is_active,
+    )
+
+    return await update_service(
+        slug=slug,
+        data=data,
+        db=db,
+        service_image=service_image,
+    )
+
+
+@router.delete(
+    "/services/{slug}",
+    response_model=Response,
+    status_code=status.HTTP_200_OK,
+    summary="Delete a subscription service (admin only)",
+)
+async def remove_service(
+    slug: str,
+    db: DBDep,
+    admin: AdminUser,
+):
+    # The service returns a dict; wrap it so response_model=Response
+    # works or drop the response_model and let FastAPI infer from dict.
+    # Simplest: use response_model=dict / no model.
+    return await delete_service(
+        slug=slug, db=db, current_user=admin
+    )
+
+
+# =============================================================================
+# TIER — public reads
+# =============================================================================
+
+@router.get(
+    "/tiers/{tier_id}/plans",
+    response_model=list[PlanRead],
+    status_code=status.HTTP_200_OK,
+    summary="Plans for a tier (public: active only)",
+)
+async def list_plans_for_tier(
+    tier_id: int,
+    db: DBDep,
+    current_user: OptionalCurrentUser,
+):
+    return await read_plans_for_tier(
+        tier_id=tier_id, db=db, current_user=current_user
+    )
+
+
+@router.get(
+    "/tiers/{tier_id}",
+    response_model=TierRead,
+    status_code=status.HTTP_200_OK,
+    summary="Tier detail (public: active + reachable only)",
+)
+async def get_tier(
+    tier_id: int,
+    db: DBDep,
+    current_user: OptionalCurrentUser,
+):
+    return await read_tier_by_id(
+        tier_id=tier_id, db=db, current_user=current_user
+    )
+
+
+# =============================================================================
+# TIER — admin writes
+# =============================================================================
+
+@router.post(
+    "/tiers",
+    response_model=CreateTierResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a subscription tier (admin only)",
+)
+async def create_tier_route(
+    data: TierCreate,
+    db: DBDep,
+    admin: AdminUser,
+):
+    # No file here, so a JSON body is fine
+    return await create_tier(
+        data=data, db=db, current_user=admin
+    )
+
+
+@router.patch(
+    "/tiers/{tier_id}",
+    response_model=UpdateTierResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update a subscription tier (admin only)",
+)
+async def patch_tier(
+    tier_id: int,
+    data: TierUpdate,
+    db: DBDep,
+    admin: AdminUser,
+):
+    return await update_tier(
+        tier_id=tier_id, data=data, db=db, current_user=admin
+    )
+
+
+@router.delete(
+    "/tiers/{tier_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Delete a subscription tier (admin only)",
+)
+async def remove_tier(
+    tier_id: int,
+    db: DBDep,
+    admin: AdminUser,
+):
+    return await delete_tier(
+        tier_id=tier_id, db=db, current_user=admin
+    )
+
+
+# =============================================================================
+# PLAN — public reads
+# =============================================================================
+
+@router.get(
+    "/plans/{plan_id}",
+    response_model=PlanRead,
+    status_code=status.HTTP_200_OK,
+    summary="Plan detail (public: active + reachable only)",
+)
+async def get_plan(
+    plan_id: int,
+    db: DBDep,
+    current_user: OptionalCurrentUser,
+):
+    return await read_plan_by_id(
+        plan_id=plan_id, db=db, current_user=current_user
+    )
+
+
+# =============================================================================
+# PLAN — admin writes
+# =============================================================================
+
+@router.post(
+    "/plans",
+    response_model=CreatePlanResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a subscription plan (admin only)",
+)
+async def create_plan_route(
+    data: PlanCreate,
+    db: DBDep,
+    admin: AdminUser,
+):
+    return await create_plan(
+        data=data, db=db, current_user=admin
+    )
+
+
+@router.patch(
+    "/plans/{plan_id}",
+    response_model=UpdatePlanResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update a subscription plan (admin only)",
+)
+async def patch_plan(
+    plan_id: int,
+    data: PlanUpdate,
+    db: DBDep,
+    admin: AdminUser,
+):
+    return await update_plan(
+        plan_id=plan_id, data=data, db=db, current_user=admin
+    )
+
+
+@router.delete(
+    "/plans/{plan_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Delete a subscription plan (admin only)",
+)
+async def remove_plan(
+    plan_id: int,
+    db: DBDep,
+    admin: AdminUser,
+):
+    return await delete_plan(
+        plan_id=plan_id, db=db, current_user=admin
+    )
+
+
+
+
+
+
+
 
 # =============================================================================
 # CHECKOUT (Step 2)
