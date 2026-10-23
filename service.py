@@ -840,39 +840,6 @@ async def delete_service(
 
     count = await _count_subscriptions(db, service_id=_service_id(service))
     if count:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "This service cannot be deleted because subscriptions "
-                "reference it."
-            ),
-        )
-
-    name = service.name
-    image_key = service.service_logo_key
-
-    try:
-        await db.delete(service)
-        await _commit_or_rollback(db, operation="deleting a service")
-    except HTTPException:
-        raise
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise _database_error("deleting a service", exc) from exc
-
-    if image_key:
-        try:
-            delete_from_r2(image_key)
-        except Exception:
-            logger.exception(
-                "Failed to delete service image key=%s", image_key
-            )
-
-    logger.info(
-        "Service '%s' deleted by user_id=%s", name, current_user.id
-    )
-
-    return {"message": f"'{name}' subscription service deleted successfully."}
 
 
 # =============================================================================
