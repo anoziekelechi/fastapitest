@@ -1,3 +1,184 @@
+from datetime import datetime
+from decimal import Decimal
+from typing import Optional
+
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
+from sqlmodel import Field, Relationship
+
+
+class SubscriptionPayment(BaseModel, table=True):
+    """
+    One payment attempt for activating or extending a subscription.
+
+    Typical lifecycle:
+        pending -> paid
+        pending -> failed
+        pending -> cancelled
+
+    A payment can remain pending while awaiting gateway confirmation
+    or reconciliation after an uncertain gateway response.
+    """
+
+    __tablename__ = "subscription_payments"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "firm_id",
+            "idempotency_key",
+            name="uq_subscription_payment_firm_idempotency",
+        ),
+        CheckConstraint(
+            "amount > 0",
+            name="ck_subscription_payment_amount_positive",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'paid', 'failed', 'cancelled')",
+            name="ck_subscription_payment_status",
+        ),
+    )
+
+    # -------------------------------------------------------------------------
+    # Relationships to existing records
+    # -------------------------------------------------------------------------
+
+    firm_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("firms.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    plan_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey(
+                "subscription_plans.id",
+                ondelete="RESTRICT",
+            ),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    payment_method_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey(
+                "paymentmethods.id",
+                ondelete="RESTRICT",
+            ),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Idempotency
+    # -------------------------------------------------------------------------
+
+    idempotency_key: str = Field(
+        sa_column=Column(
+            String(100),
+            nullable=False,
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Payment details
+    # -------------------------------------------------------------------------
+
+    # Snapshot of the amount when the purchase was initiated.
+    amount: Decimal = Field(
+        sa_column=Column(
+            Numeric(precision=10, scale=2),
+            nullable=False,
+        )
+    )
+
+    currency: str = Field(
+        default="LRD",
+        sa_column=Column(
+            String(3),
+            nullable=False,
+            server_default="LRD",
+        ),
+    )
+
+    # Your application's reference, generated before contacting the gateway.
+    payment_reference: str = Field(
+        sa_column=Column(
+            String(100),
+            nullable=False,
+            unique=True,
+            index=True,
+        )
+    )
+
+    # Actual transaction reference returned by the payment provider,
+    # if the provider supplies one.
+    provider_reference: str | None = Field(
+        default=None,
+        sa_column=Column(
+            String(150),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    # Snapshot of the internal provider identifier used for this attempt.
+    provider_code: str = Field(
+        sa_column=Column(
+            String(30),
+            nullable=False,
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Status
+    # -------------------------------------------------------------------------
+
+    status: str = Field(
+        default="pending",
+        sa_column=Column(
+            String(20),
+            nullable=False,
+            server_default="pending",
+        ),
+    )
+
+    # -------------------------------------------------------------------------
+    # Timestamps
+    # -------------------------------------------------------------------------
+
+    paid_at: datetime | None = Field(
+        default=None,
+        sa_type=DateTime(timezone=True),
+        sa_column_kwargs={"nullable": True},
+    )
+
+    # -------------------------------------------------------------------------
+    # Relationships
+    # -------------------------------------------------------------------------
+
+    firm: Optional["Firm"] = Relationship()
+    plan: Optional["SubscriptionPlan"] = Relationship()
+    payment_method: Optional["PaymentMethods"] = Relationship()
+
+
+
+
+
 # api/payments/gateways.py
 """
 Payment gateway adapters.
