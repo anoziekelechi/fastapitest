@@ -94,7 +94,498 @@ async def verify_payment(provider: str, reference: str) -> dict:
         return await verify_momo_liberia(reference)
     raise ValueError(f"Unsupported provider: {provider}")
 
-  
+
+
+# api/subscriptions/logics.py (additions)
+
+from decimal import Decimal
+
+from api.core.guards import guard_firm_state, guard_user_state
+from api.payments.gateways import initiate_payment, verify_payment
+from api.models.subscriptions import SubscriptionPayment
+
+
+# =============================================================================
+# CHECKOUT — Step 2
+# =============================================================================
+
+async def get_checkout_details(
+    plan_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Load everything needed to render the checkout page.
+
+    Validates:
+        - user is enabled + verified
+        - user owns at least one active firm
+        - plan and its full tier → service chain exist and are active
+    """
+
+    # ------------------------------------------------------------------
+    # 1. User state
+    # ------------------------------------------------------------------
+    guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 2. Pick the user's active firm
+    #
+    # If they own multiple, prefer the first non-disabled one. If they
+    # own none (or all disabled), they need to create a firm first.
+    # ------------------------------------------------------------------
+    from api.models.users import Firm
+
+    try:
+        firms_result = await db.execute(
+            select(Firm)
+            .where(col(Firm.user_id) == current_user.id)
+            .order_by(col(Firm.created_at))
+        )
+        firms = firms_result.scalars().all()
+    except Exception:
+        logger.exception(
+            "Failed to load firms for user_id=%s", current_user.id
+        )
+        raise HTTPException(500, "Failed to load firm. Please try again.")
+
+    active_firm = next((f for f in firms if not f.disabled), None)
+
+    if active_firm is None:
+        if not firms:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="You need to create a firm before subscribing.",
+                headers={"X-Error-Code": "no_firm"},
+            )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="All your firms are disabled. Please contact admin.",
+            headers={"X-Error-Code": "firm_suspended"},
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Load plan + tier + service
+    # ------------------------------------------------------------------
+    plan = await get_plan_by_id(db, plan_id)
+    if not plan or not plan.is_active:
+        raise HTTPException(404, f"Plan id={plan_id} not found or inactive")
+
+    tier = await get_tier_by_id(db, plan.tier_id)
+    if not tier or not tier.is_active:
+        raise HTTPException(
+            404, f"Tier id={plan.tier_id} not found or inactive"
+        )
+
+    service = await db.get(SubscriptionService, tier.service_id)
+    if not service or not service.is_active:
+        raise HTTPException(
+            404, f"Service id={tier.service_id} not found or inactive"
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Payment methods available
+    # ------------------------------------------------------------------
+    from api.models.home import PaymentMethods
+
+    try:
+        pm_result = await db.execute(
+            select(PaymentMethods).order_by(col(PaymentMethods.name))
+        )
+        payment_methods = pm_result.scalars().all()
+    except Exception:
+        logger.exception("Failed to load payment methods")
+        raise HTTPException(
+            500, "Failed to load payment methods. Please try again."
+        )
+
+    from api.payments.logics import to_payment_method_read
+    from api.firms.schemas import FirmRead
+    from api.subscriptions.schemas import (
+        CheckoutResponse,
+        PlanRead,
+        ServiceRead,
+        TierRead,
+    )
+
+    return CheckoutResponse(
+        plan=to_plan_read(plan),
+        tier=TierRead.model_validate(tier),
+        service=ServiceRead.model_validate(service),
+        firm=FirmRead.model_validate(active_firm),
+        payment_methods=[
+            to_payment_method_read(pm) for pm in payment_methods
+        ],
+        amount=plan.price,
+        currency=settings.currency_code,
+    )
+
+
+# =============================================================================
+# PURCHASE — Step 4
+# =============================================================================
+
+async def initiate_subscription_purchase(
+    data: SubscriptionPurchase,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Start a payment. Does NOT activate the subscription yet.
+
+    Validates:
+        - user is enabled + verified
+        - user has an active firm
+        - plan → tier → service chain is valid
+        - payment method exists
+        - no pending payment for the same firm+plan already in flight
+
+    Creates a SubscriptionPayment record with status="pending",
+    calls the gateway, and returns the reference.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. User state
+    # ------------------------------------------------------------------
+    guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 2. Active firm
+    # ------------------------------------------------------------------
+    from api.models.users import Firm
+
+    try:
+        firms_result = await db.execute(
+            select(Firm)
+            .where(col(Firm.user_id) == current_user.id)
+            .order_by(col(Firm.created_at))
+        )
+        firms = firms_result.scalars().all()
+    except Exception:
+        logger.exception(
+            "Failed to load firms for user_id=%s", current_user.id
+        )
+        raise HTTPException(500, "Failed to load firm. Please try again.")
+
+    active_firm = next((f for f in firms if not f.disabled), None)
+
+    if active_firm is None:
+        if not firms:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="You need to create a firm before subscribing.",
+                headers={"X-Error-Code": "no_firm"},
+            )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="All your firms are disabled. Please contact admin.",
+            headers={"X-Error-Code": "firm_suspended"},
+        )
+
+    # Firm is guaranteed enabled (we filtered). Guard anyway:
+    guard_firm_state(active_firm)
+
+    # ------------------------------------------------------------------
+    # 3. Plan → tier → service chain
+    # ------------------------------------------------------------------
+    plan = await get_plan_by_id(db, data.plan_id)
+    if not plan or not plan.is_active:
+        raise HTTPException(404, f"Plan id={data.plan_id} not found or inactive")
+
+    tier = await get_tier_by_id(db, plan.tier_id)
+    if not tier or not tier.is_active:
+        raise HTTPException(
+            404, f"Tier id={plan.tier_id} not found or inactive"
+        )
+
+    service = await db.get(SubscriptionService, tier.service_id)
+    if not service or not service.is_active:
+        raise HTTPException(
+            404, f"Service id={tier.service_id} not found or inactive"
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Payment method
+    # ------------------------------------------------------------------
+    from api.models.home import PaymentMethods
+
+    payment_method = await db.get(PaymentMethods, data.payment_method_id)
+    if not payment_method:
+        raise HTTPException(
+            404, f"Payment method id={data.payment_method_id} not found"
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Reject duplicate pending payments
+    #
+    # If a user double-clicks Buy Now, don't create two pending payments.
+    # ------------------------------------------------------------------
+    try:
+        existing_pending = (
+            await db.execute(
+                select(SubscriptionPayment).where(
+                    col(SubscriptionPayment.firm_id) == active_firm.id,
+                    col(SubscriptionPayment.plan_id) == data.plan_id,
+                    col(SubscriptionPayment.status) == "pending",
+                )
+            )
+        ).scalars().first()
+    except Exception:
+        logger.exception(
+            "Failed to check pending payments firm_id=%s", active_firm.id
+        )
+        raise HTTPException(
+            500, "Failed to start purchase. Please try again."
+        )
+
+    if existing_pending:
+        raise HTTPException(
+            409,
+            "A payment for this plan is already pending. "
+            "Please complete or wait for it to expire.",
+            headers={"X-Error-Code": "payment_pending"},
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Create the pending payment record
+    # ------------------------------------------------------------------
+    reference = f"sub_{secrets.token_urlsafe(16)}"
+
+    payment = SubscriptionPayment(
+        firm_id=active_firm.id,
+        plan_id=data.plan_id,
+        payment_method_id=data.payment_method_id,
+        amount=plan.price,
+        currency=settings.currency_code,
+        payment_reference=reference,
+        status="pending",
+    )
+
+    try:
+        db.add(payment)
+        await db.commit()
+        await db.refresh(payment)
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "Failed to create payment record firm_id=%s plan_id=%s",
+            active_firm.id,
+            data.plan_id,
+        )
+        raise HTTPException(
+            500, "Failed to start purchase. Please try again."
+        )
+
+    # ------------------------------------------------------------------
+    # 7. Call the gateway
+    # ------------------------------------------------------------------
+    provider = payment_method.name.lower().replace(" ", "_")
+
+    try:
+        gateway_response = await initiate_payment(
+            provider=provider,
+            amount=str(plan.price),
+            currency=settings.currency_code,
+            reference=reference,
+            customer_phone=current_user.phone if hasattr(current_user, "phone") else None,
+        )
+    except Exception:
+        logger.exception(
+            "Gateway initiation failed for payment ref=%s", reference
+        )
+
+        # Mark the payment as failed so it doesn't block new attempts
+        payment.status = "failed"
+        db.add(payment)
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+
+        raise HTTPException(
+            500,
+            "Payment gateway is unavailable. Please try again.",
+        )
+
+    logger.info(
+        "Purchase initiated: firm_id=%s plan_id=%s ref=%s provider=%s",
+        active_firm.id,
+        data.plan_id,
+        reference,
+        provider,
+    )
+
+    return {
+        "message": "Payment initiated. Complete the payment to activate.",
+        "payment_reference": reference,
+        "amount": plan.price,
+        "currency": settings.currency_code,
+        "status": gateway_response.get("status", "pending"),
+        "provider_url": gateway_response.get("provider_url"),
+    }
+
+
+# =============================================================================
+# CONFIRM — Step 5
+# =============================================================================
+
+async def confirm_subscription_payment(
+    data: SubscriptionPaymentConfirm,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Confirm a payment and activate the subscription.
+
+    In production, this is called by the gateway webhook — but the
+    webhook validates the signature. Here we allow the user to
+    trigger it (for the stub), and the backend re-verifies with the
+    gateway before activating.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Load the payment record
+    # ------------------------------------------------------------------
+    try:
+        result = await db.execute(
+            select(SubscriptionPayment).where(
+                col(SubscriptionPayment.payment_reference)
+                == data.payment_reference
+            )
+        )
+        payment = result.scalars().first()
+    except Exception:
+        logger.exception(
+            "Failed to load payment ref=%s", data.payment_reference
+        )
+        raise HTTPException(500, "Failed to confirm payment.")
+
+    if not payment:
+        raise HTTPException(
+            404, f"Payment '{data.payment_reference}' not found"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Ownership — the firm belongs to the caller (or caller is admin)
+    # ------------------------------------------------------------------
+    from api.models.users import Firm
+
+    firm = await db.get(Firm, payment.firm_id)
+    if not firm:
+        raise HTTPException(500, "Firm not found for this payment")
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            403,
+            "You can only confirm payments for your own firms",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    guard_user_state(current_user)
+    guard_firm_state(firm)
+
+    # ------------------------------------------------------------------
+    # 3. Idempotency — already paid?
+    # ------------------------------------------------------------------
+    if payment.status == "paid":
+        raise HTTPException(
+            409,
+            "This payment has already been confirmed.",
+        )
+
+    if payment.status != "pending":
+        raise HTTPException(
+            400,
+            f"This payment cannot be confirmed (status: {payment.status}).",
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Verify with the gateway
+    # ------------------------------------------------------------------
+    from api.models.home import PaymentMethods
+
+    pm = await db.get(PaymentMethods, payment.payment_method_id)
+    if not pm:
+        raise HTTPException(500, "Payment method not found")
+
+    provider = pm.name.lower().replace(" ", "_")
+
+    try:
+        verification = await verify_payment(
+            provider=provider,
+            reference=payment.payment_reference,
+        )
+    except Exception:
+        logger.exception(
+            "Gateway verification failed ref=%s",
+            payment.payment_reference,
+        )
+        raise HTTPException(
+            500,
+            "Payment gateway is unavailable. Please try again.",
+        )
+
+    if verification.get("status") != "paid":
+        # Gateway says it's not paid yet
+        raise HTTPException(
+            402,
+            "Payment has not been confirmed by the gateway.",
+            headers={"X-Error-Code": "payment_pending"},
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Mark the payment paid
+    # ------------------------------------------------------------------
+    now = datetime.now(timezone.utc)
+    payment.status = "paid"
+    payment.paid_at = now
+    db.add(payment)
+
+    # ------------------------------------------------------------------
+    # 6. Activate / extend the subscription
+    # ------------------------------------------------------------------
+    from api.subscriptions.logics import activate_subscription
+
+    activate_data = SubscriptionActivate(
+        firm_id=payment.firm_id,
+        service_id=tier_service_id(tier=await get_tier_by_id(db, (await get_plan_by_id(db, payment.plan_id)).tier_id)),
+        tier_id=(await get_plan_by_id(db, payment.plan_id)).tier_id,
+        plan_id=payment.plan_id,
+    )
+
+    # Simpler version below — activate_subscription takes typed data
+    plan = await get_plan_by_id(db, payment.plan_id)
+    if not plan:
+        raise HTTPException(500, "Plan not found for this payment")
+
+    activate_data = SubscriptionActivate(
+        firm_id=payment.firm_id,
+        service_id=(await get_tier_by_id(db, plan.tier_id)).service_id,
+        tier_id=plan.tier_id,
+        plan_id=payment.plan_id,
+    )
+
+    activation_result = await activate_subscription(
+        data=activate_data,
+        db=db,
+        current_user=current_user,
+    )
+
+    logger.info(
+        "Payment confirmed ref=%s firm_id=%s plan_id=%s",
+        payment.payment_reference,
+        payment.firm_id,
+        payment.plan_id,
+    )
+
+    return {
+        "message": "Payment confirmed. Subscription is now active.",
+        "payment": SubscriptionPaymentRead.model_validate(payment),
+        "subscription": activation_result["subscription"],
+    }
+
+
+# new
 class SubscriptionPayment(BaseModel, table=True):
     """
     One payment attempt for activating or extending a subscription.
@@ -170,7 +661,7 @@ class SubscriptionPayment(BaseModel, table=True):
 
   
 
-
+# new updates 
 # =============================================================================
 # ADMIN — ACTIVATE (override, no payment)
 # =============================================================================
