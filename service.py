@@ -1,4 +1,98 @@
+# api/payments/gateways.py
+"""
+Payment gateway adapters.
 
+Each gateway exposes:
+    initiate_payment(amount, currency, reference, phone) → dict
+    verify_payment(reference) → dict
+
+Today only Momo Liberia is implemented as a stub.
+"""
+
+import logging
+import secrets
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# MOMO LIBERIA (STUB)
+# =============================================================================
+
+async def initiate_momo_liberia(
+    amount: str,
+    currency: str,
+    reference: str,
+    customer_phone: str | None = None,
+) -> dict:
+    """
+    Initiate a Momo Liberia payment.
+
+    STUB — always returns a "pending" status. In production this
+    would POST to Momo Liberia's API and return the provider's
+    response (typically a redirect URL or USSD push code).
+    """
+    logger.info(
+        "Momo Liberia stub: initiating payment ref=%s amount=%s %s",
+        reference,
+        amount,
+        currency,
+    )
+
+    # In real integration:
+    #   - POST to Momo Liberia API
+    #   - pass { amount, currency, reference, phone }
+    #   - receive { status, provider_reference, redirect_url }
+
+    return {
+        "status": "pending",
+        "provider_reference": reference,
+        "provider_url": None,   # would be Momo's hosted payment page
+        "raw": {"stub": True},
+    }
+
+
+async def verify_momo_liberia(reference: str) -> dict:
+    """
+    Verify a Momo Liberia payment.
+
+    STUB — always returns "paid". In production this would query
+    Momo Liberia's API for the payment status.
+    """
+    logger.info("Momo Liberia stub: verifying payment ref=%s", reference)
+
+    return {
+        "status": "paid",
+        "provider_reference": reference,
+        "raw": {"stub": True},
+    }
+
+
+# =============================================================================
+# DISPATCH
+# =============================================================================
+
+async def initiate_payment(
+    provider: str,
+    amount: str,
+    currency: str,
+    reference: str,
+    customer_phone: str | None = None,
+) -> dict:
+    if provider.lower() == "momo_liberia":
+        return await initiate_momo_liberia(
+            amount=amount,
+            currency=currency,
+            reference=reference,
+            customer_phone=customer_phone,
+        )
+    raise ValueError(f"Unsupported provider: {provider}")
+
+
+async def verify_payment(provider: str, reference: str) -> dict:
+    if provider.lower() == "momo_liberia":
+        return await verify_momo_liberia(reference)
+    raise ValueError(f"Unsupported provider: {provider}")
 
   
 class SubscriptionPayment(BaseModel, table=True):
