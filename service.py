@@ -1,27 +1,154 @@
+
 # =============================================================================
-# TIER — READ BY SLUG
+# TIER — DELETE
 # =============================================================================
 
-async def read_tier_by_slug(
-    slug: str,
+async def delete_tier(
+    tier_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    tier = await get_tier_by_id(db, tier_id)
+
+    count = await _count_subscriptions(db, tier_id=tier.id)
+
+    if count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This tier cannot be deleted because subscriptions "
+                "reference it."
+            ),
+        )
+
+    try:
+        await db.delete(tier)
+        await _commit_or_rollback(db, operation="deleting a tier")
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise _database_error("deleting a tier", exc) from exc
+
+    return {"message": "Subscription tier deleted successfully."}
+
+
+# =============================================================================
+# PLAN — DELETE
+# =============================================================================
+
+async def delete_plan(
+    plan_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    plan = await get_plan_by_id(db, plan_id)
+
+    count = await _count_subscriptions(db, plan_id=plan.id)
+
+    if count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This plan cannot be deleted because subscriptions "
+                "reference it."
+            ),
+        )
+
+    try:
+        await db.delete(plan)
+        await _commit_or_rollback(db, operation="deleting a plan")
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise _database_error("deleting a plan", exc) from exc
+
+    return {"message": "Subscription plan deleted successfully."}
+
+
+# =============================================================================
+# PLAN — READ FOR TIER
+# =============================================================================
+
+async def read_plans_for_tier(
+    tier_id: int,
     db: AsyncSession,
     current_user: ReadUser | None = None,
-) -> TierRead:
+) -> list[PlanRead]:
+    tier = await get_tier_by_id(db, tier_id)
+    is_admin = _is_admin(current_user)
+
+    if not is_admin:
+        if not tier.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Subscription tier not found.",
+            )
+
+        try:
+            service = await db.get(
+                SubscriptionService,
+                tier.service_id,
+            )
+        except SQLAlchemyError as exc:
+            raise _database_error("loading a service", exc) from exc
+
+        if service is None or not service.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Subscription tier not found.",
+            )
+
+    query = (
+        select(SubscriptionPlan)
+        .where(
+            col(SubscriptionPlan.tier_id) == tier.id
+        )
+        .order_by(col(SubscriptionPlan.duration_days))
+    )
+
+    if not is_admin:
+        query = query.where(
+            col(SubscriptionPlan.is_active).is_(True)
+        )
+
+    try:
+        result = await db.execute(query)
+        return [to_plan_read(plan) for plan in result.scalars().all()]
+    except SQLAlchemyError as exc:
+        raise _database_error("reading tier plans", exc) from exc
+
+
+
+
+
+# =============================================================================
+# PLAN — READ FOR TIER BY SLUG
+# =============================================================================
+
+async def read_plans_for_tier(
+    tier_slug: str,
+    db: AsyncSession,
+    current_user: ReadUser | None = None,
+) -> list[PlanRead]:
     """
-    Read a subscription tier by slug.
+    List subscription plans for a tier identified by its slug.
 
     Public:
-        - Only active tiers belonging to active services are visible.
+        - The tier must be active.
+        - The parent service must be active.
+        - Only active plans are returned.
 
     Admin:
-        - Can read active or inactive tiers, including tiers whose
-          parent service is inactive.
+        - Can read plans belonging to active or inactive tiers and services.
+        - Can see active and inactive plans.
     """
     is_admin = _is_admin(current_user)
 
     try:
         query = select(SubscriptionTier).where(
-            col(SubscriptionTier.slug) == slug
+            col(SubscriptionTier.slug) == tier_slug
         )
 
         if not is_admin:
@@ -33,7 +160,10 @@ async def read_tier_by_slug(
         tier = result.scalars().first()
 
     except SQLAlchemyError as exc:
-        raise _database_error("reading a subscription tier by slug", exc) from exc
+        raise _database_error(
+            "loading a tier for plan reading",
+            exc,
+        ) from exc
 
     if tier is None:
         raise HTTPException(
@@ -49,7 +179,7 @@ async def read_tier_by_slug(
             )
         except SQLAlchemyError as exc:
             raise _database_error(
-                "loading a service for a subscription tier",
+                "loading a service for plan reading",
                 exc,
             ) from exc
 
@@ -59,10 +189,35 @@ async def read_tier_by_slug(
                 detail="Subscription tier not found.",
             )
 
-    return TierRead.model_validate(tier)
+    plan_query = (
+        select(SubscriptionPlan)
+        .where(
+            col(SubscriptionPlan.tier_id) == tier.id
+        )
+        .order_by(
+            col(SubscriptionPlan.duration_days)
+        )
+    )
 
+    if not is_admin:
+        plan_query = plan_query.where(
+            col(SubscriptionPlan.is_active).is_(True)
+        )
 
+    try:
+        result = await db.execute(plan_query)
+        plans = result.scalars().all()
 
+        return [
+            to_plan_read(plan)
+            for plan in plans
+        ]
+
+    except SQLAlchemyError as exc:
+        raise _database_error(
+            "reading plans for a subscription tier",
+            exc,
+        ) from exc
 
 # api/subscriptions/logics.py
 """Subscription business logic."""
