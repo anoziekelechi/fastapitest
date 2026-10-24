@@ -1,3 +1,69 @@
+# =============================================================================
+# TIER — READ BY SLUG
+# =============================================================================
+
+async def read_tier_by_slug(
+    slug: str,
+    db: AsyncSession,
+    current_user: ReadUser | None = None,
+) -> TierRead:
+    """
+    Read a subscription tier by slug.
+
+    Public:
+        - Only active tiers belonging to active services are visible.
+
+    Admin:
+        - Can read active or inactive tiers, including tiers whose
+          parent service is inactive.
+    """
+    is_admin = _is_admin(current_user)
+
+    try:
+        query = select(SubscriptionTier).where(
+            col(SubscriptionTier.slug) == slug
+        )
+
+        if not is_admin:
+            query = query.where(
+                col(SubscriptionTier.is_active).is_(True)
+            )
+
+        result = await db.execute(query)
+        tier = result.scalars().first()
+
+    except SQLAlchemyError as exc:
+        raise _database_error("reading a subscription tier by slug", exc) from exc
+
+    if tier is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription tier not found.",
+        )
+
+    if not is_admin:
+        try:
+            service = await db.get(
+                SubscriptionService,
+                tier.service_id,
+            )
+        except SQLAlchemyError as exc:
+            raise _database_error(
+                "loading a service for a subscription tier",
+                exc,
+            ) from exc
+
+        if service is None or not service.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Subscription tier not found.",
+            )
+
+    return TierRead.model_validate(tier)
+
+
+
+
 # api/subscriptions/logics.py
 """Subscription business logic."""
 
