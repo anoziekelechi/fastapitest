@@ -1,3 +1,20 @@
+@router.get(
+    "/tiers/{tier_slug}/plans",
+    response_model=list[PlanRead],
+)
+async def get_plans_for_tier(
+    tier_slug: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: ReadUser | None = Depends(get_optional_current_user),
+):
+    return await read_plans_for_tier(
+        tier_slug=tier_slug,
+        db=db,
+        current_user=current_user,
+    )
+
+
+
 
 # =============================================================================
 # TIER — DELETE
