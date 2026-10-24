@@ -1,8 +1,5 @@
-
-
 # =============================================================================
 # CREATE — ADMIN ONLY
-# add the two fields we just added in db is_active and provider_code
 # =============================================================================
 
 async def create_payment_method(
@@ -16,10 +13,12 @@ async def create_payment_method(
 
     Admin access is enforced by the route's AdminUser dependency.
 
-    The payment method name is globally unique.
-    The logo is optional and stored in Cloudflare R2.
+    - Payment method names are globally unique.
+    - provider_code identifies the internal gateway integration.
+    - is_active determines whether customers can select the method.
+    - The logo is optional and stored in Cloudflare R2.
 
-    A failed database transaction triggers a rollback and a best-effort
+    A failed database transaction triggers rollback and best-effort
     cleanup of the newly uploaded logo.
     """
 
@@ -30,12 +29,11 @@ async def create_payment_method(
         result = await db.execute(
             select(PaymentMethods).where(
                 col(PaymentMethods.name) == data.name,
-            
-        )
+            )
         )
         existing = result.scalars().first()
 
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
         await db.rollback()
 
         logger.exception(
@@ -46,7 +44,7 @@ async def create_payment_method(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create payment method. Please try again.",
-        )
+        ) from exc
 
     if existing is not None:
         raise HTTPException(
@@ -60,12 +58,33 @@ async def create_payment_method(
     new_logo_key: str | None = None
 
     if payment_logo is not None:
-        new_logo_key = await handle_file_update(
-            file=payment_logo,
-            current_key=None,
-            prefix=PAYMENT_LOGO,
-            max_size=PAYMENT_LOGO_MAX_SIZE,
-        )
+        try:
+            new_logo_key = await handle_file_update(
+                file=payment_logo,
+                current_key=None,
+                prefix=PAYMENT_LOGO,
+                max_size=PAYMENT_LOGO_MAX_SIZE,
+            )
+
+            if not new_logo_key:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Failed to upload the payment logo.",
+                )
+
+        except HTTPException:
+            raise
+
+        except Exception as exc:
+            logger.exception(
+                "Payment logo upload failed for name=%s",
+                data.name,
+            )
+
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to upload payment method logo.",
+            ) from exc
 
     # ------------------------------------------------------------------
     # 3. Prepare the model
@@ -73,6 +92,8 @@ async def create_payment_method(
     method = PaymentMethods(
         name=data.name,
         slug=generate_slug(data.name),
+        provider_code=data.provider_code,
+        is_active=data.is_active,
         payment_logo_key=new_logo_key,
     )
 
@@ -98,25 +119,20 @@ async def create_payment_method(
     try:
         db.add(method)
 
-        # Execute the INSERT and surface database constraints before commit.
         await db.flush()
-
-        # Load database-generated values while the transaction is active.
         await db.refresh(method)
-
-        # Commit only after the preceding operations succeed.
         await db.commit()
 
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
+        cleanup_new_logo()
 
         logger.warning(
             "Payment method creation violated a database integrity "
-            "constraint: name=%s",
+            "constraint: name=%s, provider_code=%s",
             data.name,
+            data.provider_code,
         )
-
-        cleanup_new_logo()
 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -124,47 +140,47 @@ async def create_payment_method(
                 f"Payment method '{data.name}' already exists "
                 "or conflicts with a database constraint."
             ),
-        )
+        ) from exc
 
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
         await db.rollback()
+        cleanup_new_logo()
 
         logger.exception(
             "Database error creating payment method name=%s",
             data.name,
         )
 
-        cleanup_new_logo()
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create payment method. Please try again.",
-        )
+        ) from exc
 
-    except Exception:
-        # Covers unexpected failures during persistence or refresh.
-        # The transaction has not been committed if this block is reached.
+    except Exception as exc:
         await db.rollback()
+        cleanup_new_logo()
 
         logger.exception(
             "Unexpected error creating payment method name=%s",
             data.name,
         )
 
-        cleanup_new_logo()
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create payment method. Please try again.",
-        )
+        ) from exc
 
     # ------------------------------------------------------------------
     # 6. Log successful creation
     # ------------------------------------------------------------------
     logger.info(
-        "Payment method '%s' (slug=%s) created by admin user_id=%s",
+        "Payment method created: id=%s, name=%s, slug=%s, "
+        "provider_code=%s, is_active=%s, admin_user_id=%s",
+        method.id,
         method.name,
         method.slug,
+        method.provider_code,
+        method.is_active,
         current_user.id,
     )
 
@@ -176,54 +192,61 @@ async def create_payment_method(
             f"Payment method '{method.name}' created successfully."
         ),
         "payment_method": to_payment_method_read(method),
-            }
-
-
+    }
 
 
 # =============================================================================
-# READ — available (public, deduplicated — for the Footer widget)
-# returns only actve payment methods
+# READ — AVAILABLE
+# PUBLIC — ACTIVE PAYMENT METHODS ONLY
 # =============================================================================
 
 async def read_available_payment_methods(
     db: AsyncSession,
 ) -> AvailablePaymentMethodsRead:
     """
-    Return one instance of each unique payment method.
+    Return active payment methods for the public frontend.
 
-    Public — no authentication. Used by the public "We accept"
-    widget on the Footer and landing page.
+    Used by the public 'We accept' widget.
 
-    In single-country mode, "deduplicated" is a no-op since names
-    are globally unique. Kept for API stability if multi-country
-    returns later.
+    Inactive methods remain in the database and are visible to admins,
+    but are not returned to public customers.
     """
+
     try:
         result = await db.execute(
-            select(PaymentMethods).order_by(col(PaymentMethods.name))
+            select(PaymentMethods)
+            .where(
+                col(PaymentMethods.is_active).is_(True)
+            )
+            .order_by(
+                col(PaymentMethods.name)
+            )
         )
+
         methods = result.scalars().all()
-    except Exception:
-        logger.exception("Failed to load available payment methods")
+
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to load available payment methods"
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to load payment methods. Please try again.",
-        )
+        ) from exc
 
     return AvailablePaymentMethodsRead(
         total=len(methods),
-        methods=[to_payment_method_read(m) for m in methods],
+        methods=[
+            to_payment_method_read(method)
+            for method in methods
+        ],
     )
 
 
-
-
-
-
 # =============================================================================
-# READ — all (admin only)
-# modify it to returns active and non active to admins
+# READ — ALL
+# ADMIN ONLY — ACTIVE AND INACTIVE PAYMENT METHODS
 # =============================================================================
 
 async def read_all_payment_methods(
@@ -232,43 +255,54 @@ async def read_all_payment_methods(
     limit: int = 100,
 ) -> AvailablePaymentMethodsRead:
     """
-    Return every payment method.
+    Return all payment methods, including active and inactive methods.
 
-    Admin-only — enforced by the route's `admin: AdminUser` dependency.
+    Admin access is enforced by the route's AdminUser dependency.
     """
+
     try:
         total: int = (
             await db.execute(
-                select(func.count()).select_from(PaymentMethods)
+                select(func.count()).select_from(
+                    PaymentMethods
+                )
             )
-        ).scalar() or 0
+        ).scalar_one()
 
         result = await db.execute(
             select(PaymentMethods)
-            .order_by(col(PaymentMethods.name))
+            .order_by(
+                col(PaymentMethods.name)
+            )
             .offset(skip)
             .limit(limit)
         )
+
         methods = result.scalars().all()
-    except Exception:
-        logger.exception("Failed to list payment methods")
+
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to list all payment methods"
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to load payment methods. Please try again.",
-        )
+        ) from exc
 
     return AvailablePaymentMethodsRead(
         total=total,
-        methods=[to_payment_method_read(m) for m in methods],
+        methods=[
+            to_payment_method_read(method)
+            for method in methods
+        ],
     )
 
 
+# =============================================================================
+# UPDATE — ADMIN ONLY
+# =============================================================================
 
-
-
-
-
-# include the is_active and provider_code in this update
 async def update_payment_method(
     slug: str,
     data: PaymentMethodUpdate,
@@ -276,16 +310,25 @@ async def update_payment_method(
     payment_logo: UploadFile | None = None,
 ) -> dict:
     """
-    Update a payment method's name and/or logo.
+    Update a payment method.
 
-    - Validates and normalizes the name through PaymentMethodUpdate.
-    - Checks for duplicate payment method names.
-    - Regenerates the slug only when the name changes.
-    - Uploads a replacement logo before changing the database record.
-    - Deletes the new upload after a failed flush only if rollback succeeds.
-    - Preserves the new upload if commit raises, because its outcome
-      may be uncertain.
-    - Deletes the old logo only after a confirmed successful commit.
+    Supported updates:
+        - name
+        - provider_code
+        - is_active
+        - payment logo
+
+    Behavior:
+        - Validates and normalizes the name through PaymentMethodUpdate.
+        - Checks for duplicate payment method names.
+        - Regenerates the slug only when the name changes.
+        - Uploads a replacement logo before changing the database record.
+        - Deletes a newly uploaded logo after a failed flush only when
+          rollback succeeds.
+        - Preserves the new logo if commit outcome is uncertain.
+        - Deletes the old logo only after confirmed successful commit.
+
+    Admin access is enforced by the route's AdminUser dependency.
     """
 
     new_logo_key: str | None = None
@@ -294,10 +337,10 @@ async def update_payment_method(
     # ---------------------------------------------------------
     # 1. Retrieve the existing payment method
     # ---------------------------------------------------------
-    # Your getter returns None when no record exists and raises
-    # HTTPException(500) when its database operation fails.
-    # Preserve those behaviors.
-    method = await get_payment_by_slug(db=db, slug=slug)
+    method = await get_payment_by_slug(
+        db=db,
+        slug=slug,
+    )
 
     if method is None:
         raise HTTPException(
@@ -306,18 +349,37 @@ async def update_payment_method(
         )
 
     # ---------------------------------------------------------
-    # 2. Determine which fields actually need updating
+    # 2. Determine which fields were supplied
     # ---------------------------------------------------------
-    new_name = data.name
+    changes = data.model_dump(exclude_unset=True)
+
+    new_name = changes.get("name")
+    new_provider_code = changes.get("provider_code")
+    new_is_active = changes.get("is_active")
 
     name_changed = (
         new_name is not None
         and new_name != method.name
     )
 
+    provider_code_changed = (
+        new_provider_code is not None
+        and new_provider_code != method.provider_code
+    )
+
+    is_active_changed = (
+        new_is_active is not None
+        and new_is_active != method.is_active
+    )
+
     logo_supplied = payment_logo is not None
 
-    if not name_changed and not logo_supplied:
+    if not (
+        name_changed
+        or provider_code_changed
+        or is_active_changed
+        or logo_supplied
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No changes were provided.",
@@ -330,8 +392,8 @@ async def update_payment_method(
         try:
             existing_id = await db.scalar(
                 select(PaymentMethods.id).where(
-                    PaymentMethods.name == new_name,
-                    PaymentMethods.id != method.id,
+                    col(PaymentMethods.name) == new_name,
+                    col(PaymentMethods.id) != method.id,
                 )
             )
 
@@ -406,6 +468,12 @@ async def update_payment_method(
         method.name = new_name
         method.slug = generate_slug(new_name)
 
+    if provider_code_changed and new_provider_code is not None:
+        method.provider_code = new_provider_code
+
+    if is_active_changed and new_is_active is not None:
+        method.is_active = new_is_active
+
     if new_logo_key is not None:
         method.payment_logo_key = new_logo_key
 
@@ -428,7 +496,6 @@ async def update_payment_method(
                 method.id,
             )
 
-        # Only clean up when rollback has succeeded.
         if rollback_succeeded and new_logo_key is not None:
             try:
                 delete_from_r2(new_logo_key)
@@ -545,15 +612,8 @@ async def update_payment_method(
         await db.commit()
 
     except Exception as exc:
-        # IMPORTANT:
-        # Do not delete new_logo_key here.
-        #
-        # A commit exception does not prove the database rejected
-        # the transaction. The commit may have succeeded while its
-        # acknowledgement was lost.
-        #
-        # Preserve the uploaded logo until the database state can
-        # be verified and any orphaned object reconciled.
+        # A commit exception does not prove that the database rejected
+        # the transaction. Preserve the new logo for reconciliation.
 
         try:
             await db.rollback()
@@ -592,9 +652,6 @@ async def update_payment_method(
             delete_from_r2(old_logo_key)
 
         except Exception:
-            # The database update has already succeeded.
-            # Do not report the update as failed because old-logo
-            # cleanup failed; log it for later reconciliation.
             logger.exception(
                 "Payment method updated, but the old logo could not "
                 "be deleted: payment_method_id=%s, old_logo_key=%s",
@@ -606,11 +663,52 @@ async def update_payment_method(
     # 10. Return the updated payment method
     # ---------------------------------------------------------
     logger.info(
-        "Payment method updated successfully: payment_method_id=%s",
+        "Payment method updated successfully: id=%s, "
+        "provider_code=%s, is_active=%s",
         method.id,
+        method.provider_code,
+        method.is_active,
     )
 
     return {
         "message": "Payment method updated successfully.",
         "payment_method": to_payment_method_read(method),
-            }
+    }
+
+
+
+
+
+
+
+# ------------------------------------------------------------------
+# Check for an existing provider code
+# ------------------------------------------------------------------
+try:
+    existing_provider = await db.scalar(
+        select(PaymentMethods.id).where(
+            col(PaymentMethods.provider_code) == data.provider_code,
+        )
+    )
+
+except SQLAlchemyError as exc:
+    await db.rollback()
+
+    logger.exception(
+        "Database error checking payment provider code=%s",
+        data.provider_code,
+    )
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Failed to validate payment provider. Please try again.",
+    ) from exc
+
+if existing_provider is not None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            f"Payment provider code '{data.provider_code}' "
+            "already exists."
+        ),
+    )
