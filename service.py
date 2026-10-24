@@ -1,5 +1,81 @@
 
 
+  
+class SubscriptionPayment(BaseModel, table=True):
+    """
+    One payment attempt for activating or extending a subscription.
+
+    A payment goes through these states:
+        pending   → user clicked Buy Now, chose a gateway, request sent
+        paid      → gateway confirmed, subscription activated
+        failed    → gateway rejected
+        cancelled → user or gateway cancelled
+    """
+    __tablename__ = "subscription_payments"  # type: ignore
+
+    firm_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("firms.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    plan_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_plans.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    payment_method_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("paymentmethods.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    # Snapshot of the amount at purchase time (price can change later)
+    amount: Decimal = Field(
+        sa_column=Column(Numeric(precision=10, scale=2), nullable=False)
+    )
+    currency: str = Field(
+        sa_column=Column(String(3), nullable=False, server_default="LRD")
+    )
+
+    # Gateway reference — what the payment provider returns
+    payment_reference: str = Field(
+        sa_column=Column(String(100), nullable=False, unique=True, index=True)
+    )
+
+    # Status
+    status: str = Field(
+        default="pending",
+        sa_column=Column(
+            String(20), nullable=False, server_default="pending"
+        )
+    )
+
+    # Timestamps
+    paid_at: datetime | None = Field(
+        default=None,
+        sa_type=DateTime(timezone=True),
+        sa_column_kwargs={"nullable": True},
+    )
+
+    # Relationships
+    firm: Optional["Firm"] = Relationship()
+    plan: Optional["SubscriptionPlan"] = Relationship()
+    payment_method: Optional["PaymentMethods"] = Relationship()
+
+
+  
+
 
 # =============================================================================
 # ADMIN — ACTIVATE (override, no payment)
