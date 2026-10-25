@@ -1,4 +1,237 @@
+async def initiate_subscription_purchase(
+    data: SubscriptionPurchase,
+    db: AsyncSession,
+    redis: Redis,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Start a subscription purchase. USER-FACING — no admin required.
 
+    Guards:
+        - guard_user_state: enabled + verified user
+        - require_firm_access: firm exists, caller owns it (or admin),
+          firm is enabled
+
+    Idempotency:
+        - Redis caches (user_id, idempotency_key) → payment_reference
+          for 24h. A repeated call returns the original payment info.
+        - A pending payment for the same (firm, plan) blocks a new
+          initiate. Stale pendings are auto-expired by
+          `get_pending_payment`.
+
+    Creates a SubscriptionPayment(status="pending"),
+    calls the gateway, returns the reference.
+    """
+    from api.core.guards import guard_user_state, require_firm_access
+
+    # ------------------------------------------------------------------
+    # 1. User state
+    # ------------------------------------------------------------------
+    guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 2. Idempotency — same key → return the cached response
+    # ------------------------------------------------------------------
+    idem_key = f"purchase_idem:{current_user.id}:{data.idempotency_key}"
+
+    try:
+        cached_reference = await redis.get(idem_key)
+    except Exception:
+        logger.exception("Redis read failed for idempotency key")
+        cached_reference = None
+
+    if cached_reference:
+        if isinstance(cached_reference, bytes):
+            cached_reference = cached_reference.decode("utf-8")
+
+        try:
+            result = await db.execute(
+                select(SubscriptionPayment).where(
+                    col(SubscriptionPayment.payment_reference)
+                    == cached_reference
+                )
+            )
+            existing_payment = result.scalars().first()
+        except SQLAlchemyError as exc:
+            raise _database_error("loading a cached payment", exc) from exc
+
+        if existing_payment:
+            return {
+                "message": "Payment already initiated.",
+                "payment_reference": existing_payment.payment_reference,
+                "amount": existing_payment.amount,
+                "currency": existing_payment.currency,
+                "status": existing_payment.status,
+                "provider_url": None,
+            }
+
+    # ------------------------------------------------------------------
+    # 3. Firm — load, check ownership, reject disabled (all-in-one)
+    # ------------------------------------------------------------------
+    firm = await require_firm_access(
+        db,
+        firm_id=data.firm_id,
+        current_user=current_user,
+        require_active=True,
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Plan → tier → service chain
+    # ------------------------------------------------------------------
+    plan = await get_plan_by_id(db, data.plan_id)
+    if not plan.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Plan with ID {data.plan_id} not found or inactive.",
+        )
+
+    tier = await get_tier_by_id(db, plan.tier_id)
+    if not tier.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tier with ID {plan.tier_id} not found or inactive.",
+        )
+
+    try:
+        service = await db.get(SubscriptionService, tier.service_id)
+    except SQLAlchemyError as exc:
+        raise _database_error("loading the service", exc) from exc
+
+    if not service or not service.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Service with ID {tier.service_id} not found or inactive."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Payment method
+    # ------------------------------------------------------------------
+    try:
+        payment_method = await db.get(
+            PaymentMethods, data.payment_method_id
+        )
+    except SQLAlchemyError as exc:
+        raise _database_error("loading the payment method", exc) from exc
+
+    if not payment_method:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Payment method with ID {data.payment_method_id} "
+                "not found."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Existing pending payment (with staleness check)
+    # ------------------------------------------------------------------
+    existing_pending = await get_pending_payment(
+        db, data.firm_id, data.plan_id
+    )
+
+    if existing_pending:
+        try:
+            await redis.set(
+                idem_key,
+                existing_pending.payment_reference,
+                ex=IDEMPOTENCY_TTL_SECONDS,
+            )
+        except Exception:
+            logger.exception("Redis write failed for idempotency key")
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A payment for this plan is already pending. "
+                "Please complete it or wait for it to expire."
+            ),
+            headers={"X-Error-Code": "payment_pending"},
+        )
+
+    # ------------------------------------------------------------------
+    # 7. Create the pending payment
+    # ------------------------------------------------------------------
+    reference = f"sub_{secrets.token_urlsafe(16)}"
+
+    payment = SubscriptionPayment(
+        firm_id=data.firm_id,
+        plan_id=data.plan_id,
+        payment_method_id=data.payment_method_id,
+        amount=plan.price,
+        currency=settings.currency_code,
+        payment_reference=reference,
+        status="pending",
+    )
+
+    try:
+        db.add(payment)
+        await _commit_or_rollback(
+            db, operation="creating a subscription payment"
+        )
+        await _refresh_or_raise(
+            db, payment, operation="refreshing a subscription payment"
+        )
+    except Exception:
+        raise
+
+    # ------------------------------------------------------------------
+    # 8. Cache the idempotency key
+    # ------------------------------------------------------------------
+    try:
+        await redis.set(idem_key, reference, ex=IDEMPOTENCY_TTL_SECONDS)
+    except Exception:
+        logger.exception(
+            "Redis write failed for idempotency key=%s", idem_key
+        )
+
+    # ------------------------------------------------------------------
+    # 9. Call the gateway
+    # ------------------------------------------------------------------
+    provider = payment_method.name.lower().replace(" ", "_")
+
+    try:
+        gateway_response = await initiate_payment(
+            provider=provider,
+            amount=str(plan.price),
+            currency=settings.currency_code,
+            reference=reference,
+        )
+    except Exception:
+        logger.exception(
+            "Gateway initiation failed for payment ref=%s", reference
+        )
+
+        payment.status = "failed"
+        db.add(payment)
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Payment gateway is unavailable. Please try again.",
+        )
+
+    logger.info(
+        "Subscription purchase initiated: firm_id=%s plan_id=%s "
+        "ref=%s provider=%s",
+        data.firm_id,
+        data.plan_id,
+        reference,
+        provider,
+    )
+
+    return {
+        "message": "Payment initiated. Complete the payment to activate.",
+        "payment_reference": reference,
+        "amount": plan.price,
+        "currency": settings.currency_code,
+        "status": gateway_response.get("status", "pending"),
+        "provider_url": gateway_response.get("provider_url"),
+    }
 
 
 async def update_plan(
