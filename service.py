@@ -1,7 +1,129 @@
 
-# =============================================================================
-# SERVICE — READ BY SLUG (ADMIN ONLY)
-# =============================================================================
+class SubscriptionPlan(BaseModel, table=True):
+    """
+    Subscription plans per tier.
+    Defines HOW LONG and HOW MUCH.
+
+    Examples:
+        starter tier:
+            monthly   → 30 days,  USD 5
+            quarterly → 90 days,  USD 12
+            biannual  → 180 days, USD 20
+            annual    → 365 days, USD 35
+
+        pro tier:
+            monthly   → 30 days,  USD 10
+            quarterly → 90 days,  USD 25
+            biannual  → 180 days, USD 45
+            annual    → 365 days, USD 70
+    """
+    __tablename__ = "subscription_plans" # type: ignore
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "tier_id",
+            name="unique_plan_per_tier"
+        ),
+    )
+
+    # FK to SubscriptionTier
+    tier_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_tiers.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    name: str = Field(
+        sa_column=Column(String(50), nullable=False)
+        # e.g. "monthly", "quarterly", "biannual", "annual"
+    )
+    slug: str | None = Field(
+        default=None,
+        sa_column=Column(String(200), nullable=True, unique=True, index=True)
+    )
+    description: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True)
+    )
+    duration_days: int = Field(
+        sa_column=Column(Integer, nullable=False)
+        # monthly=30, quarterly=90, biannual=180, annual=365
+    )
+    price: Decimal = Field(
+        sa_column=Column(Numeric(precision=10, scale=2), nullable=False)
+    )
+   
+    is_active: bool = Field(
+        default=True,
+        sa_column=Column(Boolean, nullable=False, server_default="true")
+    )
+
+    # Relationships
+    tier: Optional["SubscriptionTier"] = Relationship(
+        back_populates="plans"
+    )
+    subscriptions: list["Subscription"] = Relationship(
+        back_populates="plan"
+    )
+
+
+
+async def create_plan(
+    data: PlanCreate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    try:
+        tier = await db.get(SubscriptionTier, data.tier_id)
+    except SQLAlchemyError as exc:
+        raise database_error("loading a tier for plan creation", exc) from exc
+
+    if tier is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription tier not found.",
+        )
+
+    try:
+        existing = await db.execute(
+            select(SubscriptionPlan).where(
+                SubscriptionPlan.tier_id == data.tier_id,
+                func.lower(SubscriptionPlan.name) == data.name.lower(),
+            )
+        )
+        if existing.scalars().first():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A plan with this name already exists for the tier.",
+            )
+
+        plan = SubscriptionPlan(
+            tier_id=data.tier_id,
+            name=data.name,
+            description=data.description,
+            duration_days=data.duration_days,
+            price=data.price,
+            slug=generate_slug(
+                f"{tier.slug or tier.name}-{data.name}"
+            ),
+            is_active=True,
+        )
+        db.add(plan)
+        await commit_or_rollback(db, operation="creating a plan")
+        await refresh_or_raise(db, plan, operation="refreshing a plan")
+
+        return {
+            "message": "Subscription plan created successfully.",
+            "plan": to_plan_read(plan),
+        }
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise database_error("creating a plan", exc) from exc
 
 
 
