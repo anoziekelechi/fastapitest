@@ -3,26 +3,6 @@
 # SERVICE — READ BY SLUG (ADMIN ONLY)
 # =============================================================================
 
-async def read_service_by_slug(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> ServiceRead:
-    """
-    Read a subscription service by slug.
-
-    Administrators only.
-    Includes inactive services.
-    """
-    if not _is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator access required.",
-        )
-
-    return_service = await get_service_by_slug(db, slug)
-
-    return to_service_read(return_service)
 
 
 
@@ -70,141 +50,11 @@ async def read_tier_by_slug(
 
     return TierRead.model_validate(tier)
 
-@router.get(
-    "/services/{slug}",
-    response_model=ServiceRead,
-)
-async def get_service(
-    slug: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: ReadUser | None = Depends(get_optional_user),
-) -> ServiceRead:
-    return await read_service_by_slug(
-        slug=slug,
-        db=db,
-        current_user=current_user,
-        )
-
-
-
-# =============================================================================
-# TIER — DELETE BY SLUG
-# =============================================================================
-
-async def delete_tier(
-    tier_slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict[str, str]:
-    """
-    Delete a subscription tier by slug.
-
-    Administrators only.
-    Tiers referenced by subscriptions cannot be deleted.
-    """
-    if not _is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator access required.",
-        )
-
-    tier = await get_tier_by_slug(db, tier_slug)
-
-    count = await _count_subscriptions(
-        db,
-        tier_id=tier.id,
-    )
-
-    if count:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "This tier cannot be deleted because subscriptions "
-                "reference it."
-            ),
-        )
-
-    try:
-        await db.delete(tier)
-        await _commit_or_rollback(
-            db,
-            operation="deleting a tier",
-        )
-
-    except HTTPException:
-        raise
-
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise _database_error(
-            "deleting a tier",
-            exc,
-        ) from exc
-
-    return {
-        "message": "Subscription tier deleted successfully."
-    }
 
 
 
 
-# =============================================================================
-# PLAN — DELETE BY SLUG
-# =============================================================================
 
-async def delete_plan(
-    plan_slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict[str, str]:
-    """
-    Delete a subscription plan by slug.
-
-    Administrators only.
-    Plans referenced by subscriptions cannot be deleted.
-    """
-    if not _is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator access required.",
-        )
-
-    plan = await get_plan_by_slug(db, plan_slug)
-
-    count = await _count_subscriptions(
-        db,
-        plan_id=plan.id,
-    )
-
-    if count:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "This plan cannot be deleted because subscriptions "
-                "reference it."
-            ),
-        )
-
-    try:
-        await db.delete(plan)
-        await _commit_or_rollback(
-            db,
-            operation="deleting a plan",
-        )
-
-    except HTTPException:
-        raise
-
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise _database_error(
-            "deleting a plan",
-            exc,
-        ) from exc
-
-    return {
-        "message": "Subscription plan deleted successfully."
-        }
 
 
 
