@@ -1,3 +1,45 @@
+import calendar
+from datetime import datetime
+
+
+def add_calendar_months(
+    value: datetime,
+    months: int,
+) -> datetime:
+    """
+    Add calendar months while preserving the time and timezone.
+
+    If the target month has fewer days than the starting date,
+    use the last day of the target month.
+    """
+    if months < 0:
+        raise ValueError("months cannot be negative.")
+
+    month_index = value.month - 1 + months
+
+    target_year = value.year + month_index // 12
+    target_month = month_index % 12 + 1
+
+    last_day = calendar.monthrange(
+        target_year,
+        target_month,
+    )[1]
+
+    target_day = min(value.day, last_day)
+
+    return value.replace(
+        year=target_year,
+        month=target_month,
+        day=target_day,
+    )
+
+
+
+
+
+
+
+
 from typing import Literal, get_args
 
 
