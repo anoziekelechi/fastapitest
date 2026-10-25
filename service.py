@@ -1,3 +1,39 @@
+from sqlalchemy import CheckConstraint, Column, Integer
+from sqlmodel import Field, SQLModel
+
+
+class SubscriptionPlan(SQLModel, table=True):
+    __tablename__ = "subscription_plans"
+
+    __table_args__ = (
+        CheckConstraint(
+            "duration_months IN (1, 2, 3, 6, 12)",
+            name="ck_subscription_plan_duration_months",
+        ),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+
+    tier_id: int = Field(
+        foreign_key="subscription_tiers.id",
+        index=True,
+    )
+
+    name: str = Field(index=True)
+    description: str | None = None
+
+    duration_months: int = Field(
+        sa_column=Column(Integer, nullable=False),
+    )
+
+    price: float = Field(gt=0)
+
+    slug: str = Field(unique=True, index=True)
+
+    is_active: bool = Field(default=True)
+
+
+
 
 # =============================================================================
 # PLAN — READ FOR TIER BY SLUG (ADMIN ONLY)
