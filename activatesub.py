@@ -1,28 +1,89 @@
+import calendar
+from datetime import datetime, timezone
+
+from fastapi import HTTPException, status
+from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from api.firm.models import Firm
+from api.auth.schemas import ReadUser
 
 
-# =============================================================================
-# FIRM STATE — pure predicate on a loaded firm
-# =============================================================================
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-def guard_firm_state(firm: Firm) -> None:
+
+def as_utc(value: datetime) -> datetime:
     """
-    Reject operations on a disabled firm.
+    Normalize timestamps for comparisons.
 
-    Pure state check — does not load the firm, does not check ownership.
-    Use when you already have the firm and only need the state check
-    (e.g. after loading it inside a loop, or from a background task).
+    This assumes naive database timestamps represent UTC.
+    Prefer timezone-aware database timestamps where possible.
     """
-    if firm.disabled:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
+
+
+def add_calendar_months(
+    value: datetime,
+    months: int,
+) -> datetime:
+    """
+    Add calendar months, preserving time and timezone.
+
+    If the target month is shorter than the original day,
+    clamp to the last day of the target month.
+    """
+    if months < 0:
+        raise ValueError("months cannot be negative.")
+
+    month_index = value.month - 1 + months
+    target_year = value.year + month_index // 12
+    target_month = month_index % 12 + 1
+
+    last_day = calendar.monthrange(
+        target_year,
+        target_month,
+    )[1]
+
+    return value.replace(
+        year=target_year,
+        month=target_month,
+        day=min(value.day, last_day),
+    )
+
+
+def guard_user_state(current_user: ReadUser) -> None:
+    """Reject disabled or unverified users."""
+    if current_user.disabled:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Firm '{firm.name}' is suspended. Please contact admin.",
-            headers={"X-Error-Code": "firm_suspended"},
+            detail="Your account is suspended. Please contact support.",
+            headers={"X-Error-Code": "account_suspended"},
+        )
+
+    if not current_user.verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Please verify your account before continuing.",
+            headers={"X-Error-Code": "account_unverified"},
         )
 
 
-# =============================================================================
-# FIRM ACCESS — load + ownership + optional state
-# =============================================================================
+def guard_firm_state(firm: Firm) -> None:
+    """Reject operations on a disabled firm."""
+    if firm.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Firm '{firm.name}' is suspended. "
+                "Please contact admin."
+            ),
+            headers={"X-Error-Code": "firm_suspended"},
+        )
+
 
 async def require_firm_access(
     db: AsyncSession,
@@ -32,31 +93,16 @@ async def require_firm_access(
     require_active: bool = True,
 ) -> Firm:
     """
-    Load a firm and verify the caller can act on it.
+    Load the firm, verify owner/admin access, and optionally
+    reject disabled firms.
 
-    Steps:
-        1. Load the firm (404 if missing).
-        2. Reject if the caller is neither the owner nor an admin.
-        3. When `require_active=True` (default), reject disabled firms.
-
-    Does NOT check user state — callers that need it should call
-    `guard_user_state(current_user)` first.
-
-    Default is `require_active=True` because 99% of call sites are
-    money-touching operations where acting on a disabled firm is wrong.
-    The 1% that need to *read* a disabled firm should pass
-    `require_active=False` explicitly, so the choice is deliberate.
+    Does not check the user's disabled/verified state.
+    Call guard_user_state separately where required.
     """
-    from api.core.logging import logger  # or wherever your logger lives
-
     try:
         firm = await db.get(Firm, firm_id)
     except SQLAlchemyError as exc:
-        logger.exception("Failed to load firm id=%s", firm_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load firm. Please try again.",
-        ) from exc
+        raise _database_error("loading the firm", exc) from exc
 
     if firm is None:
         raise HTTPException(
@@ -64,7 +110,10 @@ async def require_firm_access(
             detail="Firm not found.",
         )
 
-    if not is_admin(current_user) and firm.user_id != current_user.id:
+    if (
+        not _is_admin(current_user)
+        and firm.user_id != current_user.id
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have access to this firm.",
@@ -80,9 +129,30 @@ async def require_firm_access(
 
 
 
-# =============================================================================
-# ADMIN — ACTIVATE (override, no payment)
-# =============================================================================
+
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class SubscriptionPurchase(BaseModel):
+    """Initiate a subscription purchase for a firm."""
+    model_config = ConfigDict(extra="forbid")
+
+    firm_id: int = Field(gt=0)
+    plan_id: int = Field(gt=0)
+    payment_method_id: int = Field(gt=0)
+
+The frontend should generate one idempotency key per purchase attempt and reuse it when retrying that same request. It should generate a new key for a genuinely new purchase attempt
+    
+    # Client-generated UUID or similarly unique request key.
+    idempotency_key: str = Field(
+        min_length=16,
+        max_length=128,
+    )
+
+
+
+
 
 async def activate_subscription(
     data: SubscriptionActivate,
@@ -90,69 +160,105 @@ async def activate_subscription(
     current_user: ReadUser,
 ) -> dict:
     """
-    Admin override — grants or extends a subscription without a
-    payment record. Enforced by route via `admin: AdminUser`.
-
-    Does NOT set `last_payment_id` (there is no payment involved).
+    Administrator override: activate or extend a subscription
+    without a payment record.
     """
+    if not _is_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator access required.",
+        )
+
     guard_user_state(current_user)
 
     try:
         firm = await db.get(Firm, data.firm_id)
+        service = await db.get(
+            SubscriptionService,
+            data.service_id,
+        )
     except SQLAlchemyError as exc:
-        raise _database_error("loading the firm", exc) from exc
+        raise _database_error(
+            "loading subscription activation resources",
+            exc,
+        ) from exc
 
-    if not firm:
+    if firm is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm with ID {data.firm_id} not found.",
+            detail="Firm not found.",
         )
+
     guard_firm_state(firm)
 
-    service = await db.get(SubscriptionService, data.service_id)
-    if not service or not service.is_active:
+    if service is None or not service.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                f"Service with ID {data.service_id} not found or inactive."
-            ),
+            detail="Subscription service not found or inactive.",
         )
 
     tier = await get_tier_by_id(db, data.tier_id)
+
     if not tier.is_active or tier.service_id != data.service_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"Tier '{tier.name}' does not belong to the specified "
+                "The selected tier does not belong to the specified "
                 "service or is inactive."
             ),
         )
 
     plan = await get_plan_by_id(db, data.plan_id)
-    if not plan.is_active or plan.tier_id != data.tier_id:
+
+    if not plan.is_active or plan.tier_id != tier.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"Plan '{plan.name}' does not belong to the specified "
+                "The selected plan does not belong to the specified "
                 "tier or is inactive."
             ),
         )
 
     now = utc_now()
-    ends_at = now + timedelta(days=plan.duration_days)
 
+    # Existing helper must use the firm/service unique key.
     sub = await get_subscription_by_firm_service(
-        db, data.firm_id, data.service_id
+        db,
+        data.firm_id,
+        data.service_id,
+    )
+
+    same_plan = (
+        sub is not None
+        and sub.tier_id == tier.id
+        and sub.plan_id == plan.id
+        and not sub.is_on_trial
+        and sub.is_active
+        and sub.subscription_ends_at is not None
+        and as_utc(sub.subscription_ends_at) > now
+    )
+
+    if same_plan:
+        # Extend from the existing expiration date.
+        base_time = as_utc(sub.subscription_ends_at)
+    else:
+        # New subscription, expired subscription, or plan switch.
+        base_time = now
+
+    ends_at = add_calendar_months(
+        base_time,
+        plan.duration_months,
     )
 
     if sub is None:
         sub = Subscription(
-            firm_id=data.firm_id,
-            service_id=data.service_id,
-            tier_id=data.tier_id,
-            plan_id=data.plan_id,
+            firm_id=firm.id,
+            service_id=service.id,
+            tier_id=tier.id,
+            plan_id=plan.id,
+            last_payment_id=None,
             is_on_trial=False,
-            trial_started_at=now,
+            trial_started_at=None,
             trial_ends_at=None,
             is_active=True,
             subscription_started_at=now,
@@ -160,55 +266,63 @@ async def activate_subscription(
             auto_renew=False,
         )
         db.add(sub)
+
     else:
-        same_plan = (
-            sub.tier_id == data.tier_id
-            and sub.plan_id == data.plan_id
-            and not sub.is_on_trial
-            and sub.is_active
-            and sub.subscription_ends_at
-            and sub.subscription_ends_at > now
-        )
-        if same_plan:
-            ends_at = sub.subscription_ends_at + timedelta(
-                days=plan.duration_days
-            )
-            sub.subscription_ends_at = ends_at
-        else:
-            sub.tier_id = data.tier_id
-            sub.plan_id = data.plan_id
-            sub.is_on_trial = False
-            sub.trial_ends_at = None
-            sub.is_active = True
+        sub.tier_id = tier.id
+        sub.plan_id = plan.id
+        sub.is_on_trial = False
+        sub.trial_started_at = None
+        sub.trial_ends_at = None
+        sub.is_active = True
+        sub.subscription_ends_at = ends_at
+        sub.auto_renew = False
+
+        if not same_plan:
             sub.subscription_started_at = now
-            sub.subscription_ends_at = ends_at
+
+        # This activation has no payment.
+        # Do not invent or overwrite a payment reference.
         db.add(sub)
 
-    await _commit_or_rollback(db, operation="activating a subscription")
-    await _refresh_or_raise(db, sub, operation="refreshing a subscription")
+    await _commit_or_rollback(
+        db,
+        operation="activating a subscription",
+    )
+    await _refresh_or_raise(
+        db,
+        sub,
+        operation="refreshing a subscription",
+    )
 
     logger.info(
         "Admin activated subscription: firm_id=%s service_id=%s "
         "tier_id=%s plan_id=%s by user_id=%s",
-        data.firm_id,
-        data.service_id,
-        data.tier_id,
-        data.plan_id,
+        firm.id,
+        service.id,
+        tier.id,
+        plan.id,
         current_user.id,
     )
 
     return {
         "message": (
             f"Subscription activated for '{service.name}' until "
-            f"{ends_at.strftime('%Y-%m-%d')}"
+            f"{ends_at.strftime('%Y-%m-%d')}."
         ),
         "subscription": _compute_subscription_read(sub),
-    }
+}
 
 
-# =============================================================================
-# PURCHASE — INITIATE (user-facing, idempotent)
-# =============================================================================
+
+
+
+import secrets
+
+from fastapi import HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel import col
+
 
 async def initiate_subscription_purchase(
     data: SubscriptionPurchase,
@@ -217,39 +331,22 @@ async def initiate_subscription_purchase(
     current_user: ReadUser,
 ) -> dict:
     """
-    Start a subscription purchase. USER-FACING — no admin required.
+    Initiate a user-facing subscription purchase.
 
-    Guards:
-        - guard_user_state: enabled + verified user
-        - require_firm_access: firm exists, caller owns it (or admin),
-          firm is enabled
-
-    Idempotency:
-        - Redis caches (user_id, idempotency_key) → payment_reference
-          for 24h. A repeated call returns the original payment info.
-        - A pending payment for the same (firm, plan) blocks a new
-          initiate. Stale pendings are auto-expired by
-          `get_pending_payment`.
-
-    Creates a SubscriptionPayment(status="pending"),
-    calls the gateway, returns the reference.
+    The subscription is not activated here.
+    Activation happens only after successful payment verification.
     """
-    from api.core.guards import guard_user_state, require_firm_access
-
-    # ------------------------------------------------------------------
-    # 1. User state
-    # ------------------------------------------------------------------
     guard_user_state(current_user)
 
-    # ------------------------------------------------------------------
-    # 2. Idempotency — same key → return the cached response
-    # ------------------------------------------------------------------
-    idem_key = f"purchase_idem:{current_user.id}:{data.idempotency_key}"
+    idem_key = (
+        f"purchase_idem:{current_user.id}:{data.idempotency_key}"
+    )
 
+    # 1. Idempotency lookup.
     try:
         cached_reference = await redis.get(idem_key)
     except Exception:
-        logger.exception("Redis read failed for idempotency key")
+        logger.exception("Redis idempotency read failed.")
         cached_reference = None
 
     if cached_reference:
@@ -259,27 +356,40 @@ async def initiate_subscription_purchase(
         try:
             result = await db.execute(
                 select(SubscriptionPayment).where(
-                    col(SubscriptionPayment.payment_reference)
-                    == cached_reference
+                    col(
+                        SubscriptionPayment.payment_reference
+                    ) == cached_reference
                 )
             )
             existing_payment = result.scalars().first()
         except SQLAlchemyError as exc:
-            raise _database_error("loading a cached payment", exc) from exc
+            raise _database_error(
+                "loading an idempotent payment",
+                exc,
+            ) from exc
 
-        if existing_payment:
+        if existing_payment is not None:
+            # Do not expose a cached payment unless its firm still
+            # belongs to this user or the caller is an administrator.
+            await require_firm_access(
+                db,
+                firm_id=existing_payment.firm_id,
+                current_user=current_user,
+                require_active=True,
+            )
+
             return {
                 "message": "Payment already initiated.",
-                "payment_reference": existing_payment.payment_reference,
+                "payment_reference": (
+                    existing_payment.payment_reference
+                ),
                 "amount": existing_payment.amount,
                 "currency": existing_payment.currency,
                 "status": existing_payment.status,
                 "provider_url": None,
             }
 
-    # ------------------------------------------------------------------
-    # 3. Firm — load, check ownership, reject disabled (all-in-one)
-    # ------------------------------------------------------------------
+    # 2. Firm ownership and state.
     firm = await require_firm_access(
         db,
         firm_id=data.firm_id,
@@ -287,63 +397,66 @@ async def initiate_subscription_purchase(
         require_active=True,
     )
 
-    # ------------------------------------------------------------------
-    # 4. Plan → tier → service chain
-    # ------------------------------------------------------------------
+    # 3. Plan -> tier -> service.
     plan = await get_plan_by_id(db, data.plan_id)
+
     if not plan.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Plan with ID {data.plan_id} not found or inactive.",
+            detail="Plan not found or inactive.",
         )
 
     tier = await get_tier_by_id(db, plan.tier_id)
+
     if not tier.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tier with ID {plan.tier_id} not found or inactive.",
+            detail="Subscription tier not found or inactive.",
         )
 
     try:
-        service = await db.get(SubscriptionService, tier.service_id)
+        service = await db.get(
+            SubscriptionService,
+            tier.service_id,
+        )
     except SQLAlchemyError as exc:
-        raise _database_error("loading the service", exc) from exc
+        raise _database_error(
+            "loading the subscription service",
+            exc,
+        ) from exc
 
-    if not service or not service.is_active:
+    if service is None or not service.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                f"Service with ID {tier.service_id} not found or inactive."
-            ),
+            detail="Subscription service not found or inactive.",
         )
 
-    # ------------------------------------------------------------------
-    # 5. Payment method
-    # ------------------------------------------------------------------
+    # 4. Payment method.
     try:
         payment_method = await db.get(
-            PaymentMethods, data.payment_method_id
+            PaymentMethods,
+            data.payment_method_id,
         )
     except SQLAlchemyError as exc:
-        raise _database_error("loading the payment method", exc) from exc
+        raise _database_error(
+            "loading the payment method",
+            exc,
+        ) from exc
 
-    if not payment_method:
+    if payment_method is None or not payment_method.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                f"Payment method with ID {data.payment_method_id} "
-                "not found."
-            ),
+            detail="Payment method not found or inactive.",
         )
 
-    # ------------------------------------------------------------------
-    # 6. Existing pending payment (with staleness check)
-    # ------------------------------------------------------------------
+    # 5. Check for an existing pending payment.
     existing_pending = await get_pending_payment(
-        db, data.firm_id, data.plan_id
+        db,
+        firm.id,
+        plan.id,
     )
 
-    if existing_pending:
+    if existing_pending is not None:
         try:
             await redis.set(
                 idem_key,
@@ -351,104 +464,107 @@ async def initiate_subscription_purchase(
                 ex=IDEMPOTENCY_TTL_SECONDS,
             )
         except Exception:
-            logger.exception("Redis write failed for idempotency key")
+            logger.exception(
+                "Redis idempotency write failed."
+            )
 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 "A payment for this plan is already pending. "
-                "Please complete it or wait for it to expire."
+                "Complete it or wait for it to expire."
             ),
             headers={"X-Error-Code": "payment_pending"},
         )
 
-    # ------------------------------------------------------------------
-    # 7. Create the pending payment
-    # ------------------------------------------------------------------
+    # 6. Create and persist the pending payment.
     reference = f"sub_{secrets.token_urlsafe(16)}"
 
     payment = SubscriptionPayment(
-        firm_id=data.firm_id,
-        plan_id=data.plan_id,
-        payment_method_id=data.payment_method_id,
+        firm_id=firm.id,
+        plan_id=plan.id,
+        payment_method_id=payment_method.id,
         amount=plan.price,
         currency=settings.currency_code,
         payment_reference=reference,
         status="pending",
     )
 
-    try:
-        db.add(payment)
-        await _commit_or_rollback(
-            db, operation="creating a subscription payment"
-        )
-        await _refresh_or_raise(
-            db, payment, operation="refreshing a subscription payment"
-        )
-    except Exception:
-        raise
+    db.add(payment)
 
-    # ------------------------------------------------------------------
-    # 8. Cache the idempotency key
-    # ------------------------------------------------------------------
+    await _commit_or_rollback(
+        db,
+        operation="creating a subscription payment",
+    )
+    await _refresh_or_raise(
+        db,
+        payment,
+        operation="refreshing a subscription payment",
+    )
+
+    # 7. Cache the idempotency key after the payment is committed.
     try:
-        await redis.set(idem_key, reference, ex=IDEMPOTENCY_TTL_SECONDS)
+        await redis.set(
+            idem_key,
+            reference,
+            ex=IDEMPOTENCY_TTL_SECONDS,
+        )
     except Exception:
         logger.exception(
-            "Redis write failed for idempotency key=%s", idem_key
+            "Redis idempotency write failed for payment %s",
+            reference,
         )
 
-    # ------------------------------------------------------------------
-    # 9. Call the gateway
-    # ------------------------------------------------------------------
-    provider = payment_method.name.lower().replace(" ", "_")
+    # 8. Initiate payment with the stable internal provider code.
+    provider = payment_method.provider_code
 
     try:
         gateway_response = await initiate_payment(
             provider=provider,
-            amount=str(plan.price),
-            currency=settings.currency_code,
+            amount=str(payment.amount),
+            currency=payment.currency,
             reference=reference,
         )
+
     except Exception:
         logger.exception(
-            "Gateway initiation failed for payment ref=%s", reference
+            "Gateway initiation failed for payment ref=%s",
+            reference,
         )
 
-        payment.status = "failed"
-        db.add(payment)
-        try:
-            await db.commit()
-        except Exception:
-            await db.rollback()
-
+        # The gateway request may have reached the provider even if
+        # the client received an exception. Do not automatically mark
+        # it failed unless your gateway integration can establish that
+        # the payment was not created.
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Payment gateway is unavailable. Please try again.",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "We could not confirm the payment initiation. "
+                "Please check the payment status before retrying."
+            ),
         )
 
     logger.info(
         "Subscription purchase initiated: firm_id=%s plan_id=%s "
-        "ref=%s provider=%s",
-        data.firm_id,
-        data.plan_id,
+        "reference=%s provider=%s",
+        firm.id,
+        plan.id,
         reference,
         provider,
     )
 
     return {
-        "message": "Payment initiated. Complete the payment to activate.",
+        "message": (
+            "Payment initiated. Complete the payment to activate."
+        ),
         "payment_reference": reference,
-        "amount": plan.price,
-        "currency": settings.currency_code,
+        "amount": payment.amount,
+        "currency": payment.currency,
         "status": gateway_response.get("status", "pending"),
         "provider_url": gateway_response.get("provider_url"),
     }
 
 
-# =============================================================================
-# PURCHASE — CONFIRM (user-facing, idempotent, row-locked)
-# =============================================================================
 
 async def confirm_subscription_payment(
     data: SubscriptionPaymentConfirm,
@@ -456,68 +572,48 @@ async def confirm_subscription_payment(
     current_user: ReadUser,
 ) -> dict:
     """
-    Confirm a payment and activate the subscription.
+    Verify a pending payment and activate or extend its subscription.
 
-    USER-FACING — no admin required.
-
-    Idempotency:
-        - Row-level lock (FOR UPDATE) serializes concurrent confirms
-          for the same payment reference.
-        - `paid` payments return 409 immediately; no double activation.
-        - `pending` payments proceed through gateway verification.
-        - `failed` / `expired` payments return 400.
-
-    Sets Subscription.last_payment_id to trace the payment.
+    The payment and subscription are persisted together.
     """
-    # ------------------------------------------------------------------
-    # 1. Load payment WITH row lock
-    # ------------------------------------------------------------------
+    guard_user_state(current_user)
+
+    # 1. Lock the payment row to serialize concurrent confirmations.
     try:
         result = await db.execute(
             select(SubscriptionPayment)
             .where(
-                col(SubscriptionPayment.payment_reference)
-                == data.payment_reference
+                col(
+                    SubscriptionPayment.payment_reference
+                ) == data.payment_reference
             )
             .with_for_update()
         )
         payment = result.scalars().first()
     except SQLAlchemyError as exc:
-        raise _database_error("loading the payment", exc) from exc
+        raise _database_error(
+            "loading the payment",
+            exc,
+        ) from exc
 
-    if not payment:
+    if payment is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Payment '{data.payment_reference}' not found.",
+            detail="Payment not found.",
         )
 
-    # ------------------------------------------------------------------
-    # 2. Firm + ownership
-    # ------------------------------------------------------------------
-    try:
-        firm = await db.get(Firm, payment.firm_id)
-    except SQLAlchemyError as exc:
-        raise _database_error("loading the firm", exc) from exc
+    # 2. Verify firm access before revealing payment details.
+    firm = await require_firm_access(
+        db,
+        firm_id=payment.firm_id,
+        current_user=current_user,
+        require_active=True,
+    )
 
-    if not firm:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Firm not found for this payment.",
-        )
-    if firm.user_id != current_user.id and not _is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only confirm payments for your own firms.",
-            headers={"X-Error-Code": "wrong_permission"},
-        )
-
-    guard_user_state(current_user)
-    guard_firm_state(firm)
-
-    # ------------------------------------------------------------------
-    # 3. Idempotency / state check
-    # ------------------------------------------------------------------
+    # 3. Enforce payment state.
     if payment.status == "paid":
+        # A paid payment must never activate a second subscription
+        # or extend an existing one again.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This payment has already been confirmed.",
@@ -532,79 +628,135 @@ async def confirm_subscription_payment(
             ),
         )
 
-    # ------------------------------------------------------------------
-    # 4. Load payment method + verify with gateway
-    # ------------------------------------------------------------------
+    # 4. Load payment method and verify with the actual provider.
     try:
         payment_method = await db.get(
-            PaymentMethods, payment.payment_method_id
+            PaymentMethods,
+            payment.payment_method_id,
         )
     except SQLAlchemyError as exc:
-        raise _database_error("loading the payment method", exc) from exc
+        raise _database_error(
+            "loading the payment method",
+            exc,
+        ) from exc
 
-    if not payment_method:
+    if payment_method is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Payment method not found for this payment.",
         )
 
-    provider = payment_method.name.lower().replace(" ", "_")
+    provider = payment_method.provider_code
 
     try:
         verification = await verify_payment(
             provider=provider,
             reference=payment.payment_reference,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception(
-            "Gateway verification failed ref=%s",
+            "Gateway verification failed for reference=%s",
             payment.payment_reference,
         )
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Payment gateway is unavailable. Please try again.",
-        )
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment verification is temporarily unavailable.",
+        ) from exc
 
     if verification.get("status") != "paid":
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Payment has not been confirmed by the gateway.",
+            detail="The payment has not been confirmed by the gateway.",
             headers={"X-Error-Code": "payment_pending"},
         )
 
-    # ------------------------------------------------------------------
-    # 5. Load plan → tier
-    # ------------------------------------------------------------------
+    # 5. Load the plan and validate the payment amount.
     plan = await get_plan_by_id(db, payment.plan_id)
+
+    # Do not require the plan to remain active here. A plan might have
+    # been deactivated after a legitimate payment was initiated.
+    # Payment verification and the recorded purchase determine whether
+    # the customer paid successfully.
     tier = await get_tier_by_id(db, plan.tier_id)
+
+    # A paid purchase should not silently activate an unrelated plan.
+    if tier.service_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The purchased plan is no longer correctly configured.",
+        )
+
     service_id = tier.service_id
 
-    # ------------------------------------------------------------------
-    # 6. Mark payment paid
-    # ------------------------------------------------------------------
+    # Validate gateway amount/currency when the provider returns them.
+    # Use the provider's documented response fields for your gateway.
+    verified_amount = verification.get("amount")
+    verified_currency = verification.get("currency")
+
+    if (
+        verified_amount is not None
+        and Decimal(str(verified_amount)) != Decimal(str(payment.amount))
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The verified payment amount does not match the purchase.",
+        )
+
+    if (
+        verified_currency is not None
+        and verified_currency != payment.currency
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The verified payment currency does not match the purchase.",
+        )
+
+    # 6. Lock or serialize the subscription row before extending it.
+    #
+    # This helper must use an appropriate row lock or transaction
+    # strategy for concurrent purchase confirmations.
+    sub = await get_subscription_by_firm_service(
+        db,
+        payment.firm_id,
+        service_id,
+    )
+
     now = utc_now()
+
+    same_plan = (
+        sub is not None
+        and sub.tier_id == tier.id
+        and sub.plan_id == plan.id
+        and not sub.is_on_trial
+        and sub.is_active
+        and sub.subscription_ends_at is not None
+        and as_utc(sub.subscription_ends_at) > now
+    )
+
+    if same_plan:
+        base_time = as_utc(sub.subscription_ends_at)
+    else:
+        base_time = now
+
+    ends_at = add_calendar_months(
+        base_time,
+        plan.duration_months,
+    )
+
+    # 7. Mark payment paid and set subscription fields.
     payment.status = "paid"
     payment.paid_at = now
     db.add(payment)
 
-    # ------------------------------------------------------------------
-    # 7. Activate / extend subscription (inline)
-    # ------------------------------------------------------------------
-    sub = await get_subscription_by_firm_service(
-        db, payment.firm_id, service_id
-    )
-
-    ends_at = now + timedelta(days=plan.duration_days)
-
     if sub is None:
         sub = Subscription(
-            firm_id=payment.firm_id,
+            firm_id=firm.id,
             service_id=service_id,
-            tier_id=plan.tier_id,
-            plan_id=_plan_id(plan),
-            last_payment_id=_payment_id(payment),   # traceability
+            tier_id=tier.id,
+            plan_id=plan.id,
+            last_payment_id=payment.id,
             is_on_trial=False,
-            trial_started_at=now,
+            trial_started_at=None,
             trial_ends_at=None,
             is_active=True,
             subscription_started_at=now,
@@ -612,50 +764,42 @@ async def confirm_subscription_payment(
             auto_renew=False,
         )
         db.add(sub)
-    else:
-        same_plan = (
-            sub.tier_id == plan.tier_id
-            and sub.plan_id == _plan_id(plan)
-            and not sub.is_on_trial
-            and sub.is_active
-            and sub.subscription_ends_at
-            and sub.subscription_ends_at > now
-        )
-        if same_plan:
-            ends_at = sub.subscription_ends_at + timedelta(
-                days=plan.duration_days
-            )
-            sub.subscription_ends_at = ends_at
-        else:
-            sub.tier_id = plan.tier_id
-            sub.plan_id = _plan_id(plan)
-            sub.is_on_trial = False
-            sub.trial_ends_at = None
-            sub.is_active = True
-            sub.subscription_started_at = now
-            sub.subscription_ends_at = ends_at
 
-        sub.last_payment_id = _payment_id(payment)   # traceability
+    else:
+        sub.tier_id = tier.id
+        sub.plan_id = plan.id
+        sub.last_payment_id = payment.id
+        sub.is_on_trial = False
+        sub.trial_started_at = None
+        sub.trial_ends_at = None
+        sub.is_active = True
+        sub.subscription_ends_at = ends_at
+        sub.auto_renew = False
+
+        if not same_plan:
+            sub.subscription_started_at = now
+
         db.add(sub)
 
-    # ------------------------------------------------------------------
-    # 8. Commit payment + subscription together
-    # ------------------------------------------------------------------
-    try:
-        await _commit_or_rollback(
-            db, operation="confirming a subscription payment"
-        )
-        await _refresh_or_raise(
-            db, payment, operation="refreshing a payment"
-        )
-        await _refresh_or_raise(
-            db, sub, operation="refreshing a subscription"
-        )
-    except Exception:
-        raise
+    # 8. Commit both database changes together.
+    await _commit_or_rollback(
+        db,
+        operation="confirming a subscription payment",
+    )
+
+    await _refresh_or_raise(
+        db,
+        payment,
+        operation="refreshing a payment",
+    )
+    await _refresh_or_raise(
+        db,
+        sub,
+        operation="refreshing a subscription",
+    )
 
     logger.info(
-        "Subscription payment confirmed: ref=%s firm_id=%s "
+        "Subscription payment confirmed: reference=%s firm_id=%s "
         "plan_id=%s service_id=%s ends_at=%s last_payment_id=%s",
         payment.payment_reference,
         payment.firm_id,
@@ -669,12 +813,10 @@ async def confirm_subscription_payment(
         "message": "Payment confirmed. Subscription is now active.",
         "payment": SubscriptionPaymentRead.model_validate(payment),
         "subscription": _compute_subscription_read(sub),
-    }
+        }
 
 
-# =============================================================================
-# FIRM-SCOPED READS / UPDATES
-# =============================================================================
+
 
 async def read_subscriptions_for_firm(
     firm_id: int,
@@ -683,22 +825,12 @@ async def read_subscriptions_for_firm(
 ) -> list[SubscriptionRead]:
     guard_user_state(current_user)
 
-    try:
-        firm = await db.get(Firm, firm_id)
-    except SQLAlchemyError as exc:
-        raise _database_error("loading the firm", exc) from exc
-
-    if not firm:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm with ID {firm_id} not found.",
-        )
-    if firm.user_id != current_user.id and not _is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only view subscriptions for your own firms.",
-            headers={"X-Error-Code": "wrong_permission"},
-        )
+    await require_firm_access(
+        db,
+        firm_id=firm_id,
+        current_user=current_user,
+        require_active=False,
+    )
 
     try:
         result = await db.execute(
@@ -706,11 +838,20 @@ async def read_subscriptions_for_firm(
             .where(col(Subscription.firm_id) == firm_id)
             .order_by(col(Subscription.service_id))
         )
-        subs = result.scalars().all()
-    except SQLAlchemyError as exc:
-        raise _database_error("reading subscriptions", exc) from exc
+        subscriptions = result.scalars().all()
 
-    return [_compute_subscription_read(s) for s in subs]
+    except SQLAlchemyError as exc:
+        raise _database_error(
+            "reading subscriptions for a firm",
+            exc,
+        ) from exc
+
+    return [
+        _compute_subscription_read(sub)
+        for sub in subscriptions
+    ]
+
+
 
 
 async def read_subscription_status(
@@ -721,49 +862,52 @@ async def read_subscription_status(
 ) -> SubscriptionStatusRead:
     guard_user_state(current_user)
 
-    try:
-        firm = await db.get(Firm, firm_id)
-    except SQLAlchemyError as exc:
-        raise _database_error("loading the firm", exc) from exc
-
-    if not firm:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm with ID {firm_id} not found.",
-        )
-    if firm.user_id != current_user.id and not _is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only view subscriptions for your own firms.",
-            headers={"X-Error-Code": "wrong_permission"},
-        )
+    await require_firm_access(
+        db,
+        firm_id=firm_id,
+        current_user=current_user,
+        require_active=False,
+    )
 
     try:
-        service = await db.get(SubscriptionService, service_id)
+        service = await db.get(
+            SubscriptionService,
+            service_id,
+        )
     except SQLAlchemyError as exc:
-        raise _database_error("loading the service", exc) from exc
+        raise _database_error(
+            "loading the subscription service",
+            exc,
+        ) from exc
 
-    if not service:
+    if service is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Service with ID {service_id} not found.",
+            detail="Subscription service not found.",
         )
 
-    sub = await get_subscription_by_firm_service(db, firm_id, service_id)
-    if not sub:
+    sub = await get_subscription_by_firm_service(
+        db,
+        firm_id,
+        service_id,
+    )
+
+    if sub is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                f"No subscription found for firm {firm_id} "
-                f"on service '{service.name}'."
-            ),
+            detail="No subscription found for this firm and service.",
         )
 
     tier = (
-        await get_tier_by_id(db, sub.tier_id) if sub.tier_id else None
+        await get_tier_by_id(db, sub.tier_id)
+        if sub.tier_id is not None
+        else None
     )
+
     plan = (
-        await get_plan_by_id(db, sub.plan_id) if sub.plan_id else None
+        await get_plan_by_id(db, sub.plan_id)
+        if sub.plan_id is not None
+        else None
     )
 
     read = _compute_subscription_read(sub)
@@ -782,6 +926,8 @@ async def read_subscription_status(
     )
 
 
+
+
 async def update_subscription(
     firm_id: int,
     service_id: int,
@@ -791,44 +937,30 @@ async def update_subscription(
 ) -> dict:
     guard_user_state(current_user)
 
-    try:
-        firm = await db.get(Firm, firm_id)
-    except SQLAlchemyError as exc:
-        raise _database_error("loading the firm", exc) from exc
+    firm = await require_firm_access(
+        db,
+        firm_id=firm_id,
+        current_user=current_user,
+        require_active=True,
+    )
 
-    if not firm:
+    sub = await get_subscription_by_firm_service(
+        db,
+        firm.id,
+        service_id,
+    )
+
+    if sub is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm with ID {firm_id} not found.",
-        )
-    if firm.user_id != current_user.id and not _is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only update your own firms.",
-            headers={"X-Error-Code": "wrong_permission"},
-        )
-    guard_firm_state(firm)
-
-    sub = await get_subscription_by_firm_service(db, firm_id, service_id)
-    if not sub:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                f"No subscription found for firm {firm_id} "
-                f"on service {service_id}."
-            ),
+            detail="Subscription not found for this firm and service.",
         )
 
-    if data.auto_renew is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided for update",
-        )
     if data.auto_renew == sub.auto_renew:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"No changes were made - auto_renew is already "
+                f"No changes were made; auto_renew is already "
                 f"{sub.auto_renew}."
             ),
         )
@@ -836,13 +968,21 @@ async def update_subscription(
     sub.auto_renew = data.auto_renew
     db.add(sub)
 
-    await _commit_or_rollback(db, operation="updating a subscription")
-    await _refresh_or_raise(db, sub, operation="refreshing a subscription")
+    await _commit_or_rollback(
+        db,
+        operation="updating a subscription",
+    )
+    await _refresh_or_raise(
+        db,
+        sub,
+        operation="refreshing a subscription",
+    )
 
     logger.info(
-        "Subscription auto_renew=%s firm_id=%s service_id=%s user_id=%s",
+        "Subscription auto_renew=%s firm_id=%s service_id=%s "
+        "user_id=%s",
         sub.auto_renew,
-        firm_id,
+        firm.id,
         service_id,
         current_user.id,
     )
@@ -856,17 +996,21 @@ async def update_subscription(
     }
 
 
-# =============================================================================
-# TRIAL — called from create_firm
-# =============================================================================
+
+
+
+
+from datetime import timedelta
+
 
 async def create_trial_subscriptions_for_firm(
     db: AsyncSession,
     firm_id: int,
 ) -> None:
     """
-    Create trial subscriptions for every active service for a new firm.
-    Idempotent. Called from `create_firm`; not exposed via any route.
+    Create a trial for each active subscription service.
+
+    Called from firm creation; not exposed directly as a route.
     """
     try:
         services_result = await db.execute(
@@ -875,81 +1019,93 @@ async def create_trial_subscriptions_for_firm(
             )
         )
         services = services_result.scalars().all()
+
     except SQLAlchemyError as exc:
+        await db.rollback()
         logger.exception(
-            "Failed to load services for trial creation firm_id=%s: %s",
+            "Failed to load services for trial creation firm_id=%s",
             firm_id,
-            exc,
         )
         return
 
     now = utc_now()
 
-    for service in services:
-        existing = await get_subscription_by_firm_service(
-            db, firm_id, _service_id(service)
-        )
-        if existing:
-            continue
-
-        trial_ends_at = now + timedelta(days=service.trial_days)
-
-        sub = Subscription(
-            firm_id=firm_id,
-            service_id=_service_id(service),
-            is_on_trial=True,
-            trial_started_at=now,
-            trial_ends_at=trial_ends_at,
-            is_active=True,
-            auto_renew=False,
-        )
-        db.add(sub)
-
     try:
+        for service in services:
+            service_id = _service_id(service)
+
+            existing = await get_subscription_by_firm_service(
+                db,
+                firm_id,
+                service_id,
+            )
+
+            if existing is not None:
+                continue
+
+            trial_ends_at = now + timedelta(
+                days=service.trial_days
+            )
+
+            sub = Subscription(
+                firm_id=firm_id,
+                service_id=service_id,
+                tier_id=None,
+                plan_id=None,
+                last_payment_id=None,
+                is_on_trial=True,
+                trial_started_at=now,
+                trial_ends_at=trial_ends_at,
+                is_active=True,
+                subscription_started_at=None,
+                subscription_ends_at=None,
+                auto_renew=False,
+            )
+
+            db.add(sub)
+
         await db.commit()
-    except Exception:
+
+    except SQLAlchemyError:
         await db.rollback()
         logger.exception(
-            "Failed to create trial subscriptions for firm_id=%s", firm_id
-      )
+            "Failed to create trial subscriptions for firm_id=%s",
+            firm_id,
+        )
 
 
 
-#schemas used
 
 
 
-# =============================================================================
-# SUBSCRIPTION
-# =============================================================================
+
+
+from datetime import datetime
+from decimal import Decimal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_validator,
+)
+
 
 class SubscriptionActivate(BaseModel):
-    """Activate (or extend) a paid subscription for a firm."""
+    """Administrator-only activation override."""
     model_config = ConfigDict(extra="forbid")
 
-    firm_id: int = Field(..., gt=0)
-    service_id: int = Field(..., gt=0)
-    tier_id: int = Field(..., gt=0)
-    plan_id: int = Field(..., gt=0)
+    firm_id: int = Field(gt=0)
+    service_id: int = Field(gt=0)
+    tier_id: int = Field(gt=0)
+    plan_id: int = Field(gt=0)
 
 
 class SubscriptionUpdate(BaseModel):
-    # This update requires auto_renew to be provided and non-null.
+    """Only auto_renew is user-editable."""
+    model_config = ConfigDict(extra="forbid")
+
     auto_renew: bool
-
-    @model_validator(mode="before")
-    @classmethod
-    def require_auto_renew(cls, value: object) -> object:
-        if not isinstance(value, dict):
-            raise ValueError("A valid update object is required.")
-
-        if "auto_renew" not in value:
-            raise ValueError("auto_renew must be provided.")
-
-        if value["auto_renew"] is None:
-            raise ValueError("auto_renew cannot be null.")
-
-        return value
 
 
 class SubscriptionRead(BaseModel):
@@ -960,12 +1116,10 @@ class SubscriptionRead(BaseModel):
     service_id: int
     tier_id: int | None = None
     plan_id: int | None = None
-
-    # --- NEW ---
     last_payment_id: int | None = None
 
     is_on_trial: bool
-    trial_started_at: datetime
+    trial_started_at: datetime | None = None
     trial_ends_at: datetime | None = None
 
     is_active: bool
@@ -982,7 +1136,9 @@ class SubscriptionRead(BaseModel):
 
 
 class SubscriptionStatusRead(BaseModel):
-    """Quick status check for one firm + one service."""
+    """Status of one firm subscription for one service."""
+    model_config = ConfigDict(extra="forbid")
+
     firm_id: int
     service_id: int
     service_name: str
@@ -995,18 +1151,53 @@ class SubscriptionStatusRead(BaseModel):
     can_access: bool
 
 
-# =============================================================================
-# RESPONSE ENVELOPES
-# =============================================================================
+class SubscriptionPurchase(BaseModel):
+    """Initiate a purchase for a firm."""
+    model_config = ConfigDict(extra="forbid")
 
-class CreatePlanResponse(BaseModel):
+    firm_id: int = Field(gt=0)
+    plan_id: int = Field(gt=0)
+    payment_method_id: int = Field(gt=0)
+    idempotency_key: str = Field(
+        min_length=16,
+        max_length=128,
+    )
+
+
+class SubscriptionPurchaseResponse(BaseModel):
     message: str
-    plan: PlanRead
+    payment_reference: str
+    amount: Decimal
+    currency: str
+    status: str
+    provider_url: str | None = None
 
 
-class UpdatePlanResponse(BaseModel):
+class SubscriptionPaymentConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    payment_reference: str = Field(min_length=10)
+
+
+class SubscriptionPaymentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    firm_id: int
+    plan_id: int
+    payment_method_id: int
+    amount: Decimal
+    currency: str
+    payment_reference: str
+    status: str
+    paid_at: datetime | None = None
+    created_at: datetime
+
+
+class SubscriptionPaymentConfirmedResponse(BaseModel):
     message: str
-    plan: PlanRead
+    payment: SubscriptionPaymentRead
+    subscription: SubscriptionRead
 
 
 class ActivateSubscriptionResponse(BaseModel):
@@ -1025,213 +1216,7 @@ class UpdateSubscriptionResponse(BaseModel):
 
 
 
-class CheckoutResponse(BaseModel):
-    """
-    All the info the user needs to complete the purchase.
 
-    Returned when the user lands on /subscriptions/checkout/{plan_id}.
-    """
-    plan: "PlanRead"
-    tier: "TierRead"
-    service: "ServiceRead"
-    firm: "FirmRead"
-    payment_methods: list["PaymentMethodRead"]
-    amount: Decimal
-    currency: str
-
-
-# =============================================================================
-# PURCHASE (Step 4)
-# =============================================================================
-
-class SubscriptionPurchase(BaseModel):
-    """User picks a plan + a payment method to initiate purchase."""
-    model_config = ConfigDict(extra="forbid")
-
-    plan_id: int = Field(..., gt=0)
-    payment_method_id: int = Field(..., gt=0)
-
-
-class SubscriptionPurchaseResponse(BaseModel):
-    """
-    Returned after initiating a payment.
-
-    In the Momo Liberia integration, `provider_url` may be a redirect
-    URL. For a stub, `payment_reference` is the client's reference
-    and the frontend can simulate confirmation via the confirm endpoint.
-    """
-    message: str
-    payment_reference: str
-    amount: Decimal
-    currency: str
-    status: str
-    provider_url: str | None = None
-
-
-# =============================================================================
-# PAYMENT CONFIRMATION (Step 5)
-# =============================================================================
-
-class SubscriptionPaymentConfirm(BaseModel):
-    """Confirm a payment (called after gateway redirect or webhook)."""
-    model_config = ConfigDict(extra="forbid")
-
-    payment_reference: str = Field(..., min_length=10)
-
-
-class SubscriptionPaymentRead(BaseModel):
-    """Full payment record for admin/audit views."""
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    firm_id: int
-    plan_id: int
-    payment_method_id: int
-    amount: Decimal
-    currency: str
-    payment_reference: str
-    status: str
-    paid_at: datetime | None
-    created_at: datetime
-
-
-class SubscriptionPaymentConfirmedResponse(BaseModel):
-    message: str
-    payment: SubscriptionPaymentRead
-    subscription: "SubscriptionRead"
-
-
-
-
-
-
-from api.firm.schemas import FirmRead
-from api.order.schemas import PaymentMethodRead
-from api.services.schemas import TierRead,ServiceRead
-
-CheckoutResponse.model_rebuild()
-
-
-
-
-
-
-
-
-
-
-
-
-# =============================================================================
-# SUBSCRIPTION
-# =============================================================================
-
-class SubscriptionActivate(BaseModel):
-    """Activate (or extend) a paid subscription for a firm."""
-    model_config = ConfigDict(extra="forbid")
-
-    firm_id: int = Field(..., gt=0)
-    service_id: int = Field(..., gt=0)
-    tier_id: int = Field(..., gt=0)
-    plan_id: int = Field(..., gt=0)
-
-
-# class SubscriptionUpdate(BaseModel):
-#     """Only auto_renew is user-editable."""
-#     model_config = ConfigDict(extra="forbid")
-
-#     auto_renew: bool | None = None
-
-class SubscriptionUpdate(BaseModel):
-    # This update requires auto_renew to be provided and non-null.
-    auto_renew: bool
-
-    @model_validator(mode="before")
-    @classmethod
-    def require_auto_renew(cls, value: object) -> object:
-        if not isinstance(value, dict):
-            raise ValueError("A valid update object is required.")
-
-        if "auto_renew" not in value:
-            raise ValueError("auto_renew must be provided.")
-
-        if value["auto_renew"] is None:
-            raise ValueError("auto_renew cannot be null.")
-
-        return value
-
-
-class SubscriptionRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    firm_id: int
-    service_id: int
-    tier_id: int | None = None
-    plan_id: int | None = None
-
-    # --- NEW ---
-    last_payment_id: int | None = None
-
-    is_on_trial: bool
-    trial_started_at: datetime
-    trial_ends_at: datetime | None = None
-
-    is_active: bool
-    subscription_started_at: datetime | None = None
-    subscription_ends_at: datetime | None = None
-    auto_renew: bool
-
-    created_at: datetime
-    updated_at: datetime
-
-    days_remaining: int | None = None
-    status_label: str | None = None
-    can_access: bool = False
-
-
-
-
-
-# class SubscriptionRead(BaseModel):
-#     model_config = ConfigDict(from_attributes=True)
-
-#     id: int
-#     firm_id: int
-#     service_id: int
-#     tier_id: int | None = None
-#     plan_id: int | None = None
-
-#     is_on_trial: bool
-#     trial_started_at: datetime
-#     trial_ends_at: datetime | None = None
-
-#     is_active: bool
-#     subscription_started_at: datetime | None = None
-#     subscription_ends_at: datetime | None = None
-#     auto_renew: bool
-
-#     created_at: datetime
-#     updated_at: datetime
-
-#     # Computed by the service layer
-#     days_remaining: int | None = None
-#     status_label: str | None = None
-#     can_access: bool = False
-
-
-class SubscriptionStatusRead(BaseModel):
-    """Quick status check for one firm + one service."""
-    firm_id: int
-    service_id: int
-    service_name: str
-    tier_name: str | None = None
-    plan_name: str | None = None
-    is_active: bool
-    is_on_trial: bool
-    days_remaining: int
-    status_label: str
-    can_access: bool
 
 
 
