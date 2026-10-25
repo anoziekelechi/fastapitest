@@ -1,53 +1,40 @@
-import calendar
-from datetime import datetime
-
-
-def add_calendar_months(
-    value: datetime,
-    months: int,
-) -> datetime:
-    """
-    Add calendar months while preserving the time and timezone.
-
-    If the target month has fewer days than the starting date,
-    use the last day of the target month.
-    """
-    if months < 0:
-        raise ValueError("months cannot be negative.")
-
-    month_index = value.month - 1 + months
-
-    target_year = value.year + month_index // 12
-    target_month = month_index % 12 + 1
-
-    last_day = calendar.monthrange(
-        target_year,
-        target_month,
-    )[1]
-
-    target_day = min(value.day, last_day)
-
-    return value.replace(
-        year=target_year,
-        month=target_month,
-        day=target_day,
-    )
 
 
 
+async def update_plan(
+    slug: str,
+    data: PlanUpdate,
+    db: AsyncSession,
+) -> dict:
+    plan = await get_plan_by_slug(db, slug)
+    changes = data.model_dump(exclude_unset=True)
 
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided.",
+        )
 
+    changed = False
+    for field_name, value in changes.items():
+        if getattr(plan, field_name) != value:
+            setattr(plan, field_name, value)
+            changed = True
 
+    if not changed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No changes were made.",
+        )
 
+    await commit_or_rollback(db, operation="updating a plan")
+    await refresh_or_raise(db, plan, operation="refreshing a plan")
 
-from typing import Literal, get_args
+    return {
+        "message": "Subscription plan updated successfully.",
+        "plan": to_plan_read(plan),
+    }
 
-
-SubscriptionDuration = Literal[1, 2, 3, 6, 12]
-
-ALLOWED_SUBSCRIPTION_DURATIONS = frozenset(
-    get_args(SubscriptionDuration)
-)
 
 
 
