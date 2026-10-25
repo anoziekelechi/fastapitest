@@ -1,3 +1,196 @@
+from typing import Literal, get_args
+
+
+SubscriptionDuration = Literal[1, 2, 3, 6, 12]
+
+ALLOWED_SUBSCRIPTION_DURATIONS = frozenset(
+    get_args(SubscriptionDuration)
+)
+
+
+
+
+
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from api.core.subscription_durations import SubscriptionDuration
+
+
+class SubscriptionPlanCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tier_id: int = Field(gt=0)
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = None
+    duration_months: SubscriptionDuration
+    price: float = Field(gt=0)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("Plan name must be a string.")
+
+        normalized = " ".join(value.split())
+
+        if not normalized:
+            raise ValueError("Plan name cannot be empty.")
+
+        return normalized
+
+
+
+
+
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from api.core.subscription_durations import SubscriptionDuration
+
+
+class SubscriptionPlanUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = None
+    duration_months: SubscriptionDuration | None = None
+    price: float | None = Field(default=None, gt=0)
+    is_active: bool | None = None
+
+    @model_validator(mode="after")
+    def reject_null_required_fields(self):
+        non_nullable_fields = {
+            "name",
+            "duration_months",
+            "price",
+            "is_active",
+        }
+
+        for field_name in non_nullable_fields:
+            if (
+                field_name in self.model_fields_set
+                and getattr(self, field_name) is None
+            ):
+                raise ValueError(
+                    f"{field_name} cannot be null."
+                )
+
+        return self
+
+
+
+class SubscriptionPlanRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    tier_id: int
+    name: str
+    description: str | None
+    duration_months: SubscriptionDuration
+    price: float
+    slug: str
+    is_active: bool
+
+
+
+from fastapi import HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel import col
+
+from api.core.subscription_durations import (
+    ALLOWED_SUBSCRIPTION_DURATIONS,
+)
+
+
+async def create_plan(
+    data: SubscriptionPlanCreate,
+    db: AsyncSession,
+    current_user: ReadUser,
+):
+    if not _is_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator access required.",
+        )
+
+    # Defensive check in case the function is called with an object
+    # constructed without normal Pydantic validation.
+    if data.duration_months not in ALLOWED_SUBSCRIPTION_DURATIONS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Invalid subscription duration. Allowed durations "
+                "are 1, 2, 3, 6, and 12 months."
+            ),
+        )
+
+    try:
+        tier = await get_tier_by_id(db, data.tier_id)
+
+        if not tier.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot create a plan for an inactive tier.",
+            )
+
+        existing_plan_id = await db.scalar(
+            select(SubscriptionPlan.id).where(
+                col(SubscriptionPlan.tier_id) == tier.id,
+                col(SubscriptionPlan.name) == data.name,
+            )
+        )
+
+        if existing_plan_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A plan with this name already exists for the tier.",
+            )
+
+        plan = SubscriptionPlan(
+            tier_id=tier.id,
+            name=data.name,
+            description=data.description,
+            duration_months=data.duration_months,
+            price=data.price,
+            slug=generate_slug(
+                f"{tier.slug or tier.name}-{data.name}"
+            ),
+            is_active=True,
+        )
+
+        db.add(plan)
+
+        await commit_or_rollback(
+            db,
+            operation="creating a plan",
+        )
+
+        await refresh_or_raise(
+            db,
+            plan,
+            operation="refreshing a plan",
+        )
+
+        return {
+            "message": "Subscription plan created successfully.",
+            "plan": to_plan_read(plan),
+        }
+
+    except HTTPException:
+        raise
+
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise database_error("creating a plan", exc) from exc
+
+
+
+
+
+
+
 
 
 
