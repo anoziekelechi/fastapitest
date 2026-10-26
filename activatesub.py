@@ -1,5 +1,4 @@
-import calendar
-from datetime import datetime, timezone
+
 
 from fastapi import HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
@@ -9,121 +8,6 @@ from api.firm.models import Firm
 from api.auth.schemas import ReadUser
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def as_utc(value: datetime) -> datetime:
-    """
-    Normalize timestamps for comparisons.
-
-    This assumes naive database timestamps represent UTC.
-    Prefer timezone-aware database timestamps where possible.
-    """
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-
-    return value.astimezone(timezone.utc)
-
-
-def add_calendar_months(
-    value: datetime,
-    months: int,
-) -> datetime:
-    """
-    Add calendar months, preserving time and timezone.
-
-    If the target month is shorter than the original day,
-    clamp to the last day of the target month.
-    """
-    if months < 0:
-        raise ValueError("months cannot be negative.")
-
-    month_index = value.month - 1 + months
-    target_year = value.year + month_index // 12
-    target_month = month_index % 12 + 1
-
-    last_day = calendar.monthrange(
-        target_year,
-        target_month,
-    )[1]
-
-    return value.replace(
-        year=target_year,
-        month=target_month,
-        day=min(value.day, last_day),
-    )
-
-
-def guard_user_state(current_user: ReadUser) -> None:
-    """Reject disabled or unverified users."""
-    if current_user.disabled:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account is suspended. Please contact support.",
-            headers={"X-Error-Code": "account_suspended"},
-        )
-
-    if not current_user.verified:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Please verify your account before continuing.",
-            headers={"X-Error-Code": "account_unverified"},
-        )
-
-
-def guard_firm_state(firm: Firm) -> None:
-    """Reject operations on a disabled firm."""
-    if firm.disabled:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                f"Firm '{firm.name}' is suspended. "
-                "Please contact admin."
-            ),
-            headers={"X-Error-Code": "firm_suspended"},
-        )
-
-
-async def require_firm_access(
-    db: AsyncSession,
-    *,
-    firm_id: int,
-    current_user: ReadUser,
-    require_active: bool = True,
-) -> Firm:
-    """
-    Load the firm, verify owner/admin access, and optionally
-    reject disabled firms.
-
-    Does not check the user's disabled/verified state.
-    Call guard_user_state separately where required.
-    """
-    try:
-        firm = await db.get(Firm, firm_id)
-    except SQLAlchemyError as exc:
-        raise _database_error("loading the firm", exc) from exc
-
-    if firm is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Firm not found.",
-        )
-
-    if (
-        not _is_admin(current_user)
-        and firm.user_id != current_user.id
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not have access to this firm.",
-            headers={"X-Error-Code": "wrong_permission"},
-        )
-
-    if require_active:
-        guard_firm_state(firm)
-
-    return firm
 
 
 
@@ -142,7 +26,8 @@ class SubscriptionPurchase(BaseModel):
     plan_id: int = Field(gt=0)
     payment_method_id: int = Field(gt=0)
 
-The frontend should generate one idempotency key per purchase attempt and reuse it when retrying that same request. It should generate a new key for a genuinely new purchase attempt
+The frontend should generate one idempotency key per purchase attempt and reuse it when retrying that 
+same request. It should generate a new key for a genuinely new purchase attempt
     
     # Client-generated UUID or similarly unique request key.
     idempotency_key: str = Field(
