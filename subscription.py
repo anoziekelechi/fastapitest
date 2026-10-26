@@ -1,9 +1,39 @@
 
-
 # api/models/subscriptions.py
 
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import (
+    Column,
+    ForeignKey,
+    Integer,
+    UniqueConstraint,
+)
+from sqlmodel import Field, Relationship
+
+from api.models.base import BaseModel
+
+
 class Subscription(BaseModel, table=True):
+    """
+    Represents a firm's access to a subscription service.
+
+    A subscription can be either a trial or a paid subscription.
+
+    Trial lifecycle:
+        is_on_trial = True
+        trial_started_at and trial_ends_at are populated.
+
+    Paid subscription lifecycle:
+        is_on_trial = False
+        subscription_started_at and subscription_ends_at are populated.
+
+    A firm can have only one subscription record per service.
+    """
+
     __tablename__ = "subscriptions"  # type: ignore
+
     __table_args__ = (
         UniqueConstraint(
             "firm_id",
@@ -12,49 +42,142 @@ class Subscription(BaseModel, table=True):
         ),
     )
 
-    # ... existing columns ...
+    # ------------------------------------------------------------------
+    # Foreign keys
+    # ------------------------------------------------------------------
 
-    firm_id: int = Field(...)
-    service_id: int = Field(...)
-    tier_id: int | None = Field(...)
-    plan_id: int | None = Field(...)
+    firm_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("firms.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
 
-    # --- NEW ---
+    service_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_services.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    tier_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_tiers.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    plan_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_plans.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Last successful payment
+    # ------------------------------------------------------------------
+
     last_payment_id: int | None = Field(
         default=None,
         sa_column=Column(
             Integer,
             ForeignKey(
                 "subscription_payments.id",
-                ondelete="SET NULL",   # if the payment row is deleted,
-                                       # the subscription survives
+                ondelete="SET NULL",
             ),
             nullable=True,
             index=True,
         ),
     )
 
-    # ... existing columns (trial_*, subscription_*, auto_renew) ...
+    # ------------------------------------------------------------------
+    # Trial fields
+    # ------------------------------------------------------------------
 
+    is_on_trial: bool = Field(
+        default=False,
+        index=True,
+    )
+
+    trial_started_at: datetime | None = Field(
+        default=None,
+        nullable=True,
+    )
+
+    trial_ends_at: datetime | None = Field(
+        default=None,
+        nullable=True,
+        index=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Subscription status
+    # ------------------------------------------------------------------
+
+    is_active: bool = Field(
+        default=True,
+        index=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Paid subscription dates
+    # ------------------------------------------------------------------
+
+    subscription_started_at: datetime | None = Field(
+        default=None,
+        nullable=True,
+    )
+
+    subscription_ends_at: datetime | None = Field(
+        default=None,
+        nullable=True,
+        index=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Renewal settings
+    # ------------------------------------------------------------------
+
+    auto_renew: bool = Field(
+        default=False,
+    )
+
+    # ------------------------------------------------------------------
     # Relationships
-    firm: Optional["Firm"] = Relationship(back_populates="subscriptions")
-    service: Optional["SubscriptionService"] = Relationship(
-        back_populates="subscriptions"
-    )
-    tier: Optional["SubscriptionTier"] = Relationship(
-        back_populates="subscriptions"
-    )
-    plan: Optional["SubscriptionPlan"] = Relationship(
-        back_populates="subscriptions"
+    # ------------------------------------------------------------------
+
+    firm: Optional["Firm"] = Relationship(
+        back_populates="subscriptions",
     )
 
-    # --- NEW ---
+    service: Optional["SubscriptionService"] = Relationship(
+        back_populates="subscriptions",
+    )
+
+    tier: Optional["SubscriptionTier"] = Relationship(
+        back_populates="subscriptions",
+    )
+
+    plan: Optional["SubscriptionPlan"] = Relationship(
+        back_populates="subscriptions",
+    )
+
     last_payment: Optional["SubscriptionPayment"] = Relationship(
         sa_relationship_kwargs={
             "foreign_keys": "[Subscription.last_payment_id]",
         },
     )
-
 
   
   
