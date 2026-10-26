@@ -1,5 +1,64 @@
 
 
+# api/models/subscriptions.py
+
+class Subscription(BaseModel, table=True):
+    __tablename__ = "subscriptions"  # type: ignore
+    __table_args__ = (
+        UniqueConstraint(
+            "firm_id",
+            "service_id",
+            name="unique_subscription_per_firm_service",
+        ),
+    )
+
+    # ... existing columns ...
+
+    firm_id: int = Field(...)
+    service_id: int = Field(...)
+    tier_id: int | None = Field(...)
+    plan_id: int | None = Field(...)
+
+    # --- NEW ---
+    last_payment_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey(
+                "subscription_payments.id",
+                ondelete="SET NULL",   # if the payment row is deleted,
+                                       # the subscription survives
+            ),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    # ... existing columns (trial_*, subscription_*, auto_renew) ...
+
+    # Relationships
+    firm: Optional["Firm"] = Relationship(back_populates="subscriptions")
+    service: Optional["SubscriptionService"] = Relationship(
+        back_populates="subscriptions"
+    )
+    tier: Optional["SubscriptionTier"] = Relationship(
+        back_populates="subscriptions"
+    )
+    plan: Optional["SubscriptionPlan"] = Relationship(
+        back_populates="subscriptions"
+    )
+
+    # --- NEW ---
+    last_payment: Optional["SubscriptionPayment"] = Relationship(
+        sa_relationship_kwargs={
+            "foreign_keys": "[Subscription.last_payment_id]",
+        },
+    )
+
+
+  
+  
+
 
 
 
