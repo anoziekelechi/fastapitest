@@ -1,3 +1,29 @@
+def _compute_subscription_read(sub: Subscription) -> SubscriptionRead:
+    remaining, label, can_access = get_subscription_status(
+        is_active=sub.is_active,
+        is_on_trial=sub.is_on_trial,
+        trial_ends_at=sub.trial_ends_at,
+        subscription_ends_at=sub.subscription_ends_at,
+    )
+
+    return SubscriptionRead.model_validate(sub).model_copy(
+        update={
+            "days_remaining": remaining,
+            "status_label": label,
+            "can_access": can_access,
+        }
+    )
+
+
+
+
+
+
+
+
+
+
+
 async def read_subscriptions_for_firm(
     firm_id: int,
     db: AsyncSession,
