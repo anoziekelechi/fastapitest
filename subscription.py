@@ -1,4 +1,735 @@
 
+class SubscriptionService(BaseModel, table=True):
+    """
+    Available subscription services stored in DB.
+    Admin adds new services here - no code changes needed.
+
+    Examples:
+        receipt → Receipt generation service
+        debtors → Debtor tracking service
+    """
+    __tablename__ = "subscription_services" # type: ignore
+
+    name: str = Field(
+        sa_column=Column(String(50), nullable=False, unique=True, index=True)
+        # e.g. "receipt", "debtors"
+    )
+    
+    service_logo_key: str | None = Field(
+    default=None,
+    sa_column=Column(String(500),nullable=True),
+    )
+    description: str = Field(
+        sa_column=Column(Text, nullable=False)
+    )
+    slug: str | None = Field(
+        default=None,
+        sa_column=Column(String(100), nullable=True, unique=True, index=True)
+    )
+    is_active: bool = Field(
+        default=True,
+        sa_column=Column(Boolean, nullable=False, server_default="true")
+    )
+    trial_days: int = Field(
+        default=30,
+        sa_column=Column(Integer, nullable=False, server_default="30")
+    )
+
+    # Relationships
+    tiers: list["SubscriptionTier"] = Relationship(
+        back_populates="service"
+    )
+    subscriptions: list["Subscription"] = Relationship(
+        back_populates="service"
+    )
+    orders: list["Order"] = Relationship(back_populates="service")
+
+
+class SubscriptionTier(BaseModel, table=True):
+    """
+    Subscription tiers per service.
+    Defines WHAT features you get.
+
+    Examples:
+        receipt service:
+            starter → basic receipts, 100/month
+            pro     → unlimited receipts, custom branding, email delivery
+
+        debtors service:
+            starter → track up to 50 debtors
+            pro     → unlimited debtors, reminders, reports
+    """
+    __tablename__ = "subscription_tiers" # type: ignore
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "service_id",
+            name="unique_tier_per_service"
+        ),
+    )
+
+    # FK to SubscriptionService
+    service_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_services.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    name: str = Field(
+        sa_column=Column(String(50), nullable=False)
+        # e.g. "starter", "pro", "enterprise"
+    )
+    slug: str | None = Field(
+        default=None,
+        sa_column=Column(String(150), nullable=True, unique=True, index=True)
+    )
+    description: str = Field(
+        sa_column=Column(Text, nullable=False)
+    )
+   
+    is_active: bool = Field(
+        default=True,
+        sa_column=Column(Boolean, nullable=False, server_default="true")
+    )
+
+    # Relationships
+    service: Optional["SubscriptionService"] = Relationship(
+        back_populates="tiers"
+    )
+    plans: list["SubscriptionPlan"] = Relationship(
+        back_populates="tier"
+    )
+    subscriptions: list["Subscription"] = Relationship(
+        back_populates="tier"
+    )
+    
+    orders: list["Order"] = Relationship(back_populates="tier")
+
+
+class SubscriptionPlan(BaseModel, table=True):
+    """
+    Subscription plans per tier.
+    Defines HOW LONG and HOW MUCH.
+
+    Examples:
+        starter tier:
+            monthly   → 30 days,  USD 5
+            quarterly → 90 days,  USD 12
+            biannual  → 180 days, USD 20
+            annual    → 365 days, USD 35
+
+        pro tier:
+            monthly   → 30 days,  USD 10
+            quarterly → 90 days,  USD 25
+            biannual  → 180 days, USD 45
+            annual    → 365 days, USD 70
+    """
+    __tablename__ = "subscription_plans" # type: ignore
+    __table_args__ = (
+        UniqueConstraint(
+            "name",
+            "tier_id",
+            name="unique_plan_per_tier"
+        ),
+        CheckConstraint(
+            "duration_months IN (1, 2, 3, 6, 12)",
+            name="ck_subscription_plan_duration_months",
+        ),
+    )
+
+    # FK to SubscriptionTier
+    tier_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_tiers.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    name: str = Field(
+        sa_column=Column(String(50), nullable=False)
+        # e.g. "monthly", "quarterly", "biannual", "annual"
+    )
+    slug: str | None = Field(
+        default=None,
+        sa_column=Column(String(200), nullable=False, unique=True, index=True)
+    )
+    description: str = Field(
+        sa_column=Column(Text, nullable=False)
+    )
+    duration_months: int = Field(
+        sa_column=Column(Integer, nullable=False),
+    )
+
+    price: Decimal = Field(
+        sa_column=Column(Numeric(precision=10, scale=2), nullable=False)
+    )
+   
+    is_active: bool = Field(
+        default=True,
+        sa_column=Column(Boolean, nullable=False, server_default="true")
+    )
+
+    # Relationships
+    tier: Optional["SubscriptionTier"] = Relationship(
+        back_populates="plans"
+    )
+    subscriptions: list["Subscription"] = Relationship(
+        back_populates="plan"
+    )
+    orders: list["Order"] =  Relationship(back_populates="plan")
+    subscription_payments:list["SubscriptionPayment"]= Relationship(back_populates="plan")
+
+
+
+class Subscription(BaseModel, table=True):
+    """
+    Represents a firm's access to a subscription service.
+
+    A subscription can be either a trial or a paid subscription.
+
+    Trial lifecycle:
+        is_on_trial = True
+        trial_started_at and trial_ends_at are populated.
+
+    Paid subscription lifecycle:
+        is_on_trial = False
+        subscription_started_at and subscription_ends_at are populated.
+
+    A firm can have only one subscription record per service.
+    """
+
+    __tablename__ = "subscriptions"  # type: ignore
+
+    __table_args__ = (
+        UniqueConstraint(
+            "firm_id",
+            "service_id",
+            name="unique_subscription_per_firm_service",
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Foreign keys
+    # ------------------------------------------------------------------
+
+    firm_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("firms.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    service_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_services.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    tier_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_tiers.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    plan_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_plans.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Last successful payment
+    # ------------------------------------------------------------------
+
+    last_payment_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey(
+                "subscription_payments.id",
+                ondelete="SET NULL",
+            ),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Trial fields
+    # ------------------------------------------------------------------
+
+    is_on_trial: bool = Field(
+        default=False,
+        index=True,
+    )
+
+    trial_started_at: datetime | None = Field(
+        default=None,
+        nullable=True,
+    )
+
+    trial_ends_at: datetime | None = Field(
+        default=None,
+        nullable=True,
+        index=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Subscription status
+    # ------------------------------------------------------------------
+
+    is_active: bool = Field(
+        default=True,
+        index=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Paid subscription dates
+    # ------------------------------------------------------------------
+
+    subscription_started_at: datetime | None = Field(
+        default=None,
+        nullable=True,
+    )
+
+    subscription_ends_at: datetime | None = Field(
+        default=None,
+        nullable=True,
+        index=True,
+    )
+
+    # ------------------------------------------------------------------
+    # Renewal settings
+    # ------------------------------------------------------------------
+
+    auto_renew: bool = Field(
+        default=False,
+    )
+
+    # ------------------------------------------------------------------
+    # Relationships
+    # ------------------------------------------------------------------
+
+    firm: Optional["Firm"] = Relationship(
+        back_populates="subscriptions",
+    )
+
+    service: Optional["SubscriptionService"] = Relationship(
+        back_populates="subscriptions",
+    )
+
+    tier: Optional["SubscriptionTier"] = Relationship(
+        back_populates="subscriptions",
+    )
+
+    plan: Optional["SubscriptionPlan"] = Relationship(
+        back_populates="subscriptions",
+    )
+
+    last_payment: Optional["SubscriptionPayment"] = Relationship(
+        sa_relationship_kwargs={
+            "foreign_keys": "[Subscription.last_payment_id]",
+        },
+    )
+
+  
+  
+
+
+
+
+
+class Order(BaseModel, table=True):
+    """
+    Represents a customer's subscription purchase.
+
+    The order records the selected service, tier, plan, duration,
+    and financial details at the time of purchase.
+
+    Typical lifecycle:
+        pending_payment -> paid
+        pending_payment -> cancelled
+        pending_payment -> expired
+    """
+
+    __tablename__ = "orders"  # type: ignore
+
+    __table_args__ = (
+        UniqueConstraint(
+            "order_number",
+            name="uq_orders_order_number",
+        ),
+        CheckConstraint(
+            "duration_months > 0",
+            name="ck_orders_duration_months_positive",
+        ),
+        CheckConstraint(
+            "amount > 0",
+            name="ck_orders_amount_positive",
+        ),
+        CheckConstraint(
+            "discount_amount >= 0",
+            name="ck_orders_discount_nonnegative",
+        ),
+        CheckConstraint(
+            "total_amount > 0",
+            name="ck_orders_total_positive",
+        ),
+        CheckConstraint(
+            "status IN ('pending_payment', 'paid', 'cancelled', 'expired')",
+            name="ck_orders_status",
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Order identification
+    # ------------------------------------------------------------------
+
+    order_number: str = Field(
+        sa_column=Column(
+            String(64),
+            nullable=False,
+            unique=True,
+            index=True,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Foreign keys
+    # ------------------------------------------------------------------
+
+    firm_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("firms.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    service_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_services.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    tier_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_tiers.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    plan_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_plans.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Purchase snapshots
+    # ------------------------------------------------------------------
+
+    service_name: str = Field(
+        sa_column=Column(
+            String(120),
+            nullable=False,
+        )
+    )
+
+    tier_name: str = Field(
+        sa_column=Column(
+            String(120),
+            nullable=False,
+        )
+    )
+
+    plan_name: str = Field(
+        sa_column=Column(
+            String(120),
+            nullable=False,
+        )
+    )
+
+    duration_months: int = Field(
+        gt=0,
+        sa_column=Column(
+            Integer,
+            nullable=False,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Financial details
+    # ------------------------------------------------------------------
+
+    amount: Decimal = Field(
+        sa_column=Column(
+            Numeric(precision=10, scale=2),
+            nullable=False,
+        )
+    )
+
+    discount_amount: Decimal = Field(
+        default=Decimal("0.00"),
+        sa_column=Column(
+            Numeric(precision=10, scale=2),
+            nullable=False,
+            default=Decimal("0.00"),
+            server_default="0.00",
+        ),
+    )
+
+    total_amount: Decimal = Field(
+        sa_column=Column(
+            Numeric(precision=10, scale=2),
+            nullable=False,
+        )
+    )
+
+    currency: str = Field(
+        default="LRD",
+        sa_column=Column(
+            String(3),
+            nullable=False,
+            server_default="LRD",
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+
+    status: str = Field(
+        default="pending_payment",
+        sa_column=Column(
+            String(30),
+            nullable=False,
+            server_default="pending_payment",
+            index=True,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Timestamps
+    # ------------------------------------------------------------------
+
+    paid_at: datetime | None = Field(
+        default=None,
+        sa_type=DateTime(timezone=True),
+        sa_column_kwargs={"nullable": True},
+    )
+
+    # ------------------------------------------------------------------
+    # Relationships
+    # ------------------------------------------------------------------
+
+    firm: Optional["Firm"] = Relationship(back_populates="orders")
+    service: Optional["SubscriptionService"] = Relationship(back_populates="orders")
+    tier: Optional["SubscriptionTier"] = Relationship(back_populates="orders")
+    plan: Optional["SubscriptionPlan"] = Relationship(back_populates="orders")
+    payments:list["SubscriptionPayment"] = Relationship(back_populates="order")
+
+
+
+
+
+
+
+
+class SubscriptionPayment(BaseModel, table=True):
+    """
+    One payment attempt for an order.
+
+    Typical lifecycle:
+        pending -> paid
+        pending -> failed
+        pending -> cancelled
+
+    A payment can remain pending while awaiting gateway confirmation
+    or reconciliation after an uncertain gateway response.
+    """
+
+    __tablename__ = "subscription_payments"  # type: ignore
+
+    __table_args__ = (
+        UniqueConstraint(
+            "firm_id",
+            "idempotency_key",
+            name="uq_subscription_payment_firm_idempotency",
+        ),
+        CheckConstraint(
+            "amount > 0",
+            name="ck_subscription_payment_amount_positive",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'paid', 'failed', 'cancelled')",
+            name="ck_subscription_payment_status",
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Relationships to existing records
+    # ------------------------------------------------------------------
+
+    firm_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("firms.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    # New: payment belongs to an order.
+    order_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("orders.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    # Retained for convenient access and compatibility with existing logic.
+    # The plan should match the plan recorded on the associated order.
+    plan_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey(
+                "subscription_plans.id",
+                ondelete="RESTRICT",
+            ),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    payment_method_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey(
+                "paymentmethods.id",
+                ondelete="RESTRICT",
+            ),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Idempotency
+    # ------------------------------------------------------------------
+
+    idempotency_key: str = Field(
+        sa_column=Column(
+            String(100),
+            nullable=False,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Payment details
+    # ------------------------------------------------------------------
+
+    amount: Decimal = Field(
+        sa_column=Column(
+            Numeric(precision=10, scale=2),
+            nullable=False,
+        )
+    )
+
+    currency: str = Field(
+        default="USD",
+        sa_column=Column(
+            String(3),
+            nullable=False,
+            server_default="USD",
+        ),
+    )
+
+    payment_reference: str = Field(
+        sa_column=Column(
+            String(100),
+            nullable=False,
+            unique=True,
+            index=True,
+        )
+    )
+
+    provider_reference: str | None = Field(
+        default=None,
+        sa_column=Column(
+            String(150),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    provider_code: str = Field(
+        sa_column=Column(
+            String(30),
+            nullable=False,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+
+    status: str = Field(
+        default="pending",
+        sa_column=Column(
+            String(20),
+            nullable=False,
+            server_default="pending",
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Timestamps
+    # ------------------------------------------------------------------
+
+    paid_at: datetime | None = Field(
+        default=None,
+        sa_type=DateTime(timezone=True),
+        sa_column_kwargs={"nullable": True},
+    )
+
+    # ------------------------------------------------------------------
+    # Relationships
+    # ------------------------------------------------------------------
+
+    firm: Optional["Firm"] = Relationship(back_populates="subscription_payments")
+    order: Optional["Order"] = Relationship(back_populates="payments")
+    plan: Optional["SubscriptionPlan"] = Relationship(back_populates="subscription_payments")
+    payment_method: Optional["PaymentMethods"] = Relationship(back_populates="subscription_payments")
 from pydantic import BaseModel, ConfigDict, Field
 
 
