@@ -1,6 +1,6 @@
 
 
-#a[i/subscriptions/helpers.py
+#api/subscriptions/helpers.py
 
 async def get_subscription_by_firm_service(
     db: AsyncSession,
