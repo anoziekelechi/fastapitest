@@ -379,4 +379,8 @@ class CheckoutView(View):
 # and OrderItem model will record user service,name,tier,plans in OrderItem model
 # only difference is that we dont need quantity                           
 
+# our add_to_cart logics will perform one more logics check if user already has same service name,tier,plans in OrderItem 
+# if True return you already has this in your cart please check it out now frontend will redirect user to checkout route
+# if Receipt starter 1 months is already in user OrderItem for firm A
+# if he tries to add it again in OrderItem for sane firm then return message service already in your cart 
 
