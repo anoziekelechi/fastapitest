@@ -396,469 +396,6 @@ async def get_firm_by_registration_number(
 
 
 
-# =============================================================================
-# FIRM — CREATE
-# =============================================================================
-async def create_firm(
-    data:FirmCreate,
-    db: AsyncSession,
-    firm_logo_key: UploadFile | None,
-    current_user: ReadUser,
-) -> dict:
-    
-    guard_user_state(current_user)
-    
-    """Create a firm. Caller must be verified and active
-    
-    - firm names are globally unique.
-    - The logo is optional and stored in Cloudflare R2.
-
-    A failed database transaction triggers rollback and best-effort
-    cleanup of the newly uploaded logo.
-    """
-
-    # ------------------------------------------------------------------
-    # 1. Check for an existing firm name
-    # ------------------------------------------------------------------
-    try:
-        result = await db.execute(
-            select(Firm).where(
-                col(Firm.name) == data.name,
-            )
-        )
-        existing = result.scalars().first()
-
-    except SQLAlchemyError as exc:
-        await db.rollback()
-
-        logger.exception(
-            "Database error checking firm name=%s",
-            data.name,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create firm. Please try again.",
-        ) from exc
-
-    if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"firm with name '{data.name}' already exists.",
-        )
-
-    # ------------------------------------------------------------------
-    # 2. Upload the optional logo
-    # ------------------------------------------------------------------
-    new_logo_key: str | None = None
-
-    if firm_logo_key is not None:
-        try:
-            new_logo_key = await handle_file_update(
-                file=firm_logo_key,
-                current_key=None,
-                prefix=PAYMENT_LOGO,
-                max_size=PAYMENT_LOGO_MAX_SIZE,
-            )
-
-            if not new_logo_key:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Failed to upload the payment logo.",
-                )
-
-        except HTTPException:
-            raise
-
-        except Exception as exc:
-            logger.exception(
-                "firm logo upload failed for name=%s",
-                data.name,
-            )
-
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to upload firm logo.",
-            ) from exc
-
-    # ------------------------------------------------------------------
-    # 3. Prepare the model
-    # ------------------------------------------------------------------
-    firm = Firm(
-        user_id=current_user.id,
-        name=data.name,
-        registration_number=data.registration_number,
-        slug=generate_slug(data.name),
-        deals_on=data.deals_on,
-        firm_logo_key=new_logo_key,
-        disabled=False,
-    )
-
-    # ------------------------------------------------------------------
-    # 4. Best-effort cleanup for a failed database transaction
-    # ------------------------------------------------------------------
-    def cleanup_new_logo() -> None:
-        if new_logo_key is None:
-            return
-
-        try:
-            delete_from_r2(new_logo_key)
-
-        except Exception:
-            logger.exception(
-                "Failed to clean up payment logo in R2: key=%s",
-                new_logo_key,
-            )
-
-    # ------------------------------------------------------------------
-    # 5. Persist the payment method
-    # ------------------------------------------------------------------
-    try:
-        db.add(firm)
-
-        await db.flush()
-        await db.refresh(firm)
-        await db.commit()
-
-    except IntegrityError as exc:
-        await db.rollback()
-        cleanup_new_logo()
-
-        logger.warning(
-            "firm creation violated a database integrity "
-            "constraint: name=%s, provider_code=%s",
-            data.name,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"firm '{data.name}' already exists "
-                "or conflicts with a database constraint."
-            ),
-        ) from exc
-
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        cleanup_new_logo()
-
-        logger.exception(
-            "Database error creating firm name=%s",
-            data.name,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create firm. Please try again.",
-        ) from exc
-
-    except Exception as exc:
-        await db.rollback()
-        cleanup_new_logo()
-
-        logger.exception(
-            "Unexpected error creating firm name=%s",
-            data.name,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create firm. Please try again.",
-        ) from exc
-
-
-    # ------------------------------------------------------------------
-    # 7. Return the response
-    # ------------------------------------------------------------------
-    return {
-        "message": f"Firm '{firm.name}' created successfully",
-        "firm": FirmRead.model_validate(firm),
-    }
-  
-
-async def read_single_firm(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> FirmRead:
-    """
-    Get a single firm by slug, with its full branch list nested
-    under `firm.branches`, sorted by `branch_no` ascending.
-
-    Access:
-        - owner of the firm
-        - any admin
-    """
-    guard_user_state(current_user)
-
-    firm = await get_firm_by_slug(db, slug)
-    if not firm:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{slug}' not found",
-        )
-    if not firm.id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{slug}' id not found",
-        )
-
-    #guard_firm_state(firm)
-    result =await require_firm_access(db=db,firm_id=firm.id,current_user=current_user)
-    fid = firm_id_of(result)
-
-    # ------------------------------------------------------------------
-    # Load branches for this firm
-    # ------------------------------------------------------------------
-    try:
-        branches_result = await db.execute(
-            select(Branch)
-            .where(col(Branch.firm_id) == fid)
-            .order_by(col(Branch.branch_no).asc())
-        )
-        branches = branches_result.scalars().all()
-    except Exception:
-        logger.exception(
-            "Failed to load branches for firm_id=%s", fid
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load firm. Please try again.",
-        )
-
-    # ------------------------------------------------------------------
-    # Count receipts for this firm (across all its branches)
-    # ------------------------------------------------------------------
-    try:
-        receipt_count: int = (
-            await db.execute(
-                select(func.count())
-                .select_from(Receipt)
-                .join(Branch, col(Receipt.branch_id) == col(Branch.id))
-                .where(col(Branch.firm_id) == fid)
-            )
-        ).scalar() or 0
-    except Exception:
-        logger.exception(
-            "Failed to count receipts for firm_id=%s", fid
-        )
-        receipt_count = 0
-
-    # ------------------------------------------------------------------
-    # Assemble
-    # ------------------------------------------------------------------
-    read = FirmRead.model_validate(result)
-    read.branches = [ 
-        BranchRead.model_validate(b) for b in branches
-    ]
-    read.branch_count = len(branches)
-    read.receipt_count = receipt_count
-
-    return read
-
-
-
-async def read_my_firms(
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> FirmListRead:
-    guard_user_state(current_user)
-
-    try:
-        result = await db.execute(
-            select(Firm)
-            .where(Firm.user_id == current_user.id)
-            .order_by(col(Firm.name))
-        )
-        firms = result.scalars().all()
-        ids = [firm_id_of(f) for f in firms]
-        branch_counts, receipt_counts = await counts_by_firm(db, ids)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception(
-            "Failed to load firms for user_id=%s", current_user.id
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load your firms. Please try again.",
-        )
-
-    reads = []
-    for firm in firms:
-        fid = firm_id_of(firm)
-        read = FirmRead.model_validate(firm)
-        read.branch_count = branch_counts.get(fid, 0)
-        read.receipt_count = receipt_counts.get(fid, 0)
-        reads.append(read)
-
-    return FirmListRead(total=len(reads), firms=reads)
-
-
-
-async def read_all_firms(
-    db: AsyncSession,
-    skip: int = 0,
-    limit: int = 100,
-) -> FirmListRead:
-    """Admin-only via route-level `AdminUser` dependency."""
-    try:
-        total: int = (
-            await db.execute(select(func.count()).select_from(Firm))
-        ).scalar() or 0
-
-        result = await db.execute(
-            select(Firm)
-            .order_by(col(Firm.name))
-            .offset(skip)
-            .limit(limit)
-        )
-        firms = result.scalars().all()
-        ids = [firm_id_of(f) for f in firms]
-        branch_counts, receipt_counts = await counts_by_firm(db, ids)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Failed to list firms")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load firms. Please try again.",
-        )
-
-    reads = []
-    for firm in firms:
-        fid = firm_id_of(firm)
-        read = FirmRead.model_validate(firm)
-        read.branch_count = branch_counts.get(fid, 0)
-        read.receipt_count = receipt_counts.get(fid, 0)
-        reads.append(read)
-
-    return FirmListRead(total=total, firms=reads)
-
-
-
-
-async def update_firm(
-    slug: str,
-    data: FirmUpdate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    guard_user_state(current_user)
-
-    firm = await get_firm_by_slug(db, slug)
-    if not firm:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{slug}' not found",
-        )
-    if not firm.id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{slug}'id  not found",
-        )
-
-    #guard_firm_state(firm)
-    result = await require_firm_access(db=db,firm_id=firm.id,current_user=current_user)
-
-    # if firm.user_id != current_user.id and not current_user.is_admin:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_403_FORBIDDEN,
-    #         detail="You can only update your own firm",
-    #         headers={"X-Error-Code": "wrong_permission"},
-    #     )
-
-    if all(v is None for v in (data.name,  data.registration_number, data.deals_on)):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided for update",
-        )
-
-    updated_fields: list[str] = []
-
-    if data.name is not None and data.name != firm.name:
-        existing = await get_firm_by_name(db, data.name)
-        if existing is not None and firm_id_of(existing) != firm_id_of(firm):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Firm name '{data.name}' is already taken",
-            )
-
-        old_slug = firm.slug
-        firm.name = data.name
-        firm.slug = generate_slug(data.name)
-        updated_fields.append("name")
-        logger.info(
-            "Firm slug updated: '%s' -> '%s'", old_slug, firm.slug
-        )
-        
-    # --- registration_number ---
-    # Only check/set when explicitly provided.
-    #
-    # Note: we do NOT allow clearing the registration number via
-    # update once it's set. If a firm has a registration number,
-    # it should stay — the number is a legal identity.
-    # To clear it, that's a support action.
-    if (
-        data.registration_number is not None
-        and data.registration_number != firm.registration_number
-        ):
-        existing_reg = await get_firm_by_registration_number(
-        db, data.registration_number
-    )
-        if (
-            existing_reg is not None
-            and firm_id_of(existing_reg) != firm_id_of(firm)
-        ):
-            raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Registration number "
-                f"'{data.registration_number}' is already "
-                f"registered"
-            ),
-        )
-
-        firm.registration_number = data.registration_number
-        updated_fields.append("registration_number")
-
-
-
-    if data.deals_on is not None and data.deals_on != firm.deals_on:
-        firm.deals_on = data.deals_on
-        updated_fields.append("deals_on")
-
-    if not updated_fields:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "No changes detected - all supplied values are "
-                "identical to the current ones"
-            ),
-        )
-
-    try:
-        db.add(firm)
-        await db.commit()
-        await db.refresh(firm)
-    except Exception:
-        await db.rollback()
-        logger.exception("Failed to update firm slug=%s", slug)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update firm profile. Please try again.",
-        )
-
-    fid = firm_id_of(firm)
-    read = FirmRead.model_validate(firm)
-    read.branch_count = await count_branches(db, fid)
-    read.receipt_count = await count_receipts(db, fid)
-
-    return {
-        "message": f"Firm '{firm.name}' updated successfully",
-        "firm": read,
-    }
-
 
 async def delete_firm(
     slug: str,
@@ -920,326 +457,436 @@ async def delete_firm(
         "branches_deleted": branches_deleted,
     }
 
-# i want my update_firm to follow this patter below
 
-
-async def update_service(
-    slug: str,
-    data: ServiceUpdate,
+async def disable_firm(
+    data: FirmAction,
     db: AsyncSession,
-    service_image: UploadFile | None = None,
+    current_user: ReadUser,
 ) -> dict:
-    """
-    Update a subscription service.
+    await has_permission(user=current_user, required_perm="manage_firms")
 
-    - Rejects an empty payload.
-    - Updates only fields that actually changed.
-    - Uploads a replacement image before touching the DB record.
-    - Deletes the new upload after a failed flush only if rollback
-      succeeds.
-    - Preserves the new upload if commit raises, because its outcome
-      may be uncertain.
-    - Deletes the old image only after a confirmed successful commit.
-
-    No IntegrityError handling is needed — this endpoint cannot violate
-    a unique constraint (name and slug are not editable here).
-    """
-
-    # ---------------------------------------------------------
-    # 1. Retrieve the existing service
-    # ---------------------------------------------------------
-    service = await get_service_by_slug(db=db, slug=slug)
-
-    # ==============================================================
-    # 2. Reject completely empty update payload
-    # ==============================================================
-    if all(
-        value is None
-        for value in (
-            data.description,
-            data.trial_days,
-            service_image,
-            data.is_active,
+    firm = await get_firm_by_name(db, data.name)
+    if firm is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{data.name}' not found",
         )
+
+    if firm.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Firm '{firm.name}' is already disabled",
+        )
+
+    firm.disabled = True
+    db.add(firm)
+    try:
+        await db.commit()
+        await db.refresh(firm)
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to disable firm name=%s", data.name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to disable firm. Please try again.",
+        )
+
+    fid = firm_id_of(firm)
+    read = FirmRead.model_validate(firm)
+    read.branch_count = await count_branches(db, fid)
+    #read.receipt_count = await count_receipts(db, fid)
+
+    return {
+        "message": f"Firm '{firm.name}' has been disabled",
+        "firm": read,
+    }
+
+
+async def enable_firm(
+    data: FirmAction,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    await has_permission(user=current_user, required_perm="manage_firms")
+
+    firm = await get_firm_by_name(db, data.name)
+    if firm is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{data.name}' not found",
+        )
+
+    if not firm.disabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Firm '{firm.name}' is already active",
+        )
+
+    firm.disabled = False
+    db.add(firm)
+    try:
+        await db.commit()
+        await db.refresh(firm)
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to enable firm name=%s", data.name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to enable firm. Please try again.",
+        )
+
+    fid = firm_id_of(firm)
+    read = FirmRead.model_validate(firm)
+    read.branch_count = await count_branches(db, fid)
+    read.receipt_count = await count_receipts(db, fid)
+
+    return {
+        "message": f"Firm '{firm.name}' has been re-activated",
+        "firm": read,
+    }
+
+# =============================================================================
+# BRANCH — CREATE
+# =============================================================================
+
+async def create_branch(
+    firm_slug: str,
+    data: BranchCreate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    guard_user_state(current_user)
+
+    firm = await get_firm_by_slug(db, firm_slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{firm_slug}' not found",
+        )
+
+    guard_firm_state(firm)
+
+    if firm.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only add branches to your own firm",
+            headers={"X-Error-Code": "wrong_permission"},
+        )
+
+    fid = firm_id_of(firm)
+
+    try:
+        existing = (
+            await db.execute(
+                select(Branch).where(
+                    col(Branch.firm_id) == fid,
+                    col(Branch.branch_no) == data.branch_no,
+                )
+            )
+        ).scalars().first()
+    except Exception:
+        logger.exception(
+            "Failed to check duplicate branch_no=%s firm_id=%s",
+            data.branch_no,
+            fid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create branch. Please try again.",
+        )
+
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Branch {data.branch_no} already exists "
+                f"for '{firm.name}'"
+            ),
+        )
+
+    branch = Branch(
+        firm_id=fid,
+        branch_no=data.branch_no, #type:ignore
+        address=data.address,
+        phone_number=data.phone_number,
+    )
+
+    try:
+        db.add(branch)
+        await db.commit()
+        await db.refresh(branch)
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "Failed to create branch for firm_id=%s", fid
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create branch. Please try again.",
+        )
+
+    logger.info(
+        "Branch %s created for firm '%s' by user_id=%s",
+        branch.branch_no,
+        firm.name,
+        current_user.id,
+    )
+
+    return {
+        "message": (
+            f"Branch {branch.branch_no} created successfully "
+            f"for '{firm.name}'"
+        ),
+        "branch": BranchRead.model_validate(branch),
+    }
+
+
+# =============================================================================
+# BRANCH — READ
+# =============================================================================
+
+async def read_branches_for_firm(
+    firm_slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> BranchListRead:
+    guard_user_state(current_user)
+
+    firm = await get_firm_by_slug(db, firm_slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{firm_slug}' not found",
+        )
+
+    result = await require_firm_access(firm_id=firm.id,current_user=current_user, db=db)
+
+  
+
+    fid = firm_id_of(result)
+
+    try:
+        result = await db.execute(
+            select(Branch)
+            .where(col(Branch.firm_id) == fid)
+            .order_by(col(Branch.branch_no))
+        )
+        branches = result.scalars().all()
+    except Exception:
+        logger.exception("Failed to load branches for firm_id=%s", fid)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load branches. Please try again.",
+        )
+
+    return BranchListRead(
+        firm_id=fid,
+        firm_name=firm.name,
+        total=len(branches),
+        branches=[BranchRead.model_validate(b) for b in branches],
+    )
+
+
+# =============================================================================
+# BRANCH — UPDATE
+# =============================================================================
+
+async def update_branch(
+    branch_id: int,
+    data: BranchUpdate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    guard_user_state(current_user)
+
+    branch = await get_branch_by_id(db, branch_id)
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Branch id={branch_id} not found",
+        )
+
+    firm = await db.get(Firm, branch.firm_id)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Firm not found for this branch",
+        )
+
+    #guard_firm_state(firm)
+    result = await require_firm_access(db=db,firm_id=firm.id,current_user=current_user)
+
+    if all(
+        v is None
+        for v in (data.branch_no, data.address, data.phone_number)
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one field must be provided for update",
         )
 
-    # ---------------------------------------------------------
-    # 3. Preserve the old image key
-    # ---------------------------------------------------------
-    old_image_key = service.service_logo_key
-    new_image_key: str | None = None
+    updated_fields: list[str] = []
 
-    # ---------------------------------------------------------
-    # 4. Upload a replacement image, if supplied
-    # ---------------------------------------------------------
-    if service_image is not None:
+    if data.branch_no is not None and data.branch_no != branch.branch_no:
         try:
-            new_image_key = await handle_file_update(
-                file=service_image,
-                current_key=None,
-                prefix=SERVICE_IMAGE,
-                max_size=SERVICE_IMAGE_MAX_SIZE,
-            )
-
-            if not new_image_key:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Failed to upload the service image.",
+            existing = (
+                await db.execute(
+                    select(Branch).where(
+                        col(Branch.firm_id) == branch.firm_id,
+                        col(Branch.branch_no) == data.branch_no,
+                        col(Branch.id) != branch_id_of(branch),
+                    )
                 )
-
-        except HTTPException:
-            raise
-
-        except Exception as exc:
+            ).scalars().first()
+        except Exception:
             logger.exception(
-                "Service image upload failed: service_id=%s",
-                service.id,
+                "Failed to check duplicate branch_no=%s", data.branch_no
             )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to upload service image.",
-            ) from exc
+                detail="Failed to update branch. Please try again.",
+            )
 
-    # ==============================================================
-    # 5. Update only fields that actually changed
-    # ==============================================================
-    updated_fields: list[str] = []
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Branch {data.branch_no} already exists "
+                    f"for '{firm.name}'"
+                ),
+            )
+#Cannot assign to attribute "branch_no" for class "Branch"
+#Cannot assign to attribute "branch_no" for class "Branch
+  #Type "int | None" is not assignable to type "str
+    branch.branch_no = data.branch_no #error 
+    updated_fields.append("branch_no")
 
-    if data.description is not None:
-        if data.description != service.description:
-            service.description = data.description
-            updated_fields.append("description")
+    if data.address is not None and data.address != branch.address:
+        branch.address = data.address
+        updated_fields.append("address")
 
-    if data.trial_days is not None:
-        if data.trial_days != service.trial_days:
-            service.trial_days = data.trial_days
-            updated_fields.append("trial_days")
+    if (
+        data.phone_number is not None
+        and data.phone_number != branch.phone_number
+    ):
+        branch.phone_number = data.phone_number
+        updated_fields.append("phone_number")
 
-    if data.is_active is not None:
-        if data.is_active != service.is_active:
-            service.is_active = data.is_active
-            updated_fields.append("is_active")
-
-    if new_image_key is not None:
-        if new_image_key != service.service_logo_key:
-            service.service_logo_key = new_image_key
-            updated_fields.append("service_logo_key")
-
-    # ==============================================================
-    # 6. Reject if nothing actually changed
-    # ==============================================================
     if not updated_fields:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No changes were made",
-        )
-
-    # ---------------------------------------------------------
-    # 7. Flush before attempting commit
-    #
-    # No IntegrityError branch — this update cannot violate a
-    # unique constraint. SQLAlchemyError and Exception cover
-    # the realistic failure modes.
-    # ---------------------------------------------------------
-    try:
-        await db.flush()
-
-    except SQLAlchemyError as exc:
-        rollback_succeeded = False
-
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after service flush error: "
-                "service_id=%s",
-                service.id,
-            )
-
-        if rollback_succeeded and new_image_key is not None:
-            try:
-                delete_from_r2(new_image_key)
-            except Exception:
-                logger.exception(
-                    "Failed to clean up replacement image after flush "
-                    "failure: service_id=%s, image_key=%s",
-                    service.id,
-                    new_image_key,
-                )
-
-        logger.exception(
-            "Database error while flushing service update: "
-            "service_id=%s, rollback_succeeded=%s",
-            service.id,
-            rollback_succeeded,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
-                "Failed to update service. "
-                "Check its state if the database could not be recovered."
+                "No changes detected - all supplied values are "
+                "identical to the current ones"
             ),
-        ) from exc
-
-    except Exception as exc:
-        rollback_succeeded = False
-
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after unexpected flush error: "
-                "service_id=%s",
-                service.id,
-            )
-
-        if rollback_succeeded and new_image_key is not None:
-            try:
-                delete_from_r2(new_image_key)
-            except Exception:
-                logger.exception(
-                    "Failed to clean up replacement image after flush "
-                    "failure: service_id=%s, image_key=%s",
-                    service.id,
-                    new_image_key,
-                )
-
-        logger.exception(
-            "Unexpected error while flushing service update: "
-            "service_id=%s, rollback_succeeded=%s",
-            service.id,
-            rollback_succeeded,
         )
 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while updating service.",
-        ) from exc
-
-    # ---------------------------------------------------------
-    # 8. Commit the transaction
-    # ---------------------------------------------------------
     try:
+        db.add(branch)
         await db.commit()
-
-    except Exception as exc:
-        # IMPORTANT:
-        # Do not delete new_image_key here.
-        #
-        # A commit exception does not prove the database rejected
-        # the transaction. The commit may have succeeded while its
-        # acknowledgement was lost.
-        #
-        # Preserve the uploaded image until the database state can
-        # be verified and any orphaned object reconciled.
-
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback attempt failed after commit error: "
-                "service_id=%s",
-                service.id,
-            )
-
+        await db.refresh(branch)
+    except Exception:
+        await db.rollback()
         logger.exception(
-            "Service commit failed or has an uncertain outcome. "
-            "Preserving replacement image for reconciliation: "
-            "service_id=%s, new_image_key=%s",
-            service.id,
-            new_image_key,
+            "Failed to update branch id=%s", branch_id
         )
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "The service update could not be confirmed. "
-                "Check its current state before retrying."
-            ),
-        ) from exc
-
-    # ---------------------------------------------------------
-    # 9. Commit succeeded: refresh and delete the old image
-    # ---------------------------------------------------------
-    try:
-        await db.refresh(service)
-    except Exception:
-        # Refresh failure after commit is not fatal — the update
-        # is already persisted. Log and continue.
-        logger.exception(
-            "Failed to refresh service after update: service_id=%s",
-            service.id,
+            detail="Failed to update branch. Please try again.",
         )
 
-    if (
-        new_image_key is not None
-        and old_image_key is not None
-        and old_image_key != new_image_key
-    ):
-        try:
-            delete_from_r2(old_image_key)
+    return {
+        "message": (
+            f"Branch {branch.branch_no} updated successfully"
+        ),
+        "branch": BranchRead.model_validate(branch),
+    }
 
-        except Exception:
-            # The database update has already succeeded.
-            # Do not report the update as failed because old-image
-            # cleanup failed; log it for later reconciliation.
-            logger.exception(
-                "Service updated, but the old image could not be "
-                "deleted: service_id=%s, old_image_key=%s",
-                service.id,
-                old_image_key,
+
+# =============================================================================
+# BRANCH — DELETE
+# =============================================================================
+
+async def delete_branch(
+    branch_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Delete a branch. Refused if the branch has issued receipts
+    (FK is RESTRICT).
+    """
+    guard_user_state(current_user)
+
+    branch = await get_branch_by_id(db, branch_id)
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Branch id={branch_id} not found",
+        )
+
+    firm = await db.get(Firm, branch.firm_id)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Firm not found for this branch",
+        )
+
+    #guard_firm_state(firm)
+    result = await require_firm_access(db=db,firm_id=firm.id,current_user=current_user)
+
+    # Refuse if receipts exist
+    try:
+        receipt_count: int = (
+            await db.execute(
+                select(func.count())
+                .select_from(Receipt)
+                .where(col(Receipt.branch_id) == branch_id)
             )
+        ).scalar() or 0
+    except Exception:
+        logger.exception(
+            "Failed to count receipts for branch_id=%s", branch_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete branch. Please try again.",
+        )
 
-    # ---------------------------------------------------------
-    # 10. Return the updated service
-    # ---------------------------------------------------------
+    if receipt_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Branch {branch.branch_no} has {receipt_count} "
+                f"{'receipt' if receipt_count == 1 else 'receipts'}. "
+                f"Delete or transfer them before removing the branch."
+            ),
+        )
+
+    branch_no = branch.branch_no
+
+    try:
+        await db.delete(branch)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to delete branch id=%s", branch_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete branch. Please try again.",
+        )
+
     logger.info(
-        "Service updated successfully: service_id=%s, fields=%s",
-        service.id,
-        ",".join(updated_fields),
+        "Branch %s (firm '%s') deleted by user_id=%s",
+        branch_no,
+        firm.name,
+        current_user.id,
     )
 
     return {
-        "message": "Service updated successfully.",
-        "service": to_service_read(service),
-        }
-
-"""
-then i want read_my_firms to returns only firms with branch count
-eg abc and sons -> branches 12,abx ltd -> branches 10
-
-iwant read_single_firm to returns all braches associated with a firm slug and receipt counts
-eg abc and sons slugs will return Branch no 1,No 12 old rd gra -> 1200 receipts
+        "message": f"Branch {branch_no} deleted successfully"
+}
 
 
-"""
-    
 
-        @router.post(
-    "/add/firm",
-    response_model=CreateFirmResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a firm (authenticated)",
-)
-async def create(
-    db: DBDep,
-    current_user: CurrentUser,
-    name: str = Form(...),
-    deals_on: Annotated[str | None, Form(max_length=1200)] = None,
-    registration_number: Annotated[str | None, Form(max_length=1200)] = None,
-    firm_logo_key: UploadFile | None = File(None),
-    ):
-    data = FirmCreate(name=name,deals_on=deals_on)
-    
-    return await create_firm(
-        data=data, db=db, current_user=current_user
-    )
-      #also this my crate_firm routes a
-   
+
