@@ -1,3 +1,152 @@
+
+def to_payment_method_read(method: PaymentMethods) -> PaymentMethodRead:
+    """Build a PaymentMethodRead with the logo URL resolved from its key."""
+    read = PaymentMethodRead.model_validate(method)
+    return read.model_copy(
+        update={
+            "payment_logo_url": (
+                get_public_url(method.payment_logo_key)
+                if method.payment_logo_key
+                else None
+            ),
+        }
+    )
+
+
+
+# =============================================================================
+# READ — ALL
+# ADMIN ONLY — ACTIVE AND INACTIVE PAYMENT METHODS
+# =============================================================================
+
+async def read_all_payment_methods(
+    db: AsyncSession,
+    skip: int = 0,
+    limit: int = 100,
+) -> AvailablePaymentMethodsRead:
+    """
+    Return all payment methods, including active and inactive methods.
+
+    Admin access is enforced by the route's AdminUser dependency.
+    """
+
+    try:
+        total: int = (
+            await db.execute(
+                select(func.count()).select_from(
+                    PaymentMethods
+                )
+            )
+        ).scalar_one()
+
+        result = await db.execute(
+            select(PaymentMethods)
+            .order_by(
+                col(PaymentMethods.name)
+            )
+            .offset(skip)
+            .limit(limit)
+        )
+
+        methods = result.scalars().all()
+
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to list all payment methods"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load payment methods. Please try again.",
+        ) from exc
+
+    return AvailablePaymentMethodsRead(
+        total=total,
+        methods=[
+            to_payment_method_read(method)
+            for method in methods
+        ],
+    )
+
+
+# =============================================================================
+# READ — AVAILABLE
+# PUBLIC — ACTIVE PAYMENT METHODS ONLY
+# =============================================================================
+
+async def read_available_payment_methods(
+    db: AsyncSession,
+) -> AvailablePaymentMethodsRead:
+    """
+    Return active payment methods for the public frontend.
+
+    Used by the public 'We accept' widget.
+
+    Inactive methods remain in the database and are visible to admins,
+    but are not returned to public customers.
+    """
+
+    try:
+        result = await db.execute(
+            select(PaymentMethods)
+            .where(
+                col(PaymentMethods.is_active).is_(True)
+            )
+            .order_by(
+                col(PaymentMethods.name)
+            )
+        )
+
+        methods = result.scalars().all()
+
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to load available payment methods"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load payment methods. Please try again.",
+        ) from exc
+
+    return AvailablePaymentMethodsRead(
+        total=len(methods),
+        methods=[
+            to_payment_method_read(method)
+            for method in methods
+        ],
+    )
+
+
+
+
+
+# =============================================================================
+# READ — single (admin only)
+# =============================================================================
+
+async def read_single_payment_method(
+    slug: str,
+    db: AsyncSession,
+) -> PaymentMethodRead:
+    """Get a single payment method by slug. Admin-only via route."""
+    method = await get_payment_by_slug(db, slug)
+    if not method:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Payment method '{slug}' not found",
+        )
+    return to_payment_method_read(method)
+
+
+
+
+
+
+
+
+
+#updated
 async def receipt_counts_by_branch(
     db: AsyncSession,
     branch_ids: list[int],
