@@ -1,175 +1,375 @@
+"""Generic media URL resolution for storage keys."""
 
-def to_payment_method_read(method: PaymentMethods) -> PaymentMethodRead:
-    """Build a PaymentMethodRead with the logo URL resolved from its key."""
-    read = PaymentMethodRead.model_validate(method)
-    return read.model_copy(
-        update={
-            "payment_logo_url": (
-                get_public_url(method.payment_logo_key)
-                if method.payment_logo_key
-                else None
-            ),
-        }
+from api.core.storage import get_public_url  # your existing R2 helper
+
+
+def resolve_logo_url(key: str | None) -> str | None:
+    """
+    Turn a storage key into a public URL.
+
+    Returns None if the key is None or empty, so callers never
+    have to branch on truthiness.
+
+    Example:
+        resolve_logo_url("firms/42/abc-business-9f8e7d.png")
+        # -> "https://cdn.yourapp.com/firms/42/abc-business-9f8e7d.png"
+
+        resolve_logo_url(None)
+        # -> None
+    """
+    if not key:
+        return None
+    return get_public_url(key)
+
+
+
+
+"""Firm & Branch schemas."""
+
+import re
+from decimal import Decimal
+from datetime import datetime
+from typing import Literal, Self
+
+from pydantic_core.core_schema import FieldValidationInfo
+
+from pydantic import (
+    BaseModel,
+    EmailStr,
+    Field,
+    ConfigDict,
+    field_validator,
+    model_validator,
+)
+
+from api.core.validators import (
+    normalize_email,
+    normalize_firm_name,
+    validate_local_phone,
+    sanitize_alphanumeric_text_only,
+    normalize_user_message,
+    normalize_payment_option,
+)
+
+
+# =============================================================================
+# FIRM — REQUEST
+# =============================================================================
+
+class FirmCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=2, max_length=200)
+    registration_number: str | None = Field(
+        default=None, min_length=2, max_length=50,
+    )
+    deals_on: str = Field(..., min_length=10, max_length=2000)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_firm_name(cls, v: str) -> str:
+        return normalize_firm_name(v)
+
+    @field_validator("deals_on", mode="before")
+    @classmethod
+    def validate_deal_on_fields(
+        cls, v: str, info: FieldValidationInfo,
+    ) -> str:
+        raw_name = info.field_name or "field"
+        display_name = raw_name.replace("_", " ").capitalize()
+        return normalize_user_message(v, field_name=display_name)
+
+
+class FirmUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(None, min_length=2, max_length=200)
+    registration_number: str | None = Field(
+        default=None, min_length=2, max_length=50,
+    )
+    deals_on: str | None = Field(None, min_length=10, max_length=2000)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_firmname(cls, v: str | None) -> str | None:
+        return normalize_firm_name(v) if v else None
+
+    @field_validator("deals_on", mode="before")
+    @classmethod
+    def validate_deal_on_fields(
+        cls, v: str | None, info: FieldValidationInfo,
+    ) -> str | None:
+        if v is None:
+            return None
+        raw_name = info.field_name or "field"
+        display_name = raw_name.replace("_", " ").capitalize()
+        return normalize_user_message(v, field_name=display_name)
+
+
+class FirmAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=2, max_length=200)
+
+
+# =============================================================================
+# BRANCH — REQUEST
+# =============================================================================
+
+class BranchCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    branch_no: int = Field(..., gt=0)
+    address: str = Field(..., min_length=5, max_length=500)
+    phone_number: str
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def validate_address(cls, v: str) -> str:
+        return sanitize_alphanumeric_text_only(v)
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        return validate_local_phone(v)
+
+
+class BranchUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    branch_no: int | None = Field(None, gt=0)
+    address: str | None = Field(None, min_length=5, max_length=500)
+    phone_number: str | None = None
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def validate_address(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return sanitize_alphanumeric_text_only(v)
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def validate_phone(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return validate_local_phone(v)
+
+
+# =============================================================================
+# BRANCH — READ
+# =============================================================================
+
+class BranchRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    firm_id: int
+    branch_no: int
+    address: str
+    phone_number: str
+    created_at: datetime
+    updated_at: datetime
+
+    receipt_count: int = 0
+
+
+class BranchListRead(BaseModel):
+    firm_id: int
+    firm_name: str
+    total: int
+    branches: list[BranchRead]
+
+
+# =============================================================================
+# FIRM — READ
+#
+# `firm_logo_url` is exposed; `firm_logo_key` is internal and never
+# leaves the backend. The builder populates the URL from the key.
+# =============================================================================
+
+class FirmListItem(BaseModel):
+    """
+    Firm summary row for list endpoints.
+
+    No `firm_logo_key` — internal. No `receipt_count` — not computed
+    in list views.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    name: str
+    registration_number: str | None = None
+    slug: str | None = None
+    deals_on: str
+    disabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+    branch_count: int = 0
+    firm_logo_url: str | None = None
+
+
+class FirmListRead(BaseModel):
+    total: int
+    firms: list[FirmListItem]
+
+
+class FirmRead(BaseModel):
+    """
+    Full firm detail.
+
+    No `firm_logo_key` — internal. `firm_logo_url` is populated by
+    the builder. `branches[]` is populated only by read_single_firm.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    name: str
+    registration_number: str | None = None
+    slug: str | None = None
+    deals_on: str
+    disabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+    branch_count: int = 0
+    receipt_count: int = 0
+    branches: list[BranchRead] = []
+    firm_logo_url: str | None = None
+
+
+# =============================================================================
+# RESPONSE ENVELOPES
+# =============================================================================
+
+class CreateFirmResponse(BaseModel):
+    message: str
+    firm: FirmRead
+
+
+class UpdateFirmResponse(BaseModel):
+    message: str
+    firm: FirmRead
+
+
+class FirmAdminActionResponse(BaseModel):
+    message: str
+    firm: FirmRead
+
+
+class DeleteFirmResponse(BaseModel):
+    message: str
+    receipts_deleted: int
+    branches_deleted: int
+
+
+class CreateBranchResponse(BaseModel):
+    message: str
+    branch: BranchRead
+
+
+class UpdateBranchResponse(BaseModel):
+    message: str
+    branch: BranchRead
+
+
+class DeleteBranchResponse(BaseModel):
+    message: str
+    branch_no: int
+
+
+
+
+# =============================================================================
+# BUILDERS — single source of truth for read-shape assembly
+# =============================================================================
+
+def to_branch_read(
+    branch: Branch,
+    *,
+    receipt_count: int = 0,
+) -> BranchRead:
+    """Assemble a BranchRead with its receipt counter."""
+    read = BranchRead.model_validate(branch)
+    read.receipt_count = receipt_count
+    return read
+
+
+def to_branch_list(
+    firm: Firm,
+    branches: Sequence[Branch],
+    receipt_counts: Mapping[int, int],
+) -> BranchListRead:
+    """Assemble the branch-list envelope for a firm."""
+    items = [
+        to_branch_read(b, receipt_count=receipt_counts.get(b.id, 0))
+        for b in branches
+    ]
+    return BranchListRead(
+        firm_id=firm.id,
+        firm_name=firm.name,
+        total=len(items),
+        branches=items,
     )
 
 
+def to_firm_list_item(
+    firm: Firm,
+    *,
+    branch_count: int = 0,
+) -> FirmListItem:
+    """Assemble a FirmListItem (branch count only, logo URL resolved)."""
+    item = FirmListItem.model_validate(firm)
+    item.branch_count = branch_count
+    item.firm_logo_url = resolve_logo_url(firm.firm_logo_key)
+    return item
 
-# =============================================================================
-# READ — ALL
-# ADMIN ONLY — ACTIVE AND INACTIVE PAYMENT METHODS
-# =============================================================================
 
-async def read_all_payment_methods(
-    db: AsyncSession,
-    skip: int = 0,
-    limit: int = 100,
-) -> AvailablePaymentMethodsRead:
-    """
-    Return all payment methods, including active and inactive methods.
-
-    Admin access is enforced by the route's AdminUser dependency.
-    """
-
-    try:
-        total: int = (
-            await db.execute(
-                select(func.count()).select_from(
-                    PaymentMethods
-                )
-            )
-        ).scalar_one()
-
-        result = await db.execute(
-            select(PaymentMethods)
-            .order_by(
-                col(PaymentMethods.name)
-            )
-            .offset(skip)
-            .limit(limit)
-        )
-
-        methods = result.scalars().all()
-
-    except SQLAlchemyError as exc:
-        logger.exception(
-            "Failed to list all payment methods"
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load payment methods. Please try again.",
-        ) from exc
-
-    return AvailablePaymentMethodsRead(
-        total=total,
-        methods=[
-            to_payment_method_read(method)
-            for method in methods
-        ],
+def to_firm_list(
+    firms: Sequence[Firm],
+    branch_counts: Mapping[int, int],
+    *,
+    total: int | None = None,
+) -> FirmListRead:
+    """Assemble the firms-list envelope."""
+    items = [
+        to_firm_list_item(f, branch_count=branch_counts.get(f.id, 0))
+        for f in firms
+    ]
+    return FirmListRead(
+        total=total if total is not None else len(items),
+        firms=items,
     )
 
 
-# =============================================================================
-# READ — AVAILABLE
-# PUBLIC — ACTIVE PAYMENT METHODS ONLY
-# =============================================================================
-
-async def read_available_payment_methods(
-    db: AsyncSession,
-) -> AvailablePaymentMethodsRead:
+def to_firm_detail(
+    firm: Firm,
+    branches: Sequence[Branch] = (),
+    receipt_counts: Mapping[int, int] | None = None,
+) -> FirmRead:
     """
-    Return active payment methods for the public frontend.
+    Assemble the full FirmRead.
 
-    Used by the public 'We accept' widget.
-
-    Inactive methods remain in the database and are visible to admins,
-    but are not returned to public customers.
+    `branches` and `receipt_counts` are optional so that
+    create/update/disable/enable can reuse this builder without
+    loading branches.
     """
+    receipt_counts = receipt_counts or {}
 
-    try:
-        result = await db.execute(
-            select(PaymentMethods)
-            .where(
-                col(PaymentMethods.is_active).is_(True)
-            )
-            .order_by(
-                col(PaymentMethods.name)
-            )
-        )
+    branch_reads = [
+        to_branch_read(b, receipt_count=receipt_counts.get(b.id, 0))
+        for b in branches
+    ]
 
-        methods = result.scalars().all()
-
-    except SQLAlchemyError as exc:
-        logger.exception(
-            "Failed to load available payment methods"
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load payment methods. Please try again.",
-        ) from exc
-
-    return AvailablePaymentMethodsRead(
-        total=len(methods),
-        methods=[
-            to_payment_method_read(method)
-            for method in methods
-        ],
-    )
-
-
-
-
-
-# =============================================================================
-# READ — single (admin only)
-# =============================================================================
-
-async def read_single_payment_method(
-    slug: str,
-    db: AsyncSession,
-) -> PaymentMethodRead:
-    """Get a single payment method by slug. Admin-only via route."""
-    method = await get_payment_by_slug(db, slug)
-    if not method:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Payment method '{slug}' not found",
-        )
-    return to_payment_method_read(method)
-
-
-
-
-
-
-
-
-
-#updated
-async def receipt_counts_by_branch(
-    db: AsyncSession,
-    branch_ids: list[int],
-) -> dict[int, int]:
-    """Batch receipt counts for many branches in one query."""
-    if not branch_ids:
-        return {}
-
-    try:
-        result = await db.execute(
-            select(Receipt.branch_id, func.count())
-            .where(col(Receipt.branch_id).in_(branch_ids))
-            .group_by(col(Receipt.branch_id))
-        )
-        return {row[0]: int(row[1]) for row in result.all()}
-    except Exception:
-        logger.exception(
-            "Failed to batch-count receipts for %s branches",
-            len(branch_ids),
-        )
-        return {}
-
-
+    read = FirmRead.model_validate(firm)
+    read.branches = branch_reads
+    read.branch_count = len(branch_reads)
+    read.receipt_count = sum(br.receipt_count for br in branch_reads)
+    read.firm_logo_url = resolve_logo_url(firm.firm_logo_key)
+    return read
 
 
 
@@ -180,11 +380,12 @@ async def read_single_firm(
     current_user: ReadUser,
 ) -> FirmRead:
     """
-    Full firm detail with nested branches. Each branch carries its
-    own receipt_count; the firm carries aggregate totals.
+    Full firm detail: firm fields, resolved logo URL, nested branches
+    (each with its own receipt_count), and aggregate counters.
     """
     guard_user_state(current_user)
 
+    # 1. Resolve the firm
     firm = await get_firm_by_slug(db, slug)
     if not firm:
         raise HTTPException(
@@ -197,6 +398,7 @@ async def read_single_firm(
         db=db, firm_id=fid, current_user=current_user,
     )
 
+    # 2. Load branches
     try:
         branches_result = await db.execute(
             select(Branch)
@@ -213,24 +415,49 @@ async def read_single_firm(
             detail="Failed to load firm. Please try again.",
         )
 
+    # 3. Batch receipt counts per branch
     branch_ids = [branch_id_of(b) for b in branches]
     receipt_counts = await receipt_counts_by_branch(db, branch_ids)
 
-    branch_reads: list[BranchRead] = []
-    for b in branches:
-        bid = branch_id_of(b)
-        br = BranchRead.model_validate(b)
-        br.receipt_count = receipt_counts.get(bid, 0)
-        branch_reads.append(br)
+    # 4. Assemble via builder
+    return to_firm_detail(firm, branches, receipt_counts)
 
-    total_receipts = sum(br.receipt_count for br in branch_reads)
 
-    read = FirmRead.model_validate(firm)
-    read.branches = branch_reads
-    read.branch_count = len(branch_reads)
-    read.receipt_count = total_receipts
 
-    return read
+async def read_my_firms(
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> FirmListRead:
+    """
+    List current user's firms with branch_count and firm_logo_url.
+
+    No receipt counts — the list contract intentionally omits them.
+    """
+    guard_user_state(current_user)
+
+    try:
+        result = await db.execute(
+            select(Firm)
+            .where(Firm.user_id == current_user.id)
+            .order_by(col(Firm.name))
+        )
+        firms = list(result.scalars().all())
+        ids = [firm_id_of(f) for f in firms]
+        branch_counts, _ = await counts_by_firm(db, ids)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "Failed to load firms for user_id=%s", current_user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load your firms. Please try again.",
+        )
+
+    return to_firm_list(firms, branch_counts)
+
+
 
 
 
@@ -251,7 +478,7 @@ async def read_all_firms(
             .offset(skip)
             .limit(limit)
         )
-        firms = result.scalars().all()
+        firms = list(result.scalars().all())
         ids = [firm_id_of(f) for f in firms]
         branch_counts, _ = await counts_by_firm(db, ids)
     except HTTPException:
@@ -263,59 +490,7 @@ async def read_all_firms(
             detail="Failed to load firms. Please try again.",
         )
 
-    items: list[FirmListItem] = []
-    for firm in firms:
-        fid = firm_id_of(firm)
-        item = FirmListItem.model_validate(firm)
-        item.branch_count = branch_counts.get(fid, 0)
-        items.append(item)
-
-    return FirmListRead(total=total, firms=items)
-
-
-
-
-async def read_my_firms(
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> FirmListRead:
-    """
-    List the current user's firms, each with its branch count.
-
-    Returns FirmListRead → each FirmListItem has branch_count but
-    NOT receipt_count. Receipt totals live on FirmRead, which is
-    only returned by read_single_firm where they're actually computed.
-    """
-    guard_user_state(current_user)
-
-    try:
-        result = await db.execute(
-            select(Firm)
-            .where(Firm.user_id == current_user.id)
-            .order_by(col(Firm.name))
-        )
-        firms = result.scalars().all()
-        ids = [firm_id_of(f) for f in firms]
-        branch_counts, _ = await counts_by_firm(db, ids)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception(
-            "Failed to load firms for user_id=%s", current_user.id,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load your firms. Please try again.",
-        )
-
-    items: list[FirmListItem] = []
-    for firm in firms:
-        fid = firm_id_of(firm)
-        item = FirmListItem.model_validate(firm)
-        item.branch_count = branch_counts.get(fid, 0)
-        items.append(item)
-
-    return FirmListRead(total=len(items), firms=items)
+    return to_firm_list(firms, branch_counts, total=total)
 
 
 
@@ -648,1214 +823,6 @@ async def remove_branch(
 
 
 
-
-
-"""Firm & Branch schemas."""
-
-import re
-from decimal import Decimal
-from datetime import datetime
-from typing import Literal, Self
-
-from pydantic_core.core_schema import FieldValidationInfo
-
-from pydantic import (
-    BaseModel,
-    EmailStr,
-    Field,
-    ConfigDict,
-    field_validator,
-    model_validator,
-)
-
-from api.core.validators import (
-    normalize_email,
-    normalize_firm_name,
-    validate_local_phone,
-    sanitize_alphanumeric_text_only,
-    normalize_user_message,
-    normalize_payment_option,
-)
-
-
-# =============================================================================
-# FIRM — REQUEST
-# =============================================================================
-
-class FirmCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(..., min_length=2, max_length=200)
-    registration_number: str | None = Field(
-        default=None, min_length=2, max_length=50,
-    )
-    deals_on: str = Field(..., min_length=10, max_length=2000)
-
-    @field_validator("name", mode="before")
-    @classmethod
-    def validate_firm_name(cls, v: str) -> str:
-        return normalize_firm_name(v)
-
-    @field_validator("deals_on", mode="before")
-    @classmethod
-    def validate_deal_on_fields(
-        cls, v: str, info: FieldValidationInfo,
-    ) -> str:
-        raw_name = info.field_name or "field"
-        display_name = raw_name.replace("_", " ").capitalize()
-        return normalize_user_message(v, field_name=display_name)
-
-
-class FirmUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str | None = Field(None, min_length=2, max_length=200)
-    registration_number: str | None = Field(
-        default=None, min_length=2, max_length=50,
-    )
-    deals_on: str | None = Field(None, min_length=10, max_length=2000)
-
-    @field_validator("name", mode="before")
-    @classmethod
-    def validate_firmname(cls, v: str | None) -> str | None:
-        return normalize_firm_name(v) if v else None
-
-    @field_validator("deals_on", mode="before")
-    @classmethod
-    def validate_deal_on_fields(
-        cls, v: str | None, info: FieldValidationInfo,
-    ) -> str | None:
-        if v is None:
-            return None
-        raw_name = info.field_name or "field"
-        display_name = raw_name.replace("_", " ").capitalize()
-        return normalize_user_message(v, field_name=display_name)
-
-
-class FirmAction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(..., min_length=2, max_length=200)
-
-
-# =============================================================================
-# BRANCH — REQUEST
-# =============================================================================
-
-class BranchCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    branch_no: int = Field(..., gt=0)
-    address: str = Field(..., min_length=5, max_length=500)
-    phone_number: str
-
-    @field_validator("address", mode="before")
-    @classmethod
-    def validate_address(cls, v: str) -> str:
-        return sanitize_alphanumeric_text_only(v)
-
-    @field_validator("phone_number", mode="before")
-    @classmethod
-    def validate_phone(cls, v: str) -> str:
-        return validate_local_phone(v)
-
-
-class BranchUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    branch_no: int | None = Field(None, gt=0)
-    address: str | None = Field(None, min_length=5, max_length=500)
-    phone_number: str | None = None
-
-    @field_validator("address", mode="before")
-    @classmethod
-    def validate_address(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        return sanitize_alphanumeric_text_only(v)
-
-    @field_validator("phone_number", mode="before")
-    @classmethod
-    def validate_phone(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        return validate_local_phone(v)
-
-
-# =============================================================================
-# BRANCH — READ
-# =============================================================================
-
-class BranchRead(BaseModel):
-    """
-    A single branch, as returned wherever a branch appears.
-
-    `receipt_count` is 0 by default and populated by read endpoints
-    that query receipts. Create/update endpoints also return it so
-    the shape is stable across all branch responses.
-    """
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    firm_id: int
-    branch_no: int
-    address: str
-    phone_number: str
-    created_at: datetime
-    updated_at: datetime
-
-    receipt_count: int = 0
-
-
-class BranchListRead(BaseModel):
-    """All branches for a single firm, sorted by branch_no."""
-
-    firm_id: int
-    firm_name: str
-    total: int
-    branches: list[BranchRead]
-
-
-# =============================================================================
-# FIRM — READ
-#
-# Two shapes on purpose:
-#   - FirmListItem: used by list endpoints. Branch count only.
-#     No receipt_count, no branches. This is the frontend contract
-#     for a *summary* view.
-#   - FirmRead:     used by detail endpoints. Full firm + nested
-#     branches (each with its own receipt_count) + aggregate counters.
-#
-# Splitting them keeps list responses honest: the frontend cannot
-# accidentally read `receipt_count` off a list row because the field
-# does not exist.
-# =============================================================================
-
-class FirmListItem(BaseModel):
-    """
-    Firm summary row for list endpoints.
-
-    Example:
-        { "name": "abc business", "branch_count": 5, ... }
-    """
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    user_id: int
-    name: str
-    registration_number: str | None = None
-    slug: str | None = None
-    deals_on: str
-    firm_logo_key: str | None = None
-    disabled: bool
-    created_at: datetime
-    updated_at: datetime
-
-    # Only the branch count — a list row never carries receipt data.
-    branch_count: int = 0
-
-
-class FirmListRead(BaseModel):
-    total: int
-    firms: list[FirmListItem]
-
-
-class FirmRead(BaseModel):
-    """
-    Full firm detail.
-
-    `branches` is populated by read_single_firm. `branch_count` and
-    `receipt_count` are aggregate totals across all branches.
-    """
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    user_id: int
-    name: str
-    registration_number: str | None = None
-    slug: str | None = None
-    deals_on: str
-    firm_logo_key: str | None = None
-    disabled: bool
-    created_at: datetime
-    updated_at: datetime
-
-    # Aggregate counters (across all branches).
-    branch_count: int = 0
-    receipt_count: int = 0
-
-    # Nested branches — populated only by read_single_firm.
-    branches: list[BranchRead] = []
-
-
-# =============================================================================
-# RESPONSE ENVELOPES
-# =============================================================================
-
-class CreateFirmResponse(BaseModel):
-    message: str
-    firm: FirmRead
-
-
-class UpdateFirmResponse(BaseModel):
-    message: str
-    firm: FirmRead
-
-
-class FirmAdminActionResponse(BaseModel):
-    message: str
-    firm: FirmRead
-
-
-class DeleteFirmResponse(BaseModel):
-    message: str
-    receipts_deleted: int
-    branches_deleted: int
-
-
-class CreateBranchResponse(BaseModel):
-    message: str
-    branch: BranchRead
-
-
-class UpdateBranchResponse(BaseModel):
-    message: str
-    branch: BranchRead
-
-
-class DeleteBranchResponse(BaseModel):
-    message: str
-    branch_no: int
-
-
-
-async def disable_firm(
-    data: FirmAction,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    await has_permission(user=current_user, required_perm="manage_firms")
-
-    firm = await get_firm_by_name(db, data.name)
-    if firm is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{data.name}' not found",
-        )
-
-    if firm.disabled:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Firm '{firm.name}' is already disabled",
-        )
-
-    fid = firm_id_of(firm)
-    firm.disabled = True
-
-    try:
-        await db.flush()
-    except SQLAlchemyError as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback failed after disable flush error: firm_id=%s",
-                fid,
-            )
-        logger.exception(
-            "Database error while disabling firm: firm_id=%s", fid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to disable firm. Please try again.",
-        ) from exc
-
-    try:
-        await db.commit()
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback attempt failed after disable commit error: "
-                "firm_id=%s", fid,
-            )
-        logger.exception(
-            "Disable commit failed or has an uncertain outcome: "
-            "firm_id=%s", fid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "The firm could not be disabled. "
-                "Check its current state before retrying."
-            ),
-        ) from exc
-
-    try:
-        await db.refresh(firm)
-    except Exception:
-        logger.exception(
-            "Failed to refresh firm after disable: firm_id=%s", fid,
-        )
-
-    read = FirmRead.model_validate(firm)
-    read.branch_count = await count_branches(db, fid)
-    read.receipt_count = await count_receipts(db, fid)
-
-    return {
-        "message": f"Firm '{firm.name}' has been disabled",
-        "firm": read,
-    }
-
-
-async def enable_firm(
-    data: FirmAction,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    await has_permission(user=current_user, required_perm="manage_firms")
-
-    firm = await get_firm_by_name(db, data.name)
-    if firm is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{data.name}' not found",
-        )
-
-    if not firm.disabled:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Firm '{firm.name}' is already active",
-        )
-
-    fid = firm_id_of(firm)
-    firm.disabled = False
-
-    try:
-        await db.flush()
-    except SQLAlchemyError as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback failed after enable flush error: firm_id=%s",
-                fid,
-            )
-        logger.exception(
-            "Database error while enabling firm: firm_id=%s", fid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to enable firm. Please try again.",
-        ) from exc
-
-    try:
-        await db.commit()
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback attempt failed after enable commit error: "
-                "firm_id=%s", fid,
-            )
-        logger.exception(
-            "Enable commit failed or has an uncertain outcome: "
-            "firm_id=%s", fid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "The firm could not be enabled. "
-                "Check its current state before retrying."
-            ),
-        ) from exc
-
-    try:
-        await db.refresh(firm)
-    except Exception:
-        logger.exception(
-            "Failed to refresh firm after enable: firm_id=%s", fid,
-        )
-
-    read = FirmRead.model_validate(firm)
-    read.branch_count = await count_branches(db, fid)
-    read.receipt_count = await count_receipts(db, fid)
-
-    return {
-        "message": f"Firm '{firm.name}' has been re-activated",
-        "firm": read,
-    }
-
-
-
-async def delete_branch(
-    branch_id: int,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Delete a branch.
-
-    - Refused if the branch has issued receipts (FK is RESTRICT).
-    - The receipt count is checked explicitly for a friendly error,
-      but the DB FK remains the authoritative guard against a
-      concurrent insert between the count and the delete. That
-      race shows up as an IntegrityError at flush time.
-    """
-
-    guard_user_state(current_user)
-
-    # ------------------------------------------------------------------
-    # 1. Resolve the branch
-    # ------------------------------------------------------------------
-    branch = await get_branch_by_id(db, branch_id)
-    if branch is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Branch id={branch_id} not found",
-        )
-
-    bid = branch_id_of(branch)
-    fid = branch.firm_id
-
-    # ------------------------------------------------------------------
-    # 2. Enforce access via the firm
-    # ------------------------------------------------------------------
-    firm = await db.get(Firm, fid)
-    if firm is None:
-        logger.error(
-            "Branch %s references missing firm_id=%s", bid, fid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Firm not found for this branch",
-        )
-
-    firm = await require_firm_access(
-        db=db, firm_id=fid, current_user=current_user,
-    )
-
-    # ------------------------------------------------------------------
-    # 3. Refuse if receipts exist (friendly pre-check)
-    # ------------------------------------------------------------------
-    receipt_count = await count_receipts_for_branch(db, bid)
-    if receipt_count > 0:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Branch {branch.branch_no} has {receipt_count} "
-                f"{'receipt' if receipt_count == 1 else 'receipts'}. "
-                f"Delete or transfer them before removing the branch."
-            ),
-        )
-
-    branch_no = branch.branch_no
-
-    # ------------------------------------------------------------------
-    # 4. Stage the delete and flush
-    #
-    # IntegrityError at flush time = a receipt was inserted
-    # concurrently after step 3. The DB RESTRICT FK rejects the
-    # delete, which is the correct behavior.
-    # ------------------------------------------------------------------
-    try:
-        await db.delete(branch)
-        await db.flush()
-
-    except IntegrityError as exc:
-        rollback_succeeded = False
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after branch IntegrityError: "
-                "branch_id=%s", bid,
-            )
-
-        logger.warning(
-            "Branch delete blocked by FK constraint: branch_id=%s, "
-            "rollback_succeeded=%s",
-            bid, rollback_succeeded,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Branch {branch_no} now has receipts and cannot "
-                f"be deleted. Refresh and try again."
-            ),
-        ) from exc
-
-    except SQLAlchemyError as exc:
-        rollback_succeeded = False
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after branch delete flush error: "
-                "branch_id=%s", bid,
-            )
-
-        logger.exception(
-            "Database error while flushing branch delete: "
-            "branch_id=%s, rollback_succeeded=%s",
-            bid, rollback_succeeded,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Failed to delete branch. "
-                "Check its state if the database could not be recovered."
-            ),
-        ) from exc
-
-    except Exception as exc:
-        rollback_succeeded = False
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after unexpected delete flush error: "
-                "branch_id=%s", bid,
-            )
-
-        logger.exception(
-            "Unexpected error while flushing branch delete: "
-            "branch_id=%s, rollback_succeeded=%s",
-            bid, rollback_succeeded,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while deleting branch.",
-        ) from exc
-
-    # ------------------------------------------------------------------
-    # 5. Commit
-    # ------------------------------------------------------------------
-    try:
-        await db.commit()
-
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback attempt failed after commit error: "
-                "branch_id=%s", bid,
-            )
-
-        logger.exception(
-            "Branch delete commit failed or has an uncertain outcome: "
-            "branch_id=%s", bid,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "The branch deletion could not be confirmed. "
-                "Check its current state before retrying."
-            ),
-        ) from exc
-
-    logger.info(
-        "Branch %s (firm '%s') deleted by user_id=%s",
-        branch_no, firm.name, current_user.id,
-    )
-
-    return {
-        "message": f"Branch {branch_no} deleted successfully",
-        "branch_no": branch_no,
-            }
-
-
-
-async def update_branch(
-    branch_id: int,
-    data: BranchUpdate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Update a branch.
-
-    - Rejects an empty payload.
-    - Rejects a no-op payload.
-    - Enforces (firm_id, branch_no) uniqueness explicitly, then
-      relies on the DB unique constraint for the race window.
-    """
-
-    guard_user_state(current_user)
-
-    # ------------------------------------------------------------------
-    # 1. Resolve the branch
-    # ------------------------------------------------------------------
-    branch = await get_branch_by_id(db, branch_id)
-    if branch is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Branch id={branch_id} not found",
-        )
-
-    bid = branch_id_of(branch)
-    fid = branch.firm_id
-
-    # ------------------------------------------------------------------
-    # 2. Enforce access via the firm
-    # ------------------------------------------------------------------
-    firm = await db.get(Firm, fid)
-    if firm is None:
-        logger.error(
-            "Branch %s references missing firm_id=%s", bid, fid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Firm not found for this branch",
-        )
-
-    firm = await require_firm_access(
-        db=db, firm_id=fid, current_user=current_user,
-    )
-
-    # ==============================================================
-    # 3. Reject empty payload
-    # ==============================================================
-    if all(
-        v is None
-        for v in (data.branch_no, data.address, data.phone_number)
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided for update",
-        )
-
-    # ==============================================================
-    # 4. Update only fields that actually changed
-    # ==============================================================
-    updated_fields: list[str] = []
-
-    # --- branch_no ---
-    if data.branch_no is not None and data.branch_no != branch.branch_no:
-        existing = await get_branch_by_firm_and_no(
-            db=db,
-            firm_id=fid,
-            branch_no=data.branch_no,
-            exclude_branch_id=bid,
-        )
-        if existing is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"Branch {data.branch_no} already exists "
-                    f"for '{firm.name}'"
-                ),
-            )
-
-        # Narrow the optional to a concrete int for the ORM setter.
-        new_branch_no: int = data.branch_no
-        branch.branch_no = new_branch_no
-        updated_fields.append("branch_no")
-
-    # --- address ---
-    if data.address is not None and data.address != branch.address:
-        branch.address = data.address
-        updated_fields.append("address")
-
-    # --- phone_number ---
-    if (
-        data.phone_number is not None
-        and data.phone_number != branch.phone_number
-    ):
-        branch.phone_number = data.phone_number
-        updated_fields.append("phone_number")
-
-    # ==============================================================
-    # 5. Reject if nothing actually changed
-    # ==============================================================
-    if not updated_fields:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "No changes detected - all supplied values are "
-                "identical to the current ones"
-            ),
-        )
-
-    # ---------------------------------------------------------
-    # 6. Flush before commit
-    #
-    # (firm_id, branch_no) is unique. IntegrityError at flush time
-    # is the expected loser in a concurrent rename race.
-    # ---------------------------------------------------------
-    try:
-        await db.flush()
-
-    except IntegrityError as exc:
-        rollback_succeeded = False
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after branch IntegrityError: "
-                "branch_id=%s", bid,
-            )
-
-        logger.warning(
-            "Branch update violated a database integrity constraint: "
-            "branch_id=%s, rollback_succeeded=%s",
-            bid, rollback_succeeded,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Branch {data.branch_no} already exists "
-                f"for '{firm.name}'"
-            ),
-        ) from exc
-
-    except SQLAlchemyError as exc:
-        rollback_succeeded = False
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after branch flush error: "
-                "branch_id=%s", bid,
-            )
-
-        logger.exception(
-            "Database error while flushing branch update: "
-            "branch_id=%s, rollback_succeeded=%s",
-            bid, rollback_succeeded,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Failed to update branch. "
-                "Check its state if the database could not be recovered."
-            ),
-        ) from exc
-
-    except Exception as exc:
-        rollback_succeeded = False
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after unexpected flush error: "
-                "branch_id=%s", bid,
-            )
-
-        logger.exception(
-            "Unexpected error while flushing branch update: "
-            "branch_id=%s, rollback_succeeded=%s",
-            bid, rollback_succeeded,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while updating branch.",
-        ) from exc
-
-    # ---------------------------------------------------------
-    # 7. Commit
-    # ---------------------------------------------------------
-    try:
-        await db.commit()
-
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback attempt failed after commit error: "
-                "branch_id=%s", bid,
-            )
-
-        logger.exception(
-            "Branch commit failed or has an uncertain outcome: "
-            "branch_id=%s", bid,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "The branch update could not be confirmed. "
-                "Check its current state before retrying."
-            ),
-        ) from exc
-
-    # ---------------------------------------------------------
-    # 8. Refresh (best-effort) and return
-    # ---------------------------------------------------------
-    try:
-        await db.refresh(branch)
-    except Exception:
-        logger.exception(
-            "Failed to refresh branch after update: branch_id=%s", bid,
-        )
-
-    logger.info(
-        "Branch updated successfully: branch_id=%s, fields=%s",
-        bid, ",".join(updated_fields),
-    )
-
-    read = BranchRead.model_validate(branch)
-    read.receipt_count = await count_receipts_for_branch(db, bid)
-
-    return {
-        "message": (
-            f"Branch {branch.branch_no} updated successfully"
-        ),
-        "branch": read,
-        }
-
-
-
-async def read_branches_for_firm(
-    firm_slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> BranchListRead:
-    """
-    List all branches for a firm, sorted by branch_no ascending.
-    Each branch carries its own receipt_count.
-    """
-    guard_user_state(current_user)
-
-    # ------------------------------------------------------------------
-    # 1. Resolve the firm and enforce access
-    # ------------------------------------------------------------------
-    firm = await get_firm_by_slug(db, firm_slug)
-    if firm is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{firm_slug}' not found",
-        )
-
-    fid = firm_id_of(firm)
-    firm = await require_firm_access(
-        db=db, firm_id=fid, current_user=current_user,
-    )
-
-    # ------------------------------------------------------------------
-    # 2. Load branches (one query)
-    # ------------------------------------------------------------------
-    try:
-        branches_result = await db.execute(
-            select(Branch)
-            .where(col(Branch.firm_id) == fid)
-            .order_by(col(Branch.branch_no).asc())
-        )
-        branches = list(branches_result.scalars().all())
-    except Exception:
-        logger.exception(
-            "Failed to load branches for firm_id=%s", fid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load branches. Please try again.",
-        )
-
-    # ------------------------------------------------------------------
-    # 3. Batch per-branch receipt counts (one query)
-    # ------------------------------------------------------------------
-    branch_ids = [branch_id_of(b) for b in branches]
-    receipt_counts = await receipt_counts_by_branch(db, branch_ids)
-
-    # ------------------------------------------------------------------
-    # 4. Assemble
-    # ------------------------------------------------------------------
-    branch_reads: list[BranchRead] = []
-    for b in branches:
-        bid = branch_id_of(b)
-        br = BranchRead.model_validate(b)
-        br.receipt_count = receipt_counts.get(bid, 0)
-        branch_reads.append(br)
-
-    return BranchListRead(
-        firm_id=fid,
-        firm_name=firm.name,
-        total=len(branch_reads),
-        branches=branch_reads,
-        )
-
-
-
-async def create_branch(
-    firm_slug: str,
-    data: BranchCreate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """
-    Create a branch under a firm.
-
-    - Caller must have access to the firm (owner or admin).
-    - (firm_id, branch_no) is unique. Pre-checked explicitly, then
-      enforced by the DB unique constraint as the second line of
-      defense against the TOCTOU race.
-    - No side effects before the DB write, so no cleanup phase is
-      needed on failure.
-    """
-
-    guard_user_state(current_user)
-
-    # ------------------------------------------------------------------
-    # 1. Resolve the firm and enforce access
-    # ------------------------------------------------------------------
-    firm = await get_firm_by_slug(db, firm_slug)
-    if firm is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{firm_slug}' not found",
-        )
-
-    guard_firm_state(firm)
-
-    fid = firm_id_of(firm)
-    firm = await require_firm_access(
-        db=db, firm_id=fid, current_user=current_user,
-    )
-
-    # ------------------------------------------------------------------
-    # 2. Pre-check: (firm_id, branch_no) must be unique
-    # ------------------------------------------------------------------
-    existing = await get_branch_by_firm_and_no(
-        db=db, firm_id=fid, branch_no=data.branch_no,
-    )
-    if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Branch {data.branch_no} already exists "
-                f"for '{firm.name}'"
-            ),
-        )
-
-    # ------------------------------------------------------------------
-    # 3. Prepare the model
-    # ------------------------------------------------------------------
-    branch = Branch(
-        firm_id=fid,
-        branch_no=data.branch_no,
-        address=data.address,
-        phone_number=data.phone_number,
-    )
-
-    db.add(branch)
-
-    # ------------------------------------------------------------------
-    # 4. Flush before commit
-    #
-    # IntegrityError here is the *expected* loser in a concurrent
-    # create race — the pre-check in step 2 passed but another
-    # request committed first.
-    # ------------------------------------------------------------------
-    try:
-        await db.flush()
-
-    except IntegrityError as exc:
-        rollback_succeeded = False
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after branch IntegrityError: "
-                "firm_id=%s, branch_no=%s",
-                fid, data.branch_no,
-            )
-
-        logger.warning(
-            "Branch creation violated a database integrity constraint: "
-            "firm_id=%s, branch_no=%s, rollback_succeeded=%s",
-            fid, data.branch_no, rollback_succeeded,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Branch {data.branch_no} already exists "
-                f"for '{firm.name}'"
-            ),
-        ) from exc
-
-    except SQLAlchemyError as exc:
-        rollback_succeeded = False
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after branch flush error: firm_id=%s",
-                fid,
-            )
-
-        logger.exception(
-            "Database error while flushing new branch: "
-            "firm_id=%s, rollback_succeeded=%s",
-            fid, rollback_succeeded,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Failed to create branch. "
-                "Check its state if the database could not be recovered."
-            ),
-        ) from exc
-
-    except Exception as exc:
-        rollback_succeeded = False
-        try:
-            await db.rollback()
-            rollback_succeeded = True
-        except Exception:
-            logger.exception(
-                "Rollback failed after unexpected flush error: firm_id=%s",
-                fid,
-            )
-
-        logger.exception(
-            "Unexpected error while flushing new branch: "
-            "firm_id=%s, rollback_succeeded=%s",
-            fid, rollback_succeeded,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while creating branch.",
-        ) from exc
-
-    # ------------------------------------------------------------------
-    # 5. Commit
-    #
-    # No upload / external side effects to clean up, but we still
-    # surface the "uncertain outcome" contract so callers can retry
-    # idempotently.
-    # ------------------------------------------------------------------
-    try:
-        await db.commit()
-
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback attempt failed after commit error: firm_id=%s",
-                fid,
-            )
-
-        logger.exception(
-            "Branch commit failed or has an uncertain outcome: "
-            "firm_id=%s, branch_no=%s",
-            fid, data.branch_no,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "The branch creation could not be confirmed. "
-                "Check its current state before retrying."
-            ),
-        ) from exc
-
-    # ------------------------------------------------------------------
-    # 6. Refresh (best-effort) and return
-    # ------------------------------------------------------------------
-    try:
-        await db.refresh(branch)
-    except Exception:
-        logger.exception(
-            "Failed to refresh branch after create: firm_id=%s", fid,
-        )
-
-    logger.info(
-        "Branch %s created for firm '%s' by user_id=%s",
-        branch.branch_no, firm.name, current_user.id,
-    )
-
-    read = BranchRead.model_validate(branch)
-    read.receipt_count = 0  # fresh branch — no receipts
-
-    return {
-        "message": (
-            f"Branch {branch.branch_no} created successfully "
-            f"for '{firm.name}'"
-        ),
-        "branch": read,
-    }
-
-
-
-async def get_branch_by_firm_and_no(
-    db: AsyncSession,
-    firm_id: int,
-    branch_no: int,
-    exclude_branch_id: int | None = None,
-) -> Branch | None:
-    """
-    Fetch a branch by (firm_id, branch_no).
-
-    `exclude_branch_id` is used during updates so we don't collide
-    with ourselves when the caller resubmits the same branch_no.
-    """
-    try:
-        stmt = select(Branch).where(
-            col(Branch.firm_id) == firm_id,
-            col(Branch.branch_no) == branch_no,
-        )
-        if exclude_branch_id is not None:
-            stmt = stmt.where(col(Branch.id) != exclude_branch_id)
-
-        result = await db.execute(stmt)
-        return result.scalars().first()
-
-    except Exception as exc:
-        logger.exception(
-            "Failed to fetch branch firm_id=%s branch_no=%s",
-            firm_id, branch_no,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load branch. Please try again.",
-        ) from exc
-
-
-async def count_receipts_for_branch(
-    db: AsyncSession,
-    branch_id: int,
-) -> int:
-    """Count receipts issued against a single branch."""
-    try:
-        return (
-            await db.execute(
-                select(func.count())
-                .select_from(Receipt)
-                .where(col(Receipt.branch_id) == branch_id)
-            )
-        ).scalar() or 0
-    except Exception:
-        logger.exception(
-            "Failed to count receipts for branch_id=%s", branch_id,
-        )
-        return 0
-
-
-
-
 async def create_firm(
     data: FirmCreate,
     db: AsyncSession,
@@ -2184,7 +1151,34 @@ async def create_firm(
     return {
         "message": f"Firm '{firm.name}' created successfully",
         "firm": read,
-    }
+        }
+
+
+
+
+async def receipt_counts_by_branch(
+    db: AsyncSession,
+    branch_ids: list[int],
+) -> dict[int, int]:
+    """Batch receipt counts for many branches in one query."""
+    if not branch_ids:
+        return {}
+
+    try:
+        result = await db.execute(
+            select(Receipt.branch_id, func.count())
+            .where(col(Receipt.branch_id).in_(branch_ids))
+            .group_by(col(Receipt.branch_id))
+        )
+        return {row[0]: int(row[1]) for row in result.all()}
+    except Exception:
+        logger.exception(
+            "Failed to batch-count receipts for %s branches",
+            len(branch_ids),
+        )
+        return {}
+
+
 
 
 
@@ -2520,15 +1514,7 @@ async def update_firm(
     return {
         "message": f"Firm '{firm.name}' updated successfully",
         "firm": read,
-        }
-
-
-
-
-
-
-
-
+            }
 
 
 
