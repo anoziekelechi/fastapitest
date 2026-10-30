@@ -1,33 +1,3 @@
-# disable_firm tail
-branch_count = await count_branches(db, fid)
-receipt_count = await count_receipts(db, fid)
-
-read = to_firm_detail(firm, branches=[], receipt_counts={})
-read.branch_count = branch_count
-read.receipt_count = receipt_count
-
-return {
-    "message": f"Firm '{firm.name}' has been disabled",
-    "firm": read,
-}
-
-
-# enable
-
-# enable_firm tail
-branch_count = await count_branches(db, fid)
-receipt_count = await count_receipts(db, fid)
-
-read = to_firm_detail(firm, branches=[], receipt_counts={})
-read.branch_count = branch_count
-read.receipt_count = receipt_count
-
-return {
-    "message": f"Firm '{firm.name}' has been re-activated",
-    "firm": read,
-}
-
-
 
 
 
