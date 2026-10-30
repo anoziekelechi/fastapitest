@@ -1,29 +1,59 @@
-async def receipt_counts_by_branch(
+   
+async def delete_firm(
+    slug: str,
     db: AsyncSession,
-    branch_ids: Sequence[int],
-) -> dict[int, int]:
-    """
-    Batch receipt counts for many branches in one query.
+    current_user: ReadUser,
+) -> dict:
+    guard_user_state(current_user)
 
-    Returns a dict of {branch_id: receipt_count}. Branches with zero
-    receipts are simply absent — callers should use `.get(id, 0)`.
-    """
-    if not branch_ids:
-        return {}
+    firm = await get_firm_by_slug(db, slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{slug}' not found",
+        )
+    if not firm.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{slug}' not found",
+        )
+
+    result = await require_firm_access(db=db,firm_id=firm.id,current_user=current_user)
+
+   
+    firm_name = firm.name
+    fid = firm_id_of(result)
+
+    receipts_deleted = await count_receipts(db, fid)
+    branches_deleted = await count_branches(db, fid)
 
     try:
-        result = await db.execute(
-            select(Receipt.branch_id, func.count())
-            .where(col(Receipt.branch_id).in_(branch_ids))
-            .group_by(col(Receipt.branch_id))
-        )
-        return {row[0]: int(row[1]) for row in result.all()}
+        await db.delete(result)
+        await db.commit()
     except Exception:
-        logger.exception(
-            "Failed to batch-count receipts for %s branches",
-            len(branch_ids),
+        await db.rollback()
+        logger.exception("Failed to delete firm slug=%s", slug)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete firm. Please try again.",
         )
-        return {}
+
+    logger.info(
+        "Firm '%s' deleted by user_id=%s "
+        "(branches_deleted=%s, receipts_deleted=%s)",
+        firm_name,
+        current_user.id,
+        branches_deleted,
+        receipts_deleted,
+    )
+
+    return {
+        "message": f"Firm '{firm_name}' deleted successfully",
+        "receipts_deleted": receipts_deleted,
+        "branches_deleted": branches_deleted,
+    }
+
+
 
 
 
