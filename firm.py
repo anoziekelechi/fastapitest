@@ -1,4 +1,55 @@
+async def get_branch_by_firm_and_no(
+    db: AsyncSession,
+    firm_id: int,
+    branch_no: int,
+    exclude_branch_id: int | None = None,
+) -> Branch | None:
+    """
+    Fetch a branch by (firm_id, branch_no).
 
+    `exclude_branch_id` is used during updates so we don't collide
+    with ourselves when the caller resubmits the same branch_no.
+    """
+    try:
+        stmt = select(Branch).where(
+            col(Branch.firm_id) == firm_id,
+            col(Branch.branch_no) == branch_no,
+        )
+        if exclude_branch_id is not None:
+            stmt = stmt.where(col(Branch.id) != exclude_branch_id)
+
+        result = await db.execute(stmt)
+        return result.scalars().first()
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to fetch branch firm_id=%s branch_no=%s",
+            firm_id, branch_no,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load branch. Please try again.",
+        ) from exc
+
+
+async def count_receipts_for_branch(
+    db: AsyncSession,
+    branch_id: int,
+) -> int:
+    """Count receipts issued against a single branch."""
+    try:
+        return (
+            await db.execute(
+                select(func.count())
+                .select_from(Receipt)
+                .where(col(Receipt.branch_id) == branch_id)
+            )
+        ).scalar() or 0
+    except Exception:
+        logger.exception(
+            "Failed to count receipts for branch_id=%s", branch_id,
+        )
+        return 0
 
 # =============================================================================
 # BRANCH — REQUEST
