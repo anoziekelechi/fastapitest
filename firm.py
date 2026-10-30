@@ -1,3 +1,33 @@
+# api/services/firm.py (or wherever generate_slug lives)
+
+async def generate_unique_branch_slug(
+    db: AsyncSession,
+    firm_id: int,
+    base: str,
+) -> str:
+    """
+    Return a slug for `base` that is unique within `firm_id`.
+
+    - Normalizes `base` via generate_slug().
+    - Appends -2, -3, ... on collision within the same firm.
+    - If you switch to global uniqueness, drop the `firm_id` filter
+      in `get_branch_by_slug` — the loop stays the same.
+    """
+    base_slug = generate_slug(base) or "branch"
+
+    # Fast path: the base slug is free
+    if await get_branch_by_slug(db, firm_id=firm_id, slug=base_slug) is None:
+        return base_slug
+
+    # Collision: find the next available suffix
+    n = 1
+    while True:
+        n += 1
+        candidate = f"{base_slug}-{n}"
+        if await get_branch_by_slug(db, firm_id=firm_id, slug=candidate) is None:
+            return candidate
+
+
 async def get_branch_by_slug(
     db: AsyncSession,
     firm_id: int,
