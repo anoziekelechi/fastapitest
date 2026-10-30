@@ -1,4 +1,155 @@
 
+#from __future__ import annotations
+from datetime import datetime, timezone
+from sqlalchemy import Column, Text, Boolean, DateTime,String,Integer, ForeignKey,Numeric
+from api.core.base import BaseModel, utc_now
+from sqlmodel import Field,Relationship,UniqueConstraint
+from pydantic import  EmailStr
+from pydantic_extra_types.phone_numbers import PhoneNumber
+from typing import List, Optional
+from hashlib import md5
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from api.models.payments import Receipt,SubscriptionPayment
+    from api.models.users import User
+    from api.models.orders import Order
+    from api.models.subscriptions import Subscription
+
+
+class Firm(BaseModel, table=True):
+    """
+    Company/firm profile.
+    One user can own many firms.
+    A firm can have many branches.
+
+    Subscription is at FIRM level:
+        Firm A subscribes → all Firm A branches get access
+        No need to subscribe per branch
+    """
+    __tablename__ = "firms" # type: ignore
+
+    # FK to User - NOT unique (user can own many firms)
+    user_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    name: str = Field(
+        sa_column=Column(String(200), nullable=False, unique=True, index=True)
+        # e.g. "ABC Business Entity", "XYZ and Sons Trading Company"
+    )
+
+    # firm_phone_number: str = Field(
+    #     sa_column=Column(String(20), nullable=False)
+    # )
+    firm_logo_key: str | None = Field(
+    default=None,
+    sa_column=Column(
+        String(500),
+        nullable=True,
+    ),
+    )
+    slug: str | None = Field(
+        default=None,
+        sa_column=Column(String(250), nullable=True, unique=True, index=True)
+    )
+
+    # Government registration number e.g. CAC in Nigeria
+    registration_number: str | None = Field(
+        default=None,
+        sa_column=Column(String(100), nullable=True, unique=True)
+    )
+
+    deals_on: str = Field(
+        sa_column=Column(Text, nullable=False)
+        # What the firm trades/deals in
+    )
+    
+    disabled: bool = Field(
+        default=False,
+        sa_column=Column(
+            Boolean,nullable=False,server_default="false"
+        )
+    )
+
+    # Relationships
+    owner: Optional["User"] = Relationship(back_populates="firms")
+    branches: list["Branch"] = Relationship(back_populates="firm")
+    subscriptions: list["Subscription"] = Relationship(  # ✅ Firm level
+        back_populates="firm"
+    )
+    receipts: list["Receipt"] = Relationship(back_populates="firm")
+    
+    orders:list["Order"] = Relationship(back_populates="firm")
+    subscription_payments:list["SubscriptionPayment"] = Relationship(back_populates="firm")
+
+
+
+class Branch(BaseModel, table=True):
+    """
+    Physical branch of a firm.
+    A firm can have many branches.
+
+    Access to services is determined by FIRM subscription:
+        Branch checks firm.subscriptions to see what is active
+        Branch itself has NO subscription - firm handles it
+    """
+    __tablename__ = "branches" # type: ignore
+    __table_args__ = (
+        UniqueConstraint(
+            "firm_id",
+            "branch_no",
+            name="unique_branch_no_per_firm"
+            # Same branch_no cannot appear twice in same firm
+            # Different firms can have "HQ" or "001"
+        ),
+    )
+
+    # FK to Firm
+    firm_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("firms.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    branch_no: str = Field(
+        sa_column=Column(String(50), nullable=False)
+        # e.g. "001", "HQ", "MONROVIA-01", "BUCHANA-02"
+    )
+
+    slug: str | None = Field(
+        default=None,
+        sa_column=Column(String(200), nullable=True, unique=True, index=True)
+    )
+
+    address: str = Field(
+        sa_column=Column(Text, nullable=False)
+    )
+
+    phone_number: str = Field(
+        sa_column=Column(String(20), nullable=False)
+    )
+
+    # Relationships
+    firm: Optional["Firm"] = Relationship(back_populates="branches")
+    receipts: list["Receipt"] = Relationship(back_populates="branch")
+
+
+
+
+
+
+
+
+
 async def delete_firm(
     slug: str,
     db: AsyncSession,
