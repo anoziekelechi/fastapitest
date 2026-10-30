@@ -1,4 +1,45 @@
+async def read_branches_for_firm(
+    firm_slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> BranchListRead:
+    """
+    List all branches for a firm, each with its receipt_count.
+    """
+    guard_user_state(current_user)
 
+    firm = await get_firm_by_slug(db, firm_slug)
+    if firm is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{firm_slug}' not found",
+        )
+
+    fid = firm_id_of(firm)
+    firm = await require_firm_access(
+        db=db, firm_id=fid, current_user=current_user,
+    )
+
+    try:
+        branches_result = await db.execute(
+            select(Branch)
+            .where(col(Branch.firm_id) == fid)
+            .order_by(col(Branch.branch_no).asc())
+        )
+        branches = list(branches_result.scalars().all())
+    except Exception:
+        logger.exception(
+            "Failed to load branches for firm_id=%s", fid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load branches. Please try again.",
+        )
+
+    branch_ids = [branch_id_of(b) for b in branches]
+    receipt_counts = await receipt_counts_by_branch(db, branch_ids)
+
+    return to_branch_list(firm, branches, receipt_counts)
 
 
 
