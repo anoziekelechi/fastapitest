@@ -1,216 +1,91 @@
-
-#from __future__ import annotations
-from datetime import datetime, timezone
-from sqlalchemy import Column, Text, Boolean, DateTime,String,Integer, ForeignKey,Numeric
-from api.core.base import BaseModel, utc_now
-from sqlmodel import Field,Relationship,UniqueConstraint
-from pydantic import  EmailStr
-from pydantic_extra_types.phone_numbers import PhoneNumber
-from typing import List, Optional
-from hashlib import md5
-
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from api.models.payments import Receipt,SubscriptionPayment
-    from api.models.users import User
-    from api.models.orders import Order
-    from api.models.subscriptions import Subscription
-
-
-class Firm(BaseModel, table=True):
-    """
-    Company/firm profile.
-    One user can own many firms.
-    A firm can have many branches.
-
-    Subscription is at FIRM level:
-        Firm A subscribes → all Firm A branches get access
-        No need to subscribe per branch
-    """
-    __tablename__ = "firms" # type: ignore
-
-    # FK to User - NOT unique (user can own many firms)
-    user_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("users.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        )
-    )
-
-    name: str = Field(
-        sa_column=Column(String(200), nullable=False, unique=True, index=True)
-        # e.g. "ABC Business Entity", "XYZ and Sons Trading Company"
-    )
-
-    # firm_phone_number: str = Field(
-    #     sa_column=Column(String(20), nullable=False)
-    # )
-    firm_logo_key: str | None = Field(
-    default=None,
-    sa_column=Column(
-        String(500),
-        nullable=True,
-    ),
-    )
-    slug: str | None = Field(
-        default=None,
-        sa_column=Column(String(250), nullable=True, unique=True, index=True)
-    )
-
-    # Government registration number e.g. CAC in Nigeria
-    registration_number: str | None = Field(
-        default=None,
-        sa_column=Column(String(100), nullable=True, unique=True)
-    )
-
-    deals_on: str = Field(
-        sa_column=Column(Text, nullable=False)
-        # What the firm trades/deals in
-    )
-    
-    disabled: bool = Field(
-        default=False,
-        sa_column=Column(
-            Boolean,nullable=False,server_default="false"
-        )
-    )
-
-    # Relationships
-    owner: Optional["User"] = Relationship(back_populates="firms")
-    branches: list["Branch"] = Relationship(back_populates="firm")
-    subscriptions: list["Subscription"] = Relationship(  # ✅ Firm level
-        back_populates="firm"
-    )
-    receipts: list["Receipt"] = Relationship(back_populates="firm")
-    
-    orders:list["Order"] = Relationship(back_populates="firm")
-    subscription_payments:list["SubscriptionPayment"] = Relationship(back_populates="firm")
-
-
-
-class Branch(BaseModel, table=True):
-    """
-    Physical branch of a firm.
-    A firm can have many branches.
-
-    Access to services is determined by FIRM subscription:
-        Branch checks firm.subscriptions to see what is active
-        Branch itself has NO subscription - firm handles it
-    """
-    __tablename__ = "branches" # type: ignore
-    __table_args__ = (
-        UniqueConstraint(
-            "firm_id",
-            "branch_no",
-            name="unique_branch_no_per_firm"
-            # Same branch_no cannot appear twice in same firm
-            # Different firms can have "HQ" or "001"
-        ),
-    )
-
-    # FK to Firm
-    firm_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("firms.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        )
-    )
-
-    branch_no: str = Field(
-        sa_column=Column(String(50), nullable=False)
-        # e.g. "001", "HQ", "MONROVIA-01", "BUCHANA-02"
-    )
-
-    slug: str | None = Field(
-        default=None,
-        sa_column=Column(String(200), nullable=True, unique=True, index=True)
-    )
-
-    address: str = Field(
-        sa_column=Column(Text, nullable=False)
-    )
-
-    phone_number: str = Field(
-        sa_column=Column(String(20), nullable=False)
-    )
-
-    # Relationships
-    firm: Optional["Firm"] = Relationship(back_populates="branches")
-    receipts: list["Receipt"] = Relationship(back_populates="branch")
-
-
-
-
-
-
-
-
-
-async def delete_firm(
+async def get_branch_by_slug(
+    db: AsyncSession,
+    firm_id: int,
     slug: str,
+) -> Branch | None:
+    """
+    Fetch a branch by (firm_id, slug).
+
+    Scoped to a firm so identical slugs can coexist across firms
+    (assuming the compound unique constraint above). If you keep
+    global slug uniqueness, drop `firm_id` from the WHERE clause.
+    """
+    try:
+        result = await db.execute(
+            select(Branch).where(
+                col(Branch.firm_id) == firm_id,
+                col(Branch.slug) == slug,
+            )
+        )
+        return result.scalars().first()
+    except Exception as exc:
+        logger.exception(
+            "Failed to fetch branch firm_id=%s slug=%s", firm_id, slug,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load branch. Please try again.",
+        ) from exc
+
+
+
+async def create_branch(
+    firm_slug: str,
+    data: BranchCreate,
     db: AsyncSession,
     current_user: ReadUser,
 ) -> dict:
-    """
-    Delete a firm and (via DB cascade) all of its branches.
-
-    - Counts what will be deleted *before* deleting, so the report
-      is accurate.
-    - Reads and holds the firm's logo key so R2 can be cleaned up
-      after a confirmed commit.
-    - Distinguishes IntegrityError (a concurrent receipt/branch
-      insert slipped in) from generic DB errors.
-    - Deletes the logo only after commit succeeds. On commit failure
-      the row's state is uncertain, so we preserve the logo key for
-      reconciliation.
-    """
     guard_user_state(current_user)
 
-    # ------------------------------------------------------------------
-    # 1. Resolve the firm
-    # ------------------------------------------------------------------
-    firm = await get_firm_by_slug(db, slug)
+    # 1. Resolve firm + access
+    firm = await get_firm_by_slug(db, firm_slug)
     if firm is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{slug}' not found",
+            detail=f"Firm '{firm_slug}' not found",
         )
-
-    fid = firm_id_of(firm)  # raises 500 cleanly if firm.id is None
+    guard_firm_state(firm)
+    fid = firm_id_of(firm)
     firm = await require_firm_access(
         db=db, firm_id=fid, current_user=current_user,
     )
 
-    # From here on, everything derives from the same `firm` object.
-    firm_name = firm.name
-    logo_key = firm.firm_logo_key
+    # 2. Pre-check (firm_id, branch_no)
+    existing = await get_branch_by_firm_and_no(
+        db=db, firm_id=fid, branch_no=data.branch_no,
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Branch {data.branch_no} already exists "
+                f"for '{firm.name}'"
+            ),
+        )
 
-    # ------------------------------------------------------------------
-    # 2. Snapshot counts *before* the delete
+    # 3. Generate a slug unique within this firm
     #
-    # count_receipts / count_branches are best-effort and swallow
-    # their own DB errors (returning 0). That's fine for the *report*,
-    # but it means we don't want to fail the delete just because the
-    # count query had a hiccup. Log a warning if it happens.
-    # ------------------------------------------------------------------
-    receipts_deleted = await count_receipts(db, fid)
-    branches_deleted = await count_branches(db, fid)
+    # Prefer the address for readability; fall back to branch_no.
+    # `generate_unique_branch_slug` normalizes via generate_slug().
+    slug_base = data.address or f"branch-{data.branch_no}"
+    branch_slug = await generate_unique_branch_slug(
+        db, firm_id=fid, base=slug_base,
+    )
 
-    # ------------------------------------------------------------------
-    # 3. Stage the delete + flush
-    #
-    # The FK from Receipt → Branch is RESTRICT by design. If someone
-    # inserts a receipt between step 2 and now, IntegrityError fires
-    # here, and we surface it as a clean 409 — not a 500.
-    # ------------------------------------------------------------------
+    # 4. Prepare the model
+    branch = Branch(
+        firm_id=fid,
+        branch_no=data.branch_no,
+        slug=branch_slug,
+        address=data.address,
+        phone_number=data.phone_number,
+    )
+
+    db.add(branch)
+
+    # 5. flush → commit (unchanged from your current logic)
     try:
-        await db.delete(firm)
         await db.flush()
-
     except IntegrityError as exc:
         rollback_succeeded = False
         try:
@@ -218,21 +93,21 @@ async def delete_firm(
             rollback_succeeded = True
         except Exception:
             logger.exception(
-                "Rollback failed after firm delete IntegrityError: "
-                "firm_id=%s", fid,
+                "Rollback failed after branch IntegrityError: "
+                "firm_id=%s, branch_no=%s", fid, data.branch_no,
             )
 
         logger.warning(
-            "Firm delete blocked by FK constraint: firm_id=%s, "
-            "rollback_succeeded=%s",
-            fid, rollback_succeeded,
+            "Branch creation violated a database integrity constraint: "
+            "firm_id=%s, branch_no=%s, rollback_succeeded=%s",
+            fid, data.branch_no, rollback_succeeded,
         )
 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"Firm '{firm_name}' still has branches or receipts "
-                f"that cannot be deleted. Resolve them and try again."
+                f"Branch {data.branch_no} already exists "
+                f"for '{firm.name}'"
             ),
         ) from exc
 
@@ -243,20 +118,18 @@ async def delete_firm(
             rollback_succeeded = True
         except Exception:
             logger.exception(
-                "Rollback failed after firm delete flush error: "
-                "firm_id=%s", fid,
+                "Rollback failed after branch flush error: firm_id=%s",
+                fid,
             )
-
         logger.exception(
-            "Database error while flushing firm delete: "
+            "Database error while flushing new branch: "
             "firm_id=%s, rollback_succeeded=%s",
             fid, rollback_succeeded,
         )
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
-                "Failed to delete firm. "
+                "Failed to create branch. "
                 "Check its state if the database could not be recovered."
             ),
         ) from exc
@@ -268,29 +141,22 @@ async def delete_firm(
             rollback_succeeded = True
         except Exception:
             logger.exception(
-                "Rollback failed after unexpected delete flush error: "
-                "firm_id=%s", fid,
+                "Rollback failed after unexpected flush error: firm_id=%s",
+                fid,
             )
-
         logger.exception(
-            "Unexpected error while flushing firm delete: "
+            "Unexpected error while flushing new branch: "
             "firm_id=%s, rollback_succeeded=%s",
             fid, rollback_succeeded,
         )
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while deleting firm.",
+            detail="An unexpected error occurred while creating branch.",
         ) from exc
 
-    # ------------------------------------------------------------------
-    # 4. Commit
-    # ------------------------------------------------------------------
     try:
         await db.commit()
-
     except Exception as exc:
-        # Do not delete the logo — the commit outcome is uncertain.
         try:
             await db.rollback()
         except Exception:
@@ -298,124 +164,368 @@ async def delete_firm(
                 "Rollback attempt failed after commit error: firm_id=%s",
                 fid,
             )
-
         logger.exception(
-            "Firm delete commit failed or has an uncertain outcome. "
-            "Preserving logo key for reconciliation: "
-            "firm_id=%s, logo_key=%s",
-            fid, logo_key,
+            "Branch commit failed or has an uncertain outcome: "
+            "firm_id=%s, branch_no=%s", fid, data.branch_no,
         )
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
-                "The firm deletion could not be confirmed. "
+                "The branch creation could not be confirmed. "
                 "Check its current state before retrying."
             ),
         ) from exc
 
-    # ------------------------------------------------------------------
-    # 5. Commit succeeded. Now the only remaining cleanup is the logo.
-    # ------------------------------------------------------------------
-    if logo_key is not None:
-        try:
-            delete_from_r2(logo_key)
-        except Exception:
-            # DB state is already final; a failed R2 delete must not
-            # turn a successful delete into a 500. Log for later
-            # reconciliation.
-            logger.exception(
-                "Firm deleted, but its logo could not be removed: "
-                "firm_id=%s, logo_key=%s",
-                fid, logo_key,
-            )
+    try:
+        await db.refresh(branch)
+    except Exception:
+        logger.exception(
+            "Failed to refresh branch after create: firm_id=%s", fid,
+        )
 
     logger.info(
-        "Firm '%s' deleted by user_id=%s "
-        "(branches_deleted=%s, receipts_deleted=%s)",
-        firm_name,
-        current_user.id,
-        branches_deleted,
-        receipts_deleted,
+        "Branch %s (slug=%s) created for firm '%s' by user_id=%s",
+        branch.branch_no, branch.slug, firm.name, current_user.id,
     )
 
     return {
-        "message": f"Firm '{firm_name}' deleted successfully",
-        "receipts_deleted": receipts_deleted,
-        "branches_deleted": branches_deleted,
-               }
+        "message": (
+            f"Branch {branch.branch_no} created successfully "
+            f"for '{firm.name}'"
+        ),
+        "branch": to_branch_read(branch, receipt_count=0),
+        }
 
 
-async def delete_branch(
-    branch_id: int,
+
+
+class BranchCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    branch_no: str = Field(..., min_length=1, max_length=50)
+    address: str = Field(..., min_length=5, max_length=500)
+    phone_number: str
+    # validators unchanged
+
+
+
+
+class BranchUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Do NOT expose `slug` here — slugs are server-managed. If you
+    # ever want user-editable slugs, add it back with a validator
+    # that normalizes via generate_slug and checks uniqueness.
+    branch_no: str | None = Field(None, min_length=1, max_length=50)
+    address: str | None = Field(None, min_length=5, max_length=500)
+    phone_number: str | None = None
+
+
+
+
+class BranchRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    firm_id: int
+    slug: str | None = None
+    branch_no: str
+    address: str
+    phone_number: str
+    created_at: datetime
+    updated_at: datetime
+    receipt_count: int = 0
+
+
+
+
+async def update_branch(
+    firm_slug: str,
+    branch_slug: str,
+    data: BranchUpdate,
     db: AsyncSession,
     current_user: ReadUser,
 ) -> dict:
     """
-    Delete a branch.
+    Update a branch identified by (firm_slug, branch_slug).
 
-    - Refused if the branch has issued receipts (FK is RESTRICT).
-    - The receipt count is checked explicitly for a friendly error,
-      but the DB FK remains the authoritative guard against a
-      concurrent insert between the count and the delete. That
-      race shows up as an IntegrityError at flush time.
+    - Rejects empty payloads and no-ops.
+    - Slug is immutable here — regenerate only via a dedicated
+      admin action if you ever need to rename branches.
     """
-
     guard_user_state(current_user)
 
     # ------------------------------------------------------------------
-    # 1. Resolve the branch
+    # 1. Resolve firm + access
     # ------------------------------------------------------------------
-    branch = await get_branch_by_id(db, branch_id)
-    if branch is None:
+    firm = await get_firm_by_slug(db, firm_slug)
+    if firm is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Branch id={branch_id} not found",
+            detail=f"Firm '{firm_slug}' not found",
         )
 
-    bid = branch_id_of(branch)
-    fid = branch.firm_id
-
-    # ------------------------------------------------------------------
-    # 2. Enforce access via the firm
-    # ------------------------------------------------------------------
-    firm = await db.get(Firm, fid)
-    if firm is None:
-        logger.error(
-            "Branch %s references missing firm_id=%s", bid, fid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Firm not found for this branch",
-        )
-
+    fid = firm_id_of(firm)
     firm = await require_firm_access(
         db=db, firm_id=fid, current_user=current_user,
     )
 
     # ------------------------------------------------------------------
-    # 3. Refuse if receipts exist (friendly pre-check)
+    # 2. Resolve branch within this firm
     # ------------------------------------------------------------------
+    branch = await get_branch_by_slug(
+        db, firm_id=fid, slug=branch_slug,
+    )
+    if branch is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Branch '{branch_slug}' not found for '{firm.name}'"
+            ),
+        )
+
+    bid = branch_id_of(branch)
+
+    # ==============================================================
+    # 3. Reject empty payload
+    # ==============================================================
+    if all(
+        v is None
+        for v in (data.branch_no, data.address, data.phone_number)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided for update",
+        )
+
+    # ==============================================================
+    # 4. Update only fields that actually changed
+    # ==============================================================
+    updated_fields: list[str] = []
+
+    # --- branch_no ---
+    if data.branch_no is not None and data.branch_no != branch.branch_no:
+        existing = await get_branch_by_firm_and_no(
+            db=db,
+            firm_id=fid,
+            branch_no=data.branch_no,
+            exclude_branch_id=bid,
+        )
+        if existing is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Branch {data.branch_no} already exists "
+                    f"for '{firm.name}'"
+                ),
+            )
+        branch.branch_no = data.branch_no
+        updated_fields.append("branch_no")
+
+    # --- address ---
+    if data.address is not None and data.address != branch.address:
+        branch.address = data.address
+        updated_fields.append("address")
+
+    # --- phone_number ---
+    if (
+        data.phone_number is not None
+        and data.phone_number != branch.phone_number
+    ):
+        branch.phone_number = data.phone_number
+        updated_fields.append("phone_number")
+
+    # ==============================================================
+    # 5. Reject no-op
+    # ==============================================================
+    if not updated_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "No changes detected - all supplied values are "
+                "identical to the current ones"
+            ),
+        )
+
+    # ---------------------------------------------------------
+    # 6. Flush — IntegrityError here means a concurrent
+    #    branch_no insert beat us to it
+    # ---------------------------------------------------------
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after branch IntegrityError: "
+                "branch_id=%s", bid,
+            )
+        logger.warning(
+            "Branch update violated a database integrity constraint: "
+            "branch_id=%s, rollback_succeeded=%s",
+            bid, rollback_succeeded,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Branch {data.branch_no} already exists "
+                f"for '{firm.name}'"
+            ),
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after branch flush error: "
+                "branch_id=%s", bid,
+            )
+        logger.exception(
+            "Database error while flushing branch update: "
+            "branch_id=%s, rollback_succeeded=%s",
+            bid, rollback_succeeded,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Failed to update branch. "
+                "Check its state if the database could not be recovered."
+            ),
+        ) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected flush error: "
+                "branch_id=%s", bid,
+            )
+        logger.exception(
+            "Unexpected error while flushing branch update: "
+            "branch_id=%s, rollback_succeeded=%s",
+            bid, rollback_succeeded,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while updating branch.",
+        ) from exc
+
+    # ---------------------------------------------------------
+    # 7. Commit
+    # ---------------------------------------------------------
+    try:
+        await db.commit()
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: "
+                "branch_id=%s", bid,
+            )
+        logger.exception(
+            "Branch commit failed or has an uncertain outcome: "
+            "branch_id=%s", bid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The branch update could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    # ---------------------------------------------------------
+    # 8. Refresh + return
+    # ---------------------------------------------------------
+    try:
+        await db.refresh(branch)
+    except Exception:
+        logger.exception(
+            "Failed to refresh branch after update: branch_id=%s", bid,
+        )
+
+    logger.info(
+        "Branch updated successfully: branch_id=%s, fields=%s",
+        bid, ",".join(updated_fields),
+    )
+
+    receipt_count = await count_receipts_for_branch(db, bid)
+
+    return {
+        "message": f"Branch '{branch.slug}' updated successfully",
+        "branch": to_branch_read(branch, receipt_count=receipt_count),
+        }
+
+
+
+
+async def delete_branch(
+    firm_slug: str,
+    branch_slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Delete a branch identified by (firm_slug, branch_slug).
+
+    Refused if the branch has receipts (FK RESTRICT). The
+    pre-check backs the friendly message; the FK guards the
+    concurrent-insert race.
+    """
+    guard_user_state(current_user)
+
+    # 1. Resolve firm + access
+    firm = await get_firm_by_slug(db, firm_slug)
+    if firm is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{firm_slug}' not found",
+        )
+
+    fid = firm_id_of(firm)
+    firm = await require_firm_access(
+        db=db, firm_id=fid, current_user=current_user,
+    )
+
+    # 2. Resolve branch within firm
+    branch = await get_branch_by_slug(
+        db, firm_id=fid, slug=branch_slug,
+    )
+    if branch is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Branch '{branch_slug}' not found for '{firm.name}'"
+            ),
+        )
+
+    bid = branch_id_of(branch)
+
+    # 3. Refuse if receipts exist
     receipt_count = await count_receipts_for_branch(db, bid)
     if receipt_count > 0:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"Branch {branch.branch_no} has {receipt_count} "
+                f"Branch '{branch.slug}' has {receipt_count} "
                 f"{'receipt' if receipt_count == 1 else 'receipts'}. "
                 f"Delete or transfer them before removing the branch."
             ),
         )
 
-    branch_no = branch.branch_no
+    deleted_slug = branch.slug
 
-    # ------------------------------------------------------------------
-    # 4. Stage the delete and flush
-    #
-    # IntegrityError at flush time = a receipt was inserted
-    # concurrently after step 3. The DB RESTRICT FK rejects the
-    # delete, which is the correct behavior.
-    # ------------------------------------------------------------------
+    # 4. Stage + flush
     try:
         await db.delete(branch)
         await db.flush()
@@ -430,18 +540,16 @@ async def delete_branch(
                 "Rollback failed after branch IntegrityError: "
                 "branch_id=%s", bid,
             )
-
         logger.warning(
             "Branch delete blocked by FK constraint: branch_id=%s, "
             "rollback_succeeded=%s",
             bid, rollback_succeeded,
         )
-
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"Branch {branch_no} now has receipts and cannot "
-                f"be deleted. Refresh and try again."
+                f"Branch '{deleted_slug}' now has receipts and "
+                f"cannot be deleted. Refresh and try again."
             ),
         ) from exc
 
@@ -455,13 +563,11 @@ async def delete_branch(
                 "Rollback failed after branch delete flush error: "
                 "branch_id=%s", bid,
             )
-
         logger.exception(
             "Database error while flushing branch delete: "
             "branch_id=%s, rollback_succeeded=%s",
             bid, rollback_succeeded,
         )
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
@@ -480,24 +586,19 @@ async def delete_branch(
                 "Rollback failed after unexpected delete flush error: "
                 "branch_id=%s", bid,
             )
-
         logger.exception(
             "Unexpected error while flushing branch delete: "
             "branch_id=%s, rollback_succeeded=%s",
             bid, rollback_succeeded,
         )
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while deleting branch.",
         ) from exc
 
-    # ------------------------------------------------------------------
     # 5. Commit
-    # ------------------------------------------------------------------
     try:
         await db.commit()
-
     except Exception as exc:
         try:
             await db.rollback()
@@ -506,12 +607,10 @@ async def delete_branch(
                 "Rollback attempt failed after commit error: "
                 "branch_id=%s", bid,
             )
-
         logger.exception(
             "Branch delete commit failed or has an uncertain outcome: "
             "branch_id=%s", bid,
         )
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
@@ -521,60 +620,62 @@ async def delete_branch(
         ) from exc
 
     logger.info(
-        "Branch %s (firm '%s') deleted by user_id=%s",
-        branch_no, firm.name, current_user.id,
+        "Branch '%s' (firm '%s') deleted by user_id=%s",
+        deleted_slug, firm.name, current_user.id,
     )
 
     return {
-        "message": f"Branch {branch_no} deleted successfully",
-        "branch_no": branch_no,
-    }
+        "message": f"Branch '{deleted_slug}' deleted successfully",
+        "branch_slug": deleted_slug,
+            }
 
 
 
+class DeleteBranchResponse(BaseModel):
+    message: str
+    branch_slug: str
 
-# =============================================================================
-# BRANCH — REQUEST
-# =============================================================================
+@router.patch(
+    "/{firm_slug}/branches/{branch_slug}",
+    response_model=UpdateBranchResponse,
+    summary="Update a branch by slug",
+)
+async def update_one_branch(
+    firm_slug: str,
+    branch_slug: str,
+    data: BranchUpdate,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    return await update_branch(
+        firm_slug=firm_slug,
+        branch_slug=branch_slug,
+        data=data,
+        db=db,
+        current_user=current_user,
+    )
 
-class BranchCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
-    branch_no: int = Field(..., gt=0)
-    address: str = Field(..., min_length=5, max_length=500)
-    phone_number: str
+@router.delete(
+    "/{firm_slug}/branches/{branch_slug}",
+    response_model=DeleteBranchResponse,
+    summary="Delete a branch by slug",
+)
+async def remove_branch(
+    firm_slug: str,
+    branch_slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    return await delete_branch(
+        firm_slug=firm_slug,
+        branch_slug=branch_slug,
+        db=db,
+        current_user=current_user,
+    )
 
-    @field_validator("address", mode="before")
-    @classmethod
-    def validate_address(cls, v: str) -> str:
-        return sanitize_alphanumeric_text_only(v)
-
-    @field_validator("phone_number", mode="before")
-    @classmethod
-    def validate_phone(cls, v: str) -> str:
-        return validate_local_phone(v)
 
 
-class BranchUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    branch_no: int | None = Field(None, gt=0)
-    address: str | None = Field(None, min_length=5, max_length=500)
-    phone_number: str | None = None
-
-    @field_validator("address", mode="before")
-    @classmethod
-    def validate_address(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        return sanitize_alphanumeric_text_only(v)
-
-    @field_validator("phone_number", mode="before")
-    @classmethod
-    def validate_phone(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        return validate_local_phone(v)
 
 
 
