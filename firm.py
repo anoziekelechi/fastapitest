@@ -1,3 +1,94 @@
+#add to create firm
+# ------------------------------------------------------------------
+# 9. Return the response
+# ------------------------------------------------------------------
+read = to_firm_detail(firm, branches=[], receipt_counts={})
+
+return {
+    "message": f"Firm '{firm.name}' created successfully",
+    "firm": read,
+}
+
+
+#add to update firm line 10
+# ---------------------------------------------------------
+# 10. Return the updated firm
+# ---------------------------------------------------------
+logger.info(
+    "Firm updated successfully: firm_id=%s, fields=%s",
+    fid, ",".join(updated_fields),
+)
+
+branch_count = await count_branches(db, fid)
+receipt_count = await count_receipts(db, fid)
+
+read = to_firm_detail(firm, branches=[], receipt_counts={})
+# Aggregate counters come from the DB, not from branches[] here.
+read.branch_count = branch_count
+read.receipt_count = receipt_count
+
+return {
+    "message": f"Firm '{firm.name}' updated successfully",
+    "firm": read,
+}
+
+
+
+
+
+async def read_single_firm(
+    slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> FirmRead:
+    """
+    Full firm detail: firm fields, resolved logo URL, nested branches
+    (each with its own receipt_count), and aggregate counters.
+    """
+    guard_user_state(current_user)
+
+    # 1. Resolve the firm
+    firm = await get_firm_by_slug(db, slug)
+    if not firm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{slug}' not found",
+        )
+
+    fid = firm_id_of(firm)
+    firm = await require_firm_access(
+        db=db, firm_id=fid, current_user=current_user,
+    )
+
+    # 2. Load branches
+    try:
+        branches_result = await db.execute(
+            select(Branch)
+            .where(col(Branch.firm_id) == fid)
+            .order_by(col(Branch.branch_no).asc())
+        )
+        branches = list(branches_result.scalars().all())
+    except Exception:
+        logger.exception(
+            "Failed to load branches for firm_id=%s", fid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        )
+
+    # 3. Batch receipt counts per branch
+    branch_ids = [branch_id_of(b) for b in branches]
+    receipt_counts = await receipt_counts_by_branch(db, branch_ids)
+
+    # 4. Assemble via builder
+    return to_firm_detail(firm, branches, receipt_counts)
+
+
+
+
+
+
 
 
 
