@@ -1,3 +1,190 @@
+async def delete_branch(
+    branch_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Delete a branch.
+
+    - Refused if the branch has issued receipts (FK is RESTRICT).
+    - The receipt count is checked explicitly for a friendly error,
+      but the DB FK remains the authoritative guard against a
+      concurrent insert between the count and the delete. That
+      race shows up as an IntegrityError at flush time.
+    """
+
+    guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 1. Resolve the branch
+    # ------------------------------------------------------------------
+    branch = await get_branch_by_id(db, branch_id)
+    if branch is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Branch id={branch_id} not found",
+        )
+
+    bid = branch_id_of(branch)
+    fid = branch.firm_id
+
+    # ------------------------------------------------------------------
+    # 2. Enforce access via the firm
+    # ------------------------------------------------------------------
+    firm = await db.get(Firm, fid)
+    if firm is None:
+        logger.error(
+            "Branch %s references missing firm_id=%s", bid, fid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Firm not found for this branch",
+        )
+
+    firm = await require_firm_access(
+        db=db, firm_id=fid, current_user=current_user,
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Refuse if receipts exist (friendly pre-check)
+    # ------------------------------------------------------------------
+    receipt_count = await count_receipts_for_branch(db, bid)
+    if receipt_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Branch {branch.branch_no} has {receipt_count} "
+                f"{'receipt' if receipt_count == 1 else 'receipts'}. "
+                f"Delete or transfer them before removing the branch."
+            ),
+        )
+
+    branch_no = branch.branch_no
+
+    # ------------------------------------------------------------------
+    # 4. Stage the delete and flush
+    #
+    # IntegrityError at flush time = a receipt was inserted
+    # concurrently after step 3. The DB RESTRICT FK rejects the
+    # delete, which is the correct behavior.
+    # ------------------------------------------------------------------
+    try:
+        await db.delete(branch)
+        await db.flush()
+
+    except IntegrityError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after branch IntegrityError: "
+                "branch_id=%s", bid,
+            )
+
+        logger.warning(
+            "Branch delete blocked by FK constraint: branch_id=%s, "
+            "rollback_succeeded=%s",
+            bid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Branch {branch_no} now has receipts and cannot "
+                f"be deleted. Refresh and try again."
+            ),
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after branch delete flush error: "
+                "branch_id=%s", bid,
+            )
+
+        logger.exception(
+            "Database error while flushing branch delete: "
+            "branch_id=%s, rollback_succeeded=%s",
+            bid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Failed to delete branch. "
+                "Check its state if the database could not be recovered."
+            ),
+        ) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected delete flush error: "
+                "branch_id=%s", bid,
+            )
+
+        logger.exception(
+            "Unexpected error while flushing branch delete: "
+            "branch_id=%s, rollback_succeeded=%s",
+            bid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while deleting branch.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 5. Commit
+    # ------------------------------------------------------------------
+    try:
+        await db.commit()
+
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: "
+                "branch_id=%s", bid,
+            )
+
+        logger.exception(
+            "Branch delete commit failed or has an uncertain outcome: "
+            "branch_id=%s", bid,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The branch deletion could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    logger.info(
+        "Branch %s (firm '%s') deleted by user_id=%s",
+        branch_no, firm.name, current_user.id,
+    )
+
+    return {
+        "message": f"Branch {branch_no} deleted successfully",
+        "branch_no": branch_no,
+    }
+
+
+
+
 async def get_branch_by_firm_and_no(
     db: AsyncSession,
     firm_id: int,
