@@ -1,42 +1,183 @@
-   
+
 async def delete_firm(
     slug: str,
     db: AsyncSession,
     current_user: ReadUser,
 ) -> dict:
+    """
+    Delete a firm and (via DB cascade) all of its branches.
+
+    - Counts what will be deleted *before* deleting, so the report
+      is accurate.
+    - Reads and holds the firm's logo key so R2 can be cleaned up
+      after a confirmed commit.
+    - Distinguishes IntegrityError (a concurrent receipt/branch
+      insert slipped in) from generic DB errors.
+    - Deletes the logo only after commit succeeds. On commit failure
+      the row's state is uncertain, so we preserve the logo key for
+      reconciliation.
+    """
     guard_user_state(current_user)
 
+    # ------------------------------------------------------------------
+    # 1. Resolve the firm
+    # ------------------------------------------------------------------
     firm = await get_firm_by_slug(db, slug)
-    if not firm:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{slug}' not found",
-        )
-    if not firm.id:
+    if firm is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Firm '{slug}' not found",
         )
 
-    result = await require_firm_access(db=db,firm_id=firm.id,current_user=current_user)
+    fid = firm_id_of(firm)  # raises 500 cleanly if firm.id is None
+    firm = await require_firm_access(
+        db=db, firm_id=fid, current_user=current_user,
+    )
 
-   
+    # From here on, everything derives from the same `firm` object.
     firm_name = firm.name
-    fid = firm_id_of(result)
+    logo_key = firm.firm_logo_key
 
+    # ------------------------------------------------------------------
+    # 2. Snapshot counts *before* the delete
+    #
+    # count_receipts / count_branches are best-effort and swallow
+    # their own DB errors (returning 0). That's fine for the *report*,
+    # but it means we don't want to fail the delete just because the
+    # count query had a hiccup. Log a warning if it happens.
+    # ------------------------------------------------------------------
     receipts_deleted = await count_receipts(db, fid)
     branches_deleted = await count_branches(db, fid)
 
+    # ------------------------------------------------------------------
+    # 3. Stage the delete + flush
+    #
+    # The FK from Receipt → Branch is RESTRICT by design. If someone
+    # inserts a receipt between step 2 and now, IntegrityError fires
+    # here, and we surface it as a clean 409 — not a 500.
+    # ------------------------------------------------------------------
     try:
-        await db.delete(result)
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        logger.exception("Failed to delete firm slug=%s", slug)
+        await db.delete(firm)
+        await db.flush()
+
+    except IntegrityError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after firm delete IntegrityError: "
+                "firm_id=%s", fid,
+            )
+
+        logger.warning(
+            "Firm delete blocked by FK constraint: firm_id=%s, "
+            "rollback_succeeded=%s",
+            fid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Firm '{firm_name}' still has branches or receipts "
+                f"that cannot be deleted. Resolve them and try again."
+            ),
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after firm delete flush error: "
+                "firm_id=%s", fid,
+            )
+
+        logger.exception(
+            "Database error while flushing firm delete: "
+            "firm_id=%s, rollback_succeeded=%s",
+            fid, rollback_succeeded,
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete firm. Please try again.",
+            detail=(
+                "Failed to delete firm. "
+                "Check its state if the database could not be recovered."
+            ),
+        ) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected delete flush error: "
+                "firm_id=%s", fid,
+            )
+
+        logger.exception(
+            "Unexpected error while flushing firm delete: "
+            "firm_id=%s, rollback_succeeded=%s",
+            fid, rollback_succeeded,
         )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while deleting firm.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 4. Commit
+    # ------------------------------------------------------------------
+    try:
+        await db.commit()
+
+    except Exception as exc:
+        # Do not delete the logo — the commit outcome is uncertain.
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: firm_id=%s",
+                fid,
+            )
+
+        logger.exception(
+            "Firm delete commit failed or has an uncertain outcome. "
+            "Preserving logo key for reconciliation: "
+            "firm_id=%s, logo_key=%s",
+            fid, logo_key,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The firm deletion could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 5. Commit succeeded. Now the only remaining cleanup is the logo.
+    # ------------------------------------------------------------------
+    if logo_key is not None:
+        try:
+            delete_from_r2(logo_key)
+        except Exception:
+            # DB state is already final; a failed R2 delete must not
+            # turn a successful delete into a 500. Log for later
+            # reconciliation.
+            logger.exception(
+                "Firm deleted, but its logo could not be removed: "
+                "firm_id=%s, logo_key=%s",
+                fid, logo_key,
+            )
 
     logger.info(
         "Firm '%s' deleted by user_id=%s "
@@ -51,10 +192,7 @@ async def delete_firm(
         "message": f"Firm '{firm_name}' deleted successfully",
         "receipts_deleted": receipts_deleted,
         "branches_deleted": branches_deleted,
-    }
-
-
-
+               }
 
 
 async def delete_branch(
