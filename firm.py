@@ -1,3 +1,256 @@
+async def update_branch(
+    firm_slug: str,
+    branch_slug: str,
+    data: BranchUpdate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Update a branch identified by (firm_slug, branch_slug).
+
+    Mutable fields:
+        - address
+        - phone_number
+
+    Immutable:
+        - branch_no  (renumbering would invalidate receipts and
+                      external references that key on it)
+        - slug       (server-managed; regenerate via a dedicated
+                      admin action if ever needed)
+        - firm_id    (a branch never moves between firms)
+
+    Contracts (same shape as update_firm / update_service):
+        - Reject empty payloads.
+        - Reject no-ops.
+        - flush() before commit() so DB errors are distinguishable.
+        - Commit failure is treated as "uncertain outcome" — the
+          caller is told to check state rather than retry blindly.
+    """
+    guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 1. Resolve the firm
+    # ------------------------------------------------------------------
+    firm = await get_firm_by_slug(db, firm_slug)
+    if firm is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Firm '{firm_slug}' not found",
+        )
+
+    fid = firm_id_of(firm)
+
+    # ------------------------------------------------------------------
+    # 2. Authorization first, then business state
+    #
+    # require_firm_access confirms the caller may touch this firm
+    # (owner or admin) and returns the authoritative firm object.
+    # guard_firm_state then confirms the firm is in a state where
+    # modifications are allowed (e.g. not disabled). Checking auth
+    # first avoids leaking state information to unauthorized users.
+    # ------------------------------------------------------------------
+    firm = await require_firm_access(
+        db=db, firm_id=fid, current_user=current_user,
+    )
+    guard_firm_state(firm)
+
+    # ------------------------------------------------------------------
+    # 3. Resolve the branch within this firm
+    # ------------------------------------------------------------------
+    branch = await get_branch_by_slug(
+        db, firm_id=fid, slug=branch_slug,
+    )
+    if branch is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Branch '{branch_slug}' not found for '{firm.name}'"
+            ),
+        )
+
+    bid = branch_id_of(branch)
+
+    # ==============================================================
+    # 4. Reject empty payload
+    # ==============================================================
+    if all(
+        v is None
+        for v in (data.address, data.phone_number)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided for update",
+        )
+
+    # ==============================================================
+    # 5. Update only fields that actually changed
+    # ==============================================================
+    updated_fields: list[str] = []
+
+    # --- address ---
+    if data.address is not None and data.address != branch.address:
+        branch.address = data.address
+        updated_fields.append("address")
+
+    # --- phone_number ---
+    if (
+        data.phone_number is not None
+        and data.phone_number != branch.phone_number
+    ):
+        branch.phone_number = data.phone_number
+        updated_fields.append("phone_number")
+
+    # ==============================================================
+    # 6. Reject no-op
+    # ==============================================================
+    if not updated_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "No changes detected - all supplied values are "
+                "identical to the current ones"
+            ),
+        )
+
+    # ---------------------------------------------------------
+    # 7. Flush before commit
+    #
+    # branch_no is immutable and slug is server-managed, so the
+    # common uniqueness constraints cannot fire here. The
+    # IntegrityError branch remains as a defensive net for any
+    # other constraint (e.g. a future CHECK on address).
+    # ---------------------------------------------------------
+    try:
+        await db.flush()
+
+    except IntegrityError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after branch IntegrityError: "
+                "branch_id=%s", bid,
+            )
+
+        logger.warning(
+            "Branch update violated a database integrity constraint: "
+            "branch_id=%s, rollback_succeeded=%s",
+            bid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"The update to branch '{branch.slug}' conflicts "
+                f"with an existing database constraint."
+            ),
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after branch flush error: "
+                "branch_id=%s", bid,
+            )
+
+        logger.exception(
+            "Database error while flushing branch update: "
+            "branch_id=%s, rollback_succeeded=%s",
+            bid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Failed to update branch. "
+                "Check its state if the database could not be recovered."
+            ),
+        ) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected flush error: "
+                "branch_id=%s", bid,
+            )
+
+        logger.exception(
+            "Unexpected error while flushing branch update: "
+            "branch_id=%s, rollback_succeeded=%s",
+            bid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while updating branch.",
+        ) from exc
+
+    # ---------------------------------------------------------
+    # 8. Commit
+    # ---------------------------------------------------------
+    try:
+        await db.commit()
+
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: "
+                "branch_id=%s", bid,
+            )
+
+        logger.exception(
+            "Branch commit failed or has an uncertain outcome: "
+            "branch_id=%s", bid,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The branch update could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    # ---------------------------------------------------------
+    # 9. Refresh (best-effort) and return
+    # ---------------------------------------------------------
+    try:
+        await db.refresh(branch)
+    except Exception:
+        logger.exception(
+            "Failed to refresh branch after update: branch_id=%s", bid,
+        )
+
+    logger.info(
+        "Branch updated successfully: branch_id=%s, fields=%s",
+        bid, ",".join(updated_fields),
+    )
+
+    receipt_count = await count_receipts_for_branch(db, bid)
+
+    return {
+        "message": f"Branch '{branch.slug}' updated successfully",
+        "branch": to_branch_read(branch, receipt_count=receipt_count),
+    }
+
+
+
+
+
+
+
 async def create_branch(
     firm_slug: str,
     data: BranchCreate,
