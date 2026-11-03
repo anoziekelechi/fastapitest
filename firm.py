@@ -1,4 +1,7 @@
-
+"""
+    this is another of my service that makes use of image field lets also modify it to use our firm 
+    logics,builder pattern and delete service image in R2 when service is delete 
+"""
 # ---------------------------------------------------------------------------
 # Service CRUD
 # ---------------------------------------------------------------------------
