@@ -29,55 +29,7 @@ async def get_service_by_name(
 
 
 
-# =============================================================================
-# BUILDERS — single source of truth for read-shape assembly
-# =============================================================================
 
-def to_service_read(service: SubscriptionService) -> ServiceRead:
-    """
-    Assemble a ServiceRead with the image URL resolved from its key.
-
-    No `service_logo_key` is exposed — internal storage detail.
-    """
-    read = ServiceRead.model_validate(service)
-    read.service_logo_url = resolve_logo_url(service.service_logo_key)
-    return read
-
-
-def to_service_list(
-    services: list[SubscriptionService] | tuple[SubscriptionService, ...],
-    *,
-    total: int | None = None,
-) -> list[ServiceRead]:
-    """Assemble a list of ServiceRead. Returns list — see note below."""
-    return [to_service_read(s) for s in services]
-
-
-def to_tier_with_plans_read(
-    tier: SubscriptionTier,
-    visible_plans: list[SubscriptionPlan],
-) -> TierWithPlansRead:
-    """
-    Assemble a TierWithPlansRead for one tier.
-
-    `visible_plans` is pre-filtered by the caller (admin vs public)
-    so the builder stays free of authorization logic.
-    """
-    return TierWithPlansRead(
-        **TierRead.model_validate(tier).model_dump(),
-        plans=[to_plan_read(p) for p in visible_plans],
-    )
-
-
-def to_service_with_tiers_read(
-    service: SubscriptionService,
-    tiers: list[TierWithPlansRead],
-) -> ServiceWithTiersRead:
-    """Assemble the full service detail with nested tiers + plans."""
-    return ServiceWithTiersRead(
-        **to_service_read(service).model_dump(),
-        tiers=tiers,
-    )
 
 
 # =============================================================================
