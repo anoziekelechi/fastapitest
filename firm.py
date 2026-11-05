@@ -1,213 +1,242 @@
 
-class TierSummaryRead(BaseModel):
-    """Compact tier summary — id + name only. No plans."""
-    model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    name: str
-    is_active: bool
+# ---------------------------------------------------------------------------
+# Tier CRUD
+# ---------------------------------------------------------------------------
+async def create_tier(
+    data: TierCreate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    try:
+        service = await db.get(SubscriptionService, data.service_id)
+    except SQLAlchemyError as exc:
+        raise database_error("loading a service for tier creation", exc) from exc
 
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription service not found.",
+        )
 
-class ServiceWithTierNamesRead(ServiceRead):
-    """
-    A subscription service with a compact list of its tier names.
+    try:
+        existing = await db.execute(
+            select(SubscriptionTier).where(
+                SubscriptionTier.service_id == data.service_id,
+                SubscriptionTier.name == data.name,
+            )
+        )
+        if existing.scalars().first():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A tier with this name already exists for the service.",
+            )
 
-    Example:
-        {
-          "id": 1,
-          "name": "Receipt",
-          "service_logo_url": "https://...",
-          "tiers": [
-            { "id": 10, "name": "Starter", "is_active": true },
-            { "id": 11, "name": "Pro",     "is_active": true }
-          ]
+        tier = SubscriptionTier(
+            service_id=data.service_id,
+            name=data.name,
+            description=data.description,
+            slug=generate_slug(
+                f"{service.slug or service.name}-{data.name}"
+            ),
+            is_active=True,
+        )
+        db.add(tier)
+        await commit_or_rollback(db, operation="creating a tier")
+        await refresh_or_raise(db, tier, operation="refreshing a tier")
+
+        return {
+            "message": "Subscription tier created successfully.",
+            "tier": TierRead.model_validate(tier),
         }
-    """
-    tiers: list[TierSummaryRead] = []
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise database_error("creating a tier", exc) from exc
 
 
+# # =============================================================================
+# # TIER — READ make it admin only
+# # =============================================================================
 
-from api.subscriptions.schemas import ServiceWithTierNamesRead
 
-@router.get(
-    "/{slug}",
-    response_model=ServiceWithTierNamesRead,
-    summary="Get a service with its tier names (admin)",
-)
-async def read_single_service(
-    slug: str,
-    db: DBDep,
-    current_user: AdminUser,
-):
-    return await read_service_by_slug(slug=slug, db=db)
+# async def read_tiers_for_service(
+#     slug: str,
+#     db: AsyncSession,
+#     current_user: ReadUser | None = None,
+# ) -> list[TierRead]:
+#     """
+#     List tiers for a service.
 
-#new builder
+#     Public: only active tiers that have ≥ 1 active plan.
+#     Admin: all tiers.
+#     """
+#     service = await get_service_by_slug(db, slug)
+#     admin = is_admin(current_user)
 
-def to_service_with_tier_names_read(
-    service: SubscriptionService,
-    tiers: list[SubscriptionTier] | tuple[SubscriptionTier, ...],
-) -> ServiceWithTierNamesRead:
-    """
-    Assemble a service with compact tier summaries (id + name +
-    is_active). No plans, no pricing — just enough to render a
-    tier list.
+#     if not service.is_active and not admin:
+#         raise HTTPException(
+#             status_code=status.HTTP_404_NOT_FOUND,
+#             detail="Subscription service not found.",
+#         )
 
-    `tiers` is provided by the caller so the builder stays pure
-    (no DB access, no HTTP). The caller decides whether to filter
-    by `is_active`.
-    """
-    read = ServiceWithTierNamesRead.model_validate(service)
-    read.service_logo_url = resolve_logo_url(service.service_logo_key)
-    read.tiers = [
-        TierSummaryRead.model_validate(t) for t in tiers
-    ]
-    return read
-#logic
-async def read_service_by_slug(
+#     query = (
+#         select(SubscriptionTier)
+#         .where(col(SubscriptionTier.service_id) == service_id(service))
+#         .order_by(col(SubscriptionTier.name))
+#     )
+
+#     if not is_admin:
+#         has_active_plan = (
+#             select(SubscriptionPlan.id)
+#             .where(
+#                 col(SubscriptionPlan.tier_id) == col(SubscriptionTier.id),
+#                 col(SubscriptionPlan.is_active).is_(True),
+#             )
+#             .exists()
+#         )
+#         query = query.where(
+#             col(SubscriptionTier.is_active).is_(True),
+#             has_active_plan,
+#         )
+
+#     try:
+#         result = await db.execute(query)
+#         return [TierRead.model_validate(t) for t in result.scalars().all()]
+#     except SQLAlchemyError as exc:
+#         raise database_error("reading service tiers", exc) from exc
+        
+# =============================================================================
+# TIER — READ BY SLUG this too no need make it admin
+# =============================================================================
+
+async def read_tier_by_slug(
     slug: str,
     db: AsyncSession,
-) -> ServiceWithTierNamesRead:
+) -> TierRead:
     """
-    Admin-only: fetch a service by slug with a compact list of its
-    tiers (id + name + is_active).
+    Read a subscription tier by slug.
 
-    Includes:
-        - inactive services
-        - inactive tiers
-
-    Does NOT include plans — for that, use `read_service_with_tiers`.
-
-    Tiers are sorted by name so the frontend gets a stable order
-    without client-side sorting.
+    Administrators only.
+    Includes inactive tiers and tiers belonging to inactive services.
     """
-    service = await get_service_by_slug(db, slug)
-    sid = service_id_of(service)
+   
 
     try:
         result = await db.execute(
-            select(SubscriptionTier)
-            .where(col(SubscriptionTier.service_id) == sid)
-            .order_by(col(SubscriptionTier.name).asc())
+            select(SubscriptionTier).where(
+                col(SubscriptionTier.slug) == slug
+            )
         )
-        tiers = list(result.scalars().all())
+        tier = result.scalars().first()
 
     except SQLAlchemyError as exc:
-        logger.exception(
-            "Failed to load tiers for service_id=%s", sid,
+        raise database_error(
+            "reading a subscription tier by slug",
+            exc,
+        ) from exc
+
+    if tier is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription tier not found.",
         )
-        raise database_error("reading service tiers", exc) from exc
 
-    return to_service_with_tier_names_read(service, tiers)
-
+    return TierRead.model_validate(tier)
 
 
+# =============================================================================
+# TIER — UPDATE
+# =============================================================================
+
+async def update_tier(
+    slug: str,
+    data: TierUpdate,
+    db: AsyncSession,
+) -> dict:
+    tier = await get_tier_by_slug(db, slug)
+    changes = data.model_dump(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided.",
+        )
+
+    changed = False
+    for field_name, value in changes.items():
+        if getattr(tier, field_name) != value:
+            setattr(tier, field_name, value)
+            changed = True
+
+    if not changed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No changes were made.",
+        )
+
+    await commit_or_rollback(db, operation="updating a tier")
+    await refresh_or_raise(db, tier, operation="refreshing a tier")
+
+    return {
+        "message": "Subscription tier updated successfully.",
+        "tier": TierRead.model_validate(tier),
+    }
 
 
+# =============================================================================
+# TIER — DELETE BY SLUG
+# =============================================================================
 
-
-async def read_service_with_tiers(
+async def delete_tier(
     slug: str,
     db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> ServiceWithTiersRead:
+) -> dict[str, str]:
     """
-    Read a service with tiers and plans.
+    Delete a subscription tier by slug.
 
-    Admin: all tiers, all plans, active or inactive.
-    Public: active service + active tiers + active plans only.
+    Administrators only.
+    Tiers referenced by subscriptions cannot be deleted.
     """
-    admin = is_admin(current_user)
+   
 
-    service = await get_service_by_slug(db, slug)
-    return await load_service_detail(db, service, admin=admin)
+    tier = await get_tier_by_slug(db, slug)
 
-
-
-async def read_services(
-    db: AsyncSession,
-    *,
-    current_user: ReadUser | None = None,
-    skip: int = 0,
-    limit: int = 50,
-) -> list[ServiceRead]:
-    """
-    List subscription services.
-
-    - Public: active services with at least one active tier that has
-      at least one active plan.
-    - Admin: all services, active or inactive.
-    """
-    admin = is_admin(current_user)
-
-    query = (
-        select(SubscriptionService)
-        .order_by(col(SubscriptionService.name))
-        .offset(skip)
-        .limit(limit)
+    count = await count_subscriptions(
+        db,
+        tier_id=tier.id,
     )
 
-    if not admin:
-        buyable_exists = (
-            select(SubscriptionTier.id)
-            .join(
-                SubscriptionPlan,
-                col(SubscriptionPlan.tier_id)
-                == col(SubscriptionTier.id),
-            )
-            .where(
-                col(SubscriptionTier.service_id)
-                == col(SubscriptionService.id),
-                col(SubscriptionTier.is_active).is_(True),
-                col(SubscriptionPlan.is_active).is_(True),
-            )
-            .correlate(SubscriptionService)
-            .exists()
-        )
-        query = query.where(
-            col(SubscriptionService.is_active).is_(True),
-            buyable_exists,
+    if count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This tier cannot be deleted because subscriptions "
+                "reference it."
+            ),
         )
 
     try:
-        result = await db.execute(query)
-        services = list(result.scalars().all())
+        await db.delete(tier)
+        await commit_or_rollback(
+            db,
+            operation="deleting a tier",
+        )
+
+    except HTTPException:
+        raise
+
     except SQLAlchemyError as exc:
+        await db.rollback()
         raise database_error(
-            "reading subscription services", exc,
+            "deleting a tier",
+            exc,
         ) from exc
 
-    return to_service_list(services)
-
-
-
-async def read_service_with_tiers(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> ServiceWithTiersRead:
-    """
-    Read a service with tiers and plans.
-
-    Admin: all tiers, all plans, active or inactive.
-    Public: active service + active tiers + active plans only.
-    """
-    admin = is_admin(current_user)
-
-    service = await get_service_by_slug(db, slug)
-    return await load_service_detail(db, service, admin=admin)
-
-
-
-
-
-
-
-
-
-
-
-
-
+    return {
+        "message": "Subscription tier deleted successfully."
+    }
 
 
 
