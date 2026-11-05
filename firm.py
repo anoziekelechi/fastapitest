@@ -1,242 +1,1192 @@
-
-
-# ---------------------------------------------------------------------------
-# Tier CRUD
-# ---------------------------------------------------------------------------
-async def create_tier(
-    data: TierCreate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    try:
-        service = await db.get(SubscriptionService, data.service_id)
-    except SQLAlchemyError as exc:
-        raise database_error("loading a service for tier creation", exc) from exc
-
-    if service is None:
+#helper
+def tier_id_of(tier: SubscriptionTier) -> int:
+    """Narrow SubscriptionTier.id to int or fail with a clean 500."""
+    if tier.id is None:
+        logger.error(
+            "SubscriptionTier row has no id — data integrity issue",
+        )
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription service not found.",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load tier. Please try again.",
         )
-
-    try:
-        existing = await db.execute(
-            select(SubscriptionTier).where(
-                SubscriptionTier.service_id == data.service_id,
-                SubscriptionTier.name == data.name,
-            )
-        )
-        if existing.scalars().first():
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A tier with this name already exists for the service.",
-            )
-
-        tier = SubscriptionTier(
-            service_id=data.service_id,
-            name=data.name,
-            description=data.description,
-            slug=generate_slug(
-                f"{service.slug or service.name}-{data.name}"
-            ),
-            is_active=True,
-        )
-        db.add(tier)
-        await commit_or_rollback(db, operation="creating a tier")
-        await refresh_or_raise(db, tier, operation="refreshing a tier")
-
-        return {
-            "message": "Subscription tier created successfully.",
-            "tier": TierRead.model_validate(tier),
-        }
-    except HTTPException:
-        raise
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise database_error("creating a tier", exc) from exc
+    return tier.id
 
 
-# # =============================================================================
-# # TIER — READ make it admin only
-# # =============================================================================
 
 
-# async def read_tiers_for_service(
-#     slug: str,
-#     db: AsyncSession,
-#     current_user: ReadUser | None = None,
-# ) -> list[TierRead]:
-#     """
-#     List tiers for a service.
 
-#     Public: only active tiers that have ≥ 1 active plan.
-#     Admin: all tiers.
-#     """
-#     service = await get_service_by_slug(db, slug)
-#     admin = is_admin(current_user)
 
-#     if not service.is_active and not admin:
-#         raise HTTPException(
-#             status_code=status.HTTP_404_NOT_FOUND,
-#             detail="Subscription service not found.",
-#         )
-
-#     query = (
-#         select(SubscriptionTier)
-#         .where(col(SubscriptionTier.service_id) == service_id(service))
-#         .order_by(col(SubscriptionTier.name))
-#     )
-
-#     if not is_admin:
-#         has_active_plan = (
-#             select(SubscriptionPlan.id)
-#             .where(
-#                 col(SubscriptionPlan.tier_id) == col(SubscriptionTier.id),
-#                 col(SubscriptionPlan.is_active).is_(True),
-#             )
-#             .exists()
-#         )
-#         query = query.where(
-#             col(SubscriptionTier.is_active).is_(True),
-#             has_active_plan,
-#         )
-
-#     try:
-#         result = await db.execute(query)
-#         return [TierRead.model_validate(t) for t in result.scalars().all()]
-#     except SQLAlchemyError as exc:
-#         raise database_error("reading service tiers", exc) from exc
-        
 # =============================================================================
-# TIER — READ BY SLUG this too no need make it admin
+# BUILDERS — single source of truth for tier read assembly
 # =============================================================================
 
-async def read_tier_by_slug(
-    slug: str,
+def to_tier_read(tier: SubscriptionTier) -> TierRead:
+    """
+    Assemble a TierRead from a SubscriptionTier row.
+
+    Currently a thin wrapper around model_validate. Kept as a named
+    function so any future derived field (plan_count, price_range,
+    subscription_count) lands here and nowhere else.
+    """
+    return TierRead.model_validate(tier)
+
+
+def to_tier_list(
+    tiers: list[SubscriptionTier] | tuple[SubscriptionTier, ...],
+) -> list[TierRead]:
+    """
+    Assemble a list of TierRead.
+
+    Returns a bare list — tiers are always nested under a service
+    or scoped to one, so no `total` envelope is needed. If you ever
+    expose a top-level "list all tiers" admin page, add a
+    `TierListRead { total, tiers }` envelope then.
+    """
+    return [to_tier_read(t) for t in tiers]
+
+
+# =============================================================================
+# LOADERS — multi-table reads that a builder alone can't cover
+# =============================================================================
+
+async def load_tiers_for_service(
     db: AsyncSession,
-) -> TierRead:
+    service: SubscriptionService,
+) -> list[SubscriptionTier]:
     """
-    Read a subscription tier by slug.
+    Load all tiers (active + inactive) for a service, sorted by name.
 
-    Administrators only.
-    Includes inactive tiers and tiers belonging to inactive services.
+    Used by admin tier-list endpoints. For public tier listing, add
+    a filter param or a separate loader.
     """
-   
-
+    sid = service_id_of(service)
     try:
         result = await db.execute(
-            select(SubscriptionTier).where(
-                col(SubscriptionTier.slug) == slug
-            )
+            select(SubscriptionTier)
+            .where(col(SubscriptionTier.service_id) == sid)
+            .order_by(col(SubscriptionTier.name).asc())
         )
-        tier = result.scalars().first()
-
+        return list(result.scalars().all())
     except SQLAlchemyError as exc:
-        raise database_error(
-            "reading a subscription tier by slug",
-            exc,
-        ) from exc
-
-    if tier is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription tier not found.",
+        logger.exception(
+            "Failed to load tiers for service_id=%s", sid,
         )
+        raise database_error("reading service tiers", exc) from exc
 
-    return TierRead.model_validate(tier)
+
 
 
 # =============================================================================
 # TIER — UPDATE
 # =============================================================================
 
-async def update_tier(
-    slug: str,
-    data: TierUpdate,
+class TierUpdate(BaseModel):
+    """
+    Update a tier.
+
+    Mutable:
+        - description
+        - is_active
+
+    Immutable:
+        - name        (URLs and plan references key on it)
+        - slug        (server-managed; derived from service + name)
+        - service_id  (a tier never moves between services)
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    description: str | None = Field(None, max_length=2000)
+    is_active: bool | None = None
+
+    @model_validator(mode="after")
+    def reject_explicit_nulls(self):
+        for field in ("description", "is_active"):
+            if (
+                field in self.model_fields_set
+                and getattr(self, field) is None
+            ):
+                raise ValueError(f"{field} cannot be null.")
+        return self
+
+
+
+
+
+# =============================================================================
+# TIER — READ (with plans)
+# =============================================================================
+
+class PlanSummaryRead(BaseModel):
+    """
+    Compact plan row for the tier-detail view.
+
+    Fields beyond id/name/price are here so the frontend can render
+    the exact shape shown in the spec:
+        STARTER
+            |-- 1 month  $5
+            |-- 3 month  $10
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    price: Decimal
+    currency: str | None = None
+    duration_days: int | None = None
+    is_active: bool
+
+
+class TierWithPlansRead(TierRead):
+    """
+    A tier with its list of plans, sorted by name.
+
+    Inherits all TierRead fields (id, name, description, is_active,
+    slug, created_at, updated_at) and adds `plans`.
+    """
+    plans: list[PlanSummaryRead] = []
+
+
+
+
+async def get_tier_by_service_and_slug(
     db: AsyncSession,
+    service_id: int,
+    tier_slug: str,
+    *,
+    must_exist: bool = True,
+) -> SubscriptionTier | None:
+    """
+    Fetch a tier by (service_id, slug).
+
+    Scoped to a service so a tier slug like "starter" is resolved
+    within the context of its parent service. Two services can each
+    have a "starter" tier.
+
+    `must_exist=True` (default) raises 404 when missing; the caller
+    can pass False to get `None` and shape its own error.
+    """
+    normalized_slug = tier_slug.strip().lower()
+    try:
+        result = await db.execute(
+            select(SubscriptionTier).where(
+                col(SubscriptionTier.service_id) == service_id,
+                col(SubscriptionTier.slug) == normalized_slug,
+            )
+        )
+        tier = result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch tier service_id=%s slug=%s",
+            service_id, normalized_slug,
+        )
+        raise database_error(
+            "reading a subscription tier", exc,
+        ) from exc
+
+    if tier is None and must_exist:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tier '{tier_slug}' not found for this service.",
+        )
+    return tier
+
+
+
+async def read_tier_with_plans(
+    service_slug: str,
+    tier_slug: str,
+    db: AsyncSession,
+) -> TierWithPlansRead:
+    """
+    Read a single tier (with plans) inside a service (admin-only).
+
+    URL: GET /services/{service_slug}/tiers/{tier_slug}
+
+    - Resolves the service first (404 if missing).
+    - Resolves the tier inside the service (404 if it doesn't
+      belong to that service, even if a tier with that slug exists
+      under a different service).
+    - Includes inactive tiers, inactive plans, and tiers under
+      inactive services.
+    - Plans are sorted by name.
+    """
+    # ------------------------------------------------------------------
+    # 1. Resolve the service
+    # ------------------------------------------------------------------
+    service = await get_service_by_slug(db, service_slug)
+    sid = service_id_of(service)
+
+    # ------------------------------------------------------------------
+    # 2. Resolve the tier within the service
+    # ------------------------------------------------------------------
+    tier = await get_tier_by_service_and_slug(
+        db, service_id=sid, tier_slug=tier_slug,
+    )
+    assert tier is not None  # must_exist=True guarantees this
+    tid = tier_id_of(tier)
+
+    # ------------------------------------------------------------------
+    # 3. Load plans
+    # ------------------------------------------------------------------
+    try:
+        plans_result = await db.execute(
+            select(SubscriptionPlan)
+            .where(col(SubscriptionPlan.tier_id) == tid)
+            .order_by(col(SubscriptionPlan.name).asc())
+        )
+        plans = list(plans_result.scalars().all())
+    except SQLAlchemyError as exc:
+        raise database_error(
+            "reading plans for a subscription tier", exc,
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 4. Assemble via builder
+    # ------------------------------------------------------------------
+    return to_tier_with_plans_read(tier, plans)
+
+
+
+@router.get(
+    "/services/{service_slug}/tiers/{tier_slug}",
+    response_model=TierWithPlansRead,
+    summary="Get a tier with its plans (admin)",
+)
+async def read_single_tier(
+    service_slug: str,
+    tier_slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await read_tier_with_plans(
+        service_slug=service_slug,
+        tier_slug=tier_slug,
+        db=db,
+    )
+
+
+
+
+async def read_tiers_with_plans_for_service(
+    service_slug: str,
+    db: AsyncSession,
+) -> ServiceWithTiersRead:
+    """
+    Read a service with all its tiers and plans (admin-only).
+
+    URL: GET /services/{service_slug}/tiers
+
+    Returns the full tree:
+        Receipt
+          ├─ Starter
+          │    ├─ 1 month  $5
+          │    └─ 3 month  $10
+          └─ Pro
+               └─ 1 month  $10
+    """
+    service = await get_service_by_slug(db, service_slug)
+    sid = service_id_of(service)
+
+    # Load tiers with plans eager-loaded
+    try:
+        result = await db.execute(
+            select(SubscriptionTier)
+            .where(col(SubscriptionTier.service_id) == sid)
+            .options(load_relationship(SubscriptionTier.plans))
+            .order_by(col(SubscriptionTier.name).asc())
+        )
+        tiers = list(result.scalars().all())
+    except SQLAlchemyError as exc:
+        raise database_error(
+            "reading service tiers", exc,
+        ) from exc
+
+    tier_reads = []
+    for tier in tiers:
+        plans = sorted(tier.plans or [], key=lambda p: p.name)
+        tier_reads.append(to_tier_with_plans_read(tier, plans))
+
+    # Reuse the ServiceWithTiersRead builder from earlier
+    return to_service_with_tiers_read(service, tier_reads)
+
+
+
+@router.get(
+    "/services/{service_slug}/tiers",
+    response_model=ServiceWithTiersRead,
+    summary="List all tiers with plans for a service (admin)",
+)
+async def list_tiers_for_service(
+    service_slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await read_tiers_with_plans_for_service(
+        service_slug=service_slug, db=db,
+    )
+
+
+#latest
+async def get_tier_by_service_and_slug(
+    db: AsyncSession,
+    service_id: int,
+    tier_slug: str,
+    *,
+    must_exist: bool = True,
+) -> SubscriptionTier | None:
+    """Fetch a tier scoped to its parent service."""
+    normalized_slug = tier_slug.strip().lower()
+    try:
+        result = await db.execute(
+            select(SubscriptionTier).where(
+                col(SubscriptionTier.service_id) == service_id,
+                col(SubscriptionTier.slug) == normalized_slug,
+            )
+        )
+        tier = result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch tier service_id=%s slug=%s",
+            service_id, normalized_slug,
+        )
+        raise database_error("reading a subscription tier", exc) from exc
+
+    if tier is None and must_exist:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tier '{tier_slug}' not found for this service.",
+        )
+    return tier
+
+
+
+@router.get(
+    "/services/{service_slug}/tiers",
+    response_model=ServiceWithTiersRead,
+    summary="List all tiers with plans for a service (admin)",
+)
+async def list_tiers(
+    service_slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await read_tiers_with_plans_for_service(
+        service_slug=service_slug, db=db,
+    )
+
+
+@router.get(
+    "/services/{service_slug}/tiers/{tier_slug}",
+    response_model=TierWithPlansRead,
+    summary="Get one tier with its plans (admin)",
+)
+async def read_one_tier(
+    service_slug: str,
+    tier_slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await read_tier_with_plans(
+        service_slug=service_slug,
+        tier_slug=tier_slug,
+        db=db,
+    )
+
+
+
+
+class TierCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=2, max_length=100)
+    description: str | None = Field(None, max_length=2000)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, v: str) -> str:
+        return normalize_field(v)  # your existing helper
+
+
+
+
+class TierUpdate(BaseModel):
+    """
+    Update a tier.
+
+    Mutable:
+        - description
+        - is_active
+
+    Immutable:
+        - name        (URLs and plan references key on it)
+        - slug        (server-managed; derived from tier name)
+        - service_id  (a tier never moves between services)
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    description: str | None = Field(None, max_length=2000)
+    is_active: bool | None = None
+
+    @model_validator(mode="after")
+    def reject_explicit_nulls(self):
+        for field in ("description", "is_active"):
+            if (
+                field in self.model_fields_set
+                and getattr(self, field) is None
+            ):
+                raise ValueError(f"{field} cannot be null.")
+        return self
+
+
+
+
+class TierRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    service_id: int
+    name: str
+    description: str | None = None
+    slug: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+
+class CreateTierResponse(BaseModel):
+    message: str
+    tier: TierRead
+
+
+class UpdateTierResponse(BaseModel):
+    message: str
+    tier: TierRead
+
+
+class DeleteTierResponse(BaseModel):
+    message: str
+    tier_name: str
+
+
+
+async def get_tier_by_service_and_slug(
+    db: AsyncSession,
+    service_id: int,
+    tier_slug: str,
+    *,
+    must_exist: bool = True,
+) -> SubscriptionTier | None:
+    """
+    Fetch a tier by (service_id, slug).
+
+    Scoped to a service so a tier slug like "starter" is resolved
+    within the context of its parent service. Two services can each
+    have a "starter" tier.
+    """
+    normalized_slug = tier_slug.strip().lower()
+
+    try:
+        result = await db.execute(
+            select(SubscriptionTier).where(
+                col(SubscriptionTier.service_id) == service_id,
+                col(SubscriptionTier.slug) == normalized_slug,
+            )
+        )
+        tier = result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch tier service_id=%s slug=%s",
+            service_id, normalized_slug,
+        )
+        raise database_error(
+            "reading a subscription tier", exc,
+        ) from exc
+
+    if tier is None and must_exist:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tier '{tier_slug}' not found for this service.",
+        )
+    return tier
+
+
+
+async def get_tier_by_service_and_name(
+    db: AsyncSession,
+    service_id: int,
+    name: str,
+    *,
+    exclude_tier_id: int | None = None,
+) -> SubscriptionTier | None:
+    """Fetch a tier by (service_id, name), optionally excluding a specific id."""
+    try:
+        stmt = select(SubscriptionTier).where(
+            col(SubscriptionTier.service_id) == service_id,
+            col(SubscriptionTier.name) == name,
+        )
+        if exclude_tier_id is not None:
+            stmt = stmt.where(col(SubscriptionTier.id) != exclude_tier_id)
+        result = await db.execute(stmt)
+        return result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch tier service_id=%s name=%s",
+            service_id, name,
+        )
+        raise database_error("reading a subscription tier", exc) from exc
+
+
+
+
+async def create_tier(
+    service_slug: str,
+    data: TierCreate,
+    db: AsyncSession,
+    current_user: ReadUser,
 ) -> dict:
-    tier = await get_tier_by_slug(db, slug)
-    changes = data.model_dump(exclude_unset=True)
+    """
+    Create a tier under a service.
 
-    if not changes:
+    URL: POST /services/{service_slug}/tiers
+
+    - The service must exist.
+    - `(service_id, name)` must be unique — pre-checked, then
+      enforced by the DB unique constraint for the race window.
+    - `(service_id, slug)` must be unique — slug is generated from
+      the tier name; if a same-named tier already exists, the
+      pre-check has already rejected the request.
+    - No file upload: no R2 cleanup phases.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Resolve the service
+    # ------------------------------------------------------------------
+    service = await get_service_by_slug(db, service_slug)
+    sid = service_id_of(service)
+
+    # ------------------------------------------------------------------
+    # 2. Pre-check: (service_id, name) uniqueness
+    # ------------------------------------------------------------------
+    existing = await get_tier_by_service_and_name(
+        db, service_id=sid, name=data.name,
+    )
+    if existing is not None:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A tier named '{data.name}' already exists "
+                f"for this service."
+            ),
         )
 
-    changed = False
-    for field_name, value in changes.items():
-        if getattr(tier, field_name) != value:
-            setattr(tier, field_name, value)
-            changed = True
+    # ------------------------------------------------------------------
+    # 3. Prepare the model
+    #
+    # The slug encodes the tier name only — the service lives in
+    # the URL, so tiers across services can share the same slug.
+    # ------------------------------------------------------------------
+    tier = SubscriptionTier(
+        service_id=sid,
+        name=data.name,
+        description=data.description,
+        slug=generate_slug(data.name),
+        is_active=True,
+    )
 
-    if not changed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No changes were made.",
+    db.add(tier)
+
+    # ------------------------------------------------------------------
+    # 4. Flush
+    # ------------------------------------------------------------------
+    try:
+        await db.flush()
+
+    except IntegrityError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after tier IntegrityError: "
+                "service_id=%s, name=%s", sid, data.name,
+            )
+
+        logger.warning(
+            "Tier creation violated a database integrity constraint: "
+            "service_id=%s, name=%s, rollback_succeeded=%s",
+            sid, data.name, rollback_succeeded,
         )
 
-    await commit_or_rollback(db, operation="updating a tier")
-    await refresh_or_raise(db, tier, operation="refreshing a tier")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A tier named '{data.name}' already exists "
+                f"for this service."
+            ),
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after tier flush error: "
+                "service_id=%s", sid,
+            )
+
+        logger.exception(
+            "Database error while flushing new tier: "
+            "service_id=%s, rollback_succeeded=%s",
+            sid, rollback_succeeded,
+        )
+
+        raise database_error("creating a tier", exc) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected tier flush error: "
+                "service_id=%s", sid,
+            )
+
+        logger.exception(
+            "Unexpected error while flushing new tier: "
+            "service_id=%s, rollback_succeeded=%s",
+            sid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while creating tier.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 5. Commit
+    # ------------------------------------------------------------------
+    try:
+        await db.commit()
+
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: "
+                "service_id=%s, name=%s", sid, data.name,
+            )
+
+        logger.exception(
+            "Tier commit failed or has an uncertain outcome: "
+            "service_id=%s, name=%s", sid, data.name,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The tier creation could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 6. Refresh (best-effort) + return
+    # ------------------------------------------------------------------
+    try:
+        await db.refresh(tier)
+    except Exception:
+        logger.exception(
+            "Failed to refresh tier after create: service_id=%s", sid,
+        )
+
+    logger.info(
+        "Tier '%s' created for service_id=%s by admin user_id=%s",
+        tier.name, sid, current_user.id,
+    )
 
     return {
-        "message": "Subscription tier updated successfully.",
-        "tier": TierRead.model_validate(tier),
+        "message": "Subscription tier created successfully.",
+        "tier": to_tier_read(tier),
     }
 
 
-# =============================================================================
-# TIER — DELETE BY SLUG
-# =============================================================================
+
+
+async def update_tier(
+    service_slug: str,
+    tier_slug: str,
+    data: TierUpdate,
+    db: AsyncSession,
+) -> dict:
+    """
+    Update a tier under a service.
+
+    URL: PATCH /services/{service_slug}/tiers/{tier_slug}
+
+    Mutable:
+        - description
+        - is_active
+
+    Immutable:
+        - name        (URLs and plan references key on it)
+        - slug        (server-managed)
+        - service_id  (a tier never moves between services)
+
+    Contract — same as update_service / update_payment_method:
+        - Empty payload rejected.
+        - No-op rejected.
+        - flush → commit → refresh.
+        - No IntegrityError branch: no unique constraint can be
+          violated (name and slug are immutable here).
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Resolve the service
+    # ------------------------------------------------------------------
+    service = await get_service_by_slug(db, service_slug)
+    sid = service_id_of(service)
+
+    # ------------------------------------------------------------------
+    # 2. Resolve the tier within the service
+    # ------------------------------------------------------------------
+    tier = await get_tier_by_service_and_slug(
+        db, service_id=sid, tier_slug=tier_slug,
+    )
+    assert tier is not None  # must_exist=True guarantees this
+    tid = tier_id_of(tier)
+
+    # ==============================================================
+    # 3. Reject completely empty update payload
+    # ==============================================================
+    if all(
+        v is None
+        for v in (data.description, data.is_active)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided for update",
+        )
+
+    # ==============================================================
+    # 4. Update only fields that actually changed
+    # ==============================================================
+    updated_fields: list[str] = []
+
+    # --- description ---
+    if (
+        data.description is not None
+        and data.description != tier.description
+    ):
+        tier.description = data.description
+        updated_fields.append("description")
+
+    # --- is_active ---
+    if (
+        data.is_active is not None
+        and data.is_active != tier.is_active
+    ):
+        tier.is_active = data.is_active
+        updated_fields.append("is_active")
+
+    # ==============================================================
+    # 5. Reject no-op
+    # ==============================================================
+    if not updated_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No changes were made",
+        )
+
+    # ---------------------------------------------------------
+    # 6. Flush
+    #
+    # No IntegrityError branch: name and slug are immutable here,
+    # so no unique constraint can fire.
+    # ---------------------------------------------------------
+    try:
+        await db.flush()
+
+    except SQLAlchemyError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after tier flush error: tier_id=%s",
+                tid,
+            )
+
+        logger.exception(
+            "Database error while flushing tier update: "
+            "tier_id=%s, rollback_succeeded=%s",
+            tid, rollback_succeeded,
+        )
+
+        raise database_error("updating a tier", exc) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected tier flush error: "
+                "tier_id=%s", tid,
+            )
+
+        logger.exception(
+            "Unexpected error while flushing tier update: "
+            "tier_id=%s, rollback_succeeded=%s",
+            tid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while updating tier.",
+        ) from exc
+
+    # ---------------------------------------------------------
+    # 7. Commit
+    # ---------------------------------------------------------
+    try:
+        await db.commit()
+
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: tier_id=%s",
+                tid,
+            )
+
+        logger.exception(
+            "Tier commit failed or has an uncertain outcome: "
+            "tier_id=%s", tid,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The tier update could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    # ---------------------------------------------------------
+    # 8. Refresh (best-effort) + return
+    # ---------------------------------------------------------
+    try:
+        await db.refresh(tier)
+    except Exception:
+        logger.exception(
+            "Failed to refresh tier after update: tier_id=%s", tid,
+        )
+
+    logger.info(
+        "Tier updated successfully: tier_id=%s, fields=%s",
+        tid, ",".join(updated_fields),
+    )
+
+    return {
+        "message": "Subscription tier updated successfully.",
+        "tier": to_tier_read(tier),
+    }
+
+
 
 async def delete_tier(
-    slug: str,
+    service_slug: str,
+    tier_slug: str,
     db: AsyncSession,
 ) -> dict[str, str]:
     """
-    Delete a subscription tier by slug.
+    Delete a tier under a service.
 
-    Administrators only.
-    Tiers referenced by subscriptions cannot be deleted.
+    URL: DELETE /services/{service_slug}/tiers/{tier_slug}
+
+    - Refused if any subscription still references it (FK RESTRICT).
+    - Friendly pre-check backs the FK against the concurrent-
+      subscription race.
+    - No file to clean up (tiers have no image).
     """
-   
 
-    tier = await get_tier_by_slug(db, slug)
+    # ------------------------------------------------------------------
+    # 1. Resolve the service
+    # ------------------------------------------------------------------
+    service = await get_service_by_slug(db, service_slug)
+    sid = service_id_of(service)
 
-    count = await count_subscriptions(
-        db,
-        tier_id=tier.id,
+    # ------------------------------------------------------------------
+    # 2. Resolve the tier within the service
+    # ------------------------------------------------------------------
+    tier = await get_tier_by_service_and_slug(
+        db, service_id=sid, tier_slug=tier_slug,
     )
+    assert tier is not None  # must_exist=True guarantees this
+    tid = tier_id_of(tier)
+    tier_name = tier.name
 
+    # ------------------------------------------------------------------
+    # 3. Refuse if subscriptions reference it
+    # ------------------------------------------------------------------
+    count = await count_subscriptions(db, tier_id=tid)
     if count:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "This tier cannot be deleted because subscriptions "
-                "reference it."
+                f"Tier '{tier_name}' cannot be deleted because "
+                f"{count} "
+                f"{'subscription references' if count == 1 else 'subscriptions reference'} "
+                f"it."
             ),
         )
 
+    # ------------------------------------------------------------------
+    # 4. Stage the delete + flush
+    #
+    # IntegrityError here = a subscription was inserted concurrently
+    # after step 3. DB RESTRICT fires.
+    # ------------------------------------------------------------------
     try:
         await db.delete(tier)
-        await commit_or_rollback(
-            db,
-            operation="deleting a tier",
+        await db.flush()
+
+    except IntegrityError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after tier IntegrityError: tier_id=%s",
+                tid,
+            )
+
+        logger.warning(
+            "Tier delete blocked by FK constraint: tier_id=%s, "
+            "rollback_succeeded=%s",
+            tid, rollback_succeeded,
         )
 
-    except HTTPException:
-        raise
-
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise database_error(
-            "deleting a tier",
-            exc,
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Tier '{tier_name}' now has subscriptions and "
+                f"cannot be deleted. Refresh and try again."
+            ),
         ) from exc
 
+    except SQLAlchemyError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after tier delete flush error: "
+                "tier_id=%s", tid,
+            )
+
+        logger.exception(
+            "Database error while flushing tier delete: "
+            "tier_id=%s, rollback_succeeded=%s",
+            tid, rollback_succeeded,
+        )
+
+        raise database_error("deleting a tier", exc) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected delete flush error: "
+                "tier_id=%s", tid,
+            )
+
+        logger.exception(
+            "Unexpected error while flushing tier delete: "
+            "tier_id=%s, rollback_succeeded=%s",
+            tid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while deleting tier.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 5. Commit
+    # ------------------------------------------------------------------
+    try:
+        await db.commit()
+
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: tier_id=%s",
+                tid,
+            )
+
+        logger.exception(
+            "Tier delete commit failed or has an uncertain outcome: "
+            "tier_id=%s", tid,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The tier deletion could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    logger.info("Tier '%s' (id=%s) deleted", tier_name, tid)
+
     return {
-        "message": "Subscription tier deleted successfully."
-    }
+        "message": "Subscription tier deleted successfully.",
+        "tier_name": tier_name,
+            }
+
+
+
+
+from api.subscriptions.schemas import (
+    CreateTierResponse,
+    DeleteTierResponse,
+    TierCreate,
+    TierUpdate,
+    UpdateTierResponse,
+)
+
+
+@router.post(
+    "/services/{service_slug}/tiers",
+    response_model=CreateTierResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a tier under a service (admin)",
+)
+async def create(
+    service_slug: str,
+    data: TierCreate,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await create_tier(
+        service_slug=service_slug,
+        data=data,
+        db=db,
+        current_user=current_user,
+    )
+
+
+@router.patch(
+    "/services/{service_slug}/tiers/{tier_slug}",
+    response_model=UpdateTierResponse,
+    summary="Update a tier (admin)",
+)
+async def update(
+    service_slug: str,
+    tier_slug: str,
+    data: TierUpdate,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await update_tier(
+        service_slug=service_slug,
+        tier_slug=tier_slug,
+        data=data,
+        db=db,
+    )
+
+
+@router.delete(
+    "/services/{service_slug}/tiers/{tier_slug}",
+    response_model=DeleteTierResponse,
+    summary="Delete a tier (admin)",
+)
+async def delete(
+    service_slug: str,
+    tier_slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await delete_tier(
+        service_slug=service_slug,
+        tier_slug=tier_slug,
+        db=db,
+    )
+
+
+
+
+
+
+
+
+async def get_tier_by_service_and_slug(
+    db: AsyncSession,
+    service_id: int,
+    tier_slug: str,
+    *,
+    must_exist: bool = True,
+) -> SubscriptionTier | None:
+    """
+    Fetch a tier by (service_id, slug).
+
+    Scoped to a service so a tier slug like "starter" is resolved
+    within the context of its parent service. Two services can each
+    have a "starter" tier.
+    """
+    normalized_slug = tier_slug.strip().lower()
+
+    try:
+        result = await db.execute(
+            select(SubscriptionTier).where(
+                col(SubscriptionTier.service_id) == service_id,
+                col(SubscriptionTier.slug) == normalized_slug,
+            )
+        )
+        tier = result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch tier service_id=%s slug=%s",
+            service_id, normalized_slug,
+        )
+        raise database_error(
+            "reading a subscription tier", exc,
+        ) from exc
+
+    if tier is None and must_exist:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tier '{tier_slug}' not found for this service.",
+        )
+    return tier
+
+
+
+
+
+
+
+
+
+
 
 
 
