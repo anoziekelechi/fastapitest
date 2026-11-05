@@ -1,22 +1,106 @@
 
+class TierSummaryRead(BaseModel):
+    """Compact tier summary — id + name only. No plans."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    is_active: bool
+
+
+class ServiceWithTierNamesRead(ServiceRead):
+    """
+    A subscription service with a compact list of its tier names.
+
+    Example:
+        {
+          "id": 1,
+          "name": "Receipt",
+          "service_logo_url": "https://...",
+          "tiers": [
+            { "id": 10, "name": "Starter", "is_active": true },
+            { "id": 11, "name": "Pro",     "is_active": true }
+          ]
+        }
+    """
+    tiers: list[TierSummaryRead] = []
 
 
 
+from api.subscriptions.schemas import ServiceWithTierNamesRead
 
+@router.get(
+    "/{slug}",
+    response_model=ServiceWithTierNamesRead,
+    summary="Get a service with its tier names (admin)",
+)
+async def read_single_service(
+    slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await read_service_by_slug(slug=slug, db=db)
 
+#new builder
 
+def to_service_with_tier_names_read(
+    service: SubscriptionService,
+    tiers: list[SubscriptionTier] | tuple[SubscriptionTier, ...],
+) -> ServiceWithTierNamesRead:
+    """
+    Assemble a service with compact tier summaries (id + name +
+    is_active). No plans, no pricing — just enough to render a
+    tier list.
 
-
-
-
-
+    `tiers` is provided by the caller so the builder stays pure
+    (no DB access, no HTTP). The caller decides whether to filter
+    by `is_active`.
+    """
+    read = ServiceWithTierNamesRead.model_validate(service)
+    read.service_logo_url = resolve_logo_url(service.service_logo_key)
+    read.tiers = [
+        TierSummaryRead.model_validate(t) for t in tiers
+    ]
+    return read
+#logic
 async def read_service_by_slug(
     slug: str,
     db: AsyncSession,
-) -> ServiceRead:
-    """Admin-only: fetch a service by slug (includes inactive)."""
+) -> ServiceWithTierNamesRead:
+    """
+    Admin-only: fetch a service by slug with a compact list of its
+    tiers (id + name + is_active).
+
+    Includes:
+        - inactive services
+        - inactive tiers
+
+    Does NOT include plans — for that, use `read_service_with_tiers`.
+
+    Tiers are sorted by name so the frontend gets a stable order
+    without client-side sorting.
+    """
     service = await get_service_by_slug(db, slug)
-    return to_service_read(service)
+    sid = service_id_of(service)
+
+    try:
+        result = await db.execute(
+            select(SubscriptionTier)
+            .where(col(SubscriptionTier.service_id) == sid)
+            .order_by(col(SubscriptionTier.name).asc())
+        )
+        tiers = list(result.scalars().all())
+
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to load tiers for service_id=%s", sid,
+        )
+        raise database_error("reading service tiers", exc) from exc
+
+    return to_service_with_tier_names_read(service, tiers)
+
+
+
 
 
 
@@ -113,13 +197,6 @@ async def read_service_with_tiers(
     return await load_service_detail(db, service, admin=admin)
 
 
-async def read_service_by_slug(
-    slug: str,
-    db: AsyncSession,
-) -> ServiceRead:
-    """Admin-only: fetch a service by slug (includes inactive)."""
-    service = await get_service_by_slug(db, slug)
-    return to_service_read(service)
 
 
 
