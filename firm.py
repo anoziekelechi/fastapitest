@@ -1,3 +1,138 @@
+#new read tier by slug 
+
+
+
+# =============================================================================
+# TIER — READ (with plans)
+# =============================================================================
+
+class PlanSummaryRead(BaseModel):
+    """
+    Compact plan row for the tier-detail view.
+
+    Fields beyond id/name/price are here so the frontend can render
+    the exact shape shown in the spec:
+        STARTER
+            |-- 1 month  $5
+            |-- 3 month  $10
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    price: Decimal
+    currency: str | None = None
+    duration_days: int | None = None
+    is_active: bool
+
+
+class TierWithPlansRead(TierRead):
+    """
+    A tier with its list of plans, sorted by name.
+
+    Inherits all TierRead fields (id, name, description, is_active,
+    slug, created_at, updated_at) and adds `plans`.
+    """
+    plans: list[PlanSummaryRead] = []
+
+
+
+def to_tier_with_plans_read(
+    tier: SubscriptionTier,
+    plans: list[SubscriptionPlan] | tuple[SubscriptionPlan, ...],
+) -> TierWithPlansRead:
+    """
+    Assemble a TierWithPlansRead.
+
+    `plans` is provided by the caller (already filtered/sorted)
+    so the builder stays pure — no DB access, no authorization.
+    """
+    read = TierWithPlansRead.model_validate(tier)
+    read.plans = [
+        PlanSummaryRead.model_validate(p)
+        for p in plans
+    ]
+    return read
+
+
+async def read_tier_by_slug(
+    slug: str,
+    db: AsyncSession,
+) -> TierWithPlansRead:
+    """
+    Read a tier by slug with its list of plans (admin-only via route).
+
+    - Includes inactive tiers, inactive plans, and tiers under
+      inactive services.
+    - Plans are sorted by name so the frontend gets a stable order
+      without client-side sorting.
+    """
+    # ------------------------------------------------------------------
+    # 1. Resolve the tier
+    # ------------------------------------------------------------------
+    try:
+        result = await db.execute(
+            select(SubscriptionTier).where(
+                col(SubscriptionTier.slug) == slug,
+            )
+        )
+        tier = result.scalars().first()
+    except SQLAlchemyError as exc:
+        raise database_error(
+            "reading a subscription tier by slug", exc,
+        ) from exc
+
+    if tier is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription tier not found.",
+        )
+
+    tid = tier_id_of(tier)
+
+    # ------------------------------------------------------------------
+    # 2. Load plans for this tier (one query, sorted)
+    # ------------------------------------------------------------------
+    try:
+        plans_result = await db.execute(
+            select(SubscriptionPlan)
+            .where(col(SubscriptionPlan.tier_id) == tid)
+            .order_by(col(SubscriptionPlan.name).asc())
+        )
+        plans = list(plans_result.scalars().all())
+    except SQLAlchemyError as exc:
+        raise database_error(
+            "reading plans for a subscription tier", exc,
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 3. Assemble via builder
+    # ------------------------------------------------------------------
+    return to_tier_with_plans_read(tier, plans)
+
+
+
+
+from api.subscriptions.schemas import TierWithPlansRead
+
+@router.get(
+    "/tiers/{slug}",
+    response_model=TierWithPlansRead,
+    summary="Get a tier with its plans (admin)",
+)
+async def read_single_tier(
+    slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await read_tier_by_slug(slug=slug, db=db)
+
+
+
+
+
+
+
 #helper
 def tier_id_of(tier: SubscriptionTier) -> int:
     """Narrow SubscriptionTier.id to int or fail with a clean 500."""
