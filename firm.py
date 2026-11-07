@@ -1,68 +1,301 @@
 
+# =============================================================================
+# PLAN — CREATE
+# # =============================================================================
 
-
-
-
-
-async def read_tier_by_slug(
-    slug: str,
+async def create_plan(
+    data: PlanCreate,
     db: AsyncSession,
-) -> TierWithPlansRead:
-    """
-    Read a tier by slug with its plans (admin-only via route).
-
-    URL: GET /tiers/{tier_slug}
-
-    Slug is globally unique (prefixed by service name at creation),
-    so this endpoint is unambiguous: `/tiers/receipt-starter` and
-    `/tiers/debt-ledger-starter` resolve to different tiers.
-
-    For scoped access, use `/services/{service_slug}/tiers/{tier_slug}`
-    — the tier must belong to that service, otherwise 404.
-    """
-    # ------------------------------------------------------------------
-    # 1. Resolve the tier
-    # ------------------------------------------------------------------
-    tier = await get_tier_by_slug(db, slug)  # raises 404 if missing
-    tid = tier_id_of(tier)
-
-    # ------------------------------------------------------------------
-    # 2. Load plans (one query, sorted)
-    # ------------------------------------------------------------------
-    try:
-        plans_result = await db.execute(
-            select(SubscriptionPlan)
-            .where(SubscriptionPlan.tier_id == tid)
-            .order_by(SubscriptionPlan.name.asc())#Cannot access attribute "asc" for class "str"
-  #Attribute "asc" is unknownPylancereportAttrib
-        )
-        plans = list(plans_result.scalars().all())
-    except SQLAlchemyError as exc:
-        logger.exception(
-            "Failed to load plans for tier_id=%s", tid,
-        )
+    current_user: ReadUser,
+):
+    if not is_admin(current_user):
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load tier. Please try again.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator access required.",
+        )
+
+    # Defensive check in case the function is called with an object
+    # constructed without normal Pydantic validation.
+    if data.duration_months not in ALLOWED_SUBSCRIPTION_DURATIONS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Invalid subscription duration. Allowed durations "
+                "are 1, 2, 3, 6, and 12 months."
+            ),
+        )
+
+    try:
+        tier = await get_tier_by_id(db, data.tier_id)
+
+        if not tier.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot create a plan for an inactive tier.",
+            )
+
+        existing_plan_id = await db.scalar(
+            select(SubscriptionPlan.id).where(
+                col(SubscriptionPlan.tier_id) == tier.id,
+                col(SubscriptionPlan.name) == data.name,
+            )
+        )
+
+        if existing_plan_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A plan with this name already exists for the tier.",
+            )
+
+        plan = SubscriptionPlan(
+            tier_id=data.tier_id,
+            name=data.name,
+            description=data.description,
+            duration_months=data.duration_months,
+            price=data.price,
+            slug=generate_slug(
+                f"{tier.slug or tier.name}-{data.name}"
+            ),
+            is_active=True,
+        )
+
+        db.add(plan)
+
+        await commit_or_rollback(
+            db,
+            operation="creating a plan",
+        )
+
+        await refresh_or_raise(
+            db,
+            plan,
+            operation="refreshing a plan",
+        )
+
+        return {
+            "message": "Subscription plan created successfully.",
+            "plan": to_plan_read(plan),
+        }
+
+    except HTTPException:
+        raise
+
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise database_error("creating a plan", exc) from exc
+
+
+
+# =============================================================================
+# PLAN — READ FOR TIER BY SLUG (ADMIN ONLY)
+# =============================================================================
+
+async def read_plans_for_tier(
+    tier_slug: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> list[PlanRead]:
+    """
+    Read all subscription plans belonging to a tier by tier slug.
+
+    Administrators only.
+    Includes inactive plans and plans belonging to inactive services.
+    """
+    if not is_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator access required.",
+        )
+
+    # ---------------------------------------------------------
+    # Retrieve tier by slug
+    # ---------------------------------------------------------
+    tier = await get_tier_by_slug(db, tier_slug)
+
+    # ---------------------------------------------------------
+    # Retrieve all plans belonging to the tier
+    # ---------------------------------------------------------
+    query = (
+        select(SubscriptionPlan)
+        .where(
+            col(SubscriptionPlan.tier_id) == tier.id
+        )
+        .order_by(
+            col(SubscriptionPlan.duration_months)
+        )
+    )
+
+    try:
+        result = await db.execute(query)
+
+        return [
+            to_plan_read(plan)
+            for plan in result.scalars().all()
+        ]
+
+    except SQLAlchemyError as exc:
+        raise database_error(
+            "reading plans for a subscription tier",
+            exc,
         ) from exc
 
-    # ------------------------------------------------------------------
-    # 3. Assemble via builder
-    # ------------------------------------------------------------------
-    return to_tier_with_plans_read(tier, plans)
 
+
+# =============================================================================
+# PLAN — UPDATE
+# =============================================================================
+
+async def update_plan(
+    slug: str,
+    data: PlanUpdate,
+    db: AsyncSession,
+) -> dict:
+    plan = await get_plan_by_slug(db, slug)
+    changes = data.model_dump(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided.",
+        )
+
+    changed = False
+    for field_name, value in changes.items():
+        if getattr(plan, field_name) != value:
+            setattr(plan, field_name, value)
+            changed = True
+
+    if not changed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No changes were made.",
+        )
+
+    await commit_or_rollback(db, operation="updating a plan")
+    await refresh_or_raise(db, plan, operation="refreshing a plan")
+
+    return {
+        "message": "Subscription plan updated successfully.",
+        "plan": to_plan_read(plan),
+    }
+
+
+# =============================================================================
+# PLAN — DELETE BY SLUG
+# =============================================================================
+
+async def delete_plan(
+    slug: str,
+    db: AsyncSession,
+    #current_user: ReadUser,
+) -> dict[str, str]:
     """
-    Argument of type "SubscriptionTier | None" cannot be assigned to parameter "tier" of type 
-    "SubscriptionTier" in function "to_tier_with_plans_read"
-  Type "SubscriptionTier | None" is not assignable to type "SubscriptionTier"
-    "None" is not assignable to "SubscriptionTier"PylancereportArgumentType
+    Delete a subscription plan by slug.
+
+    Administrators only.
+    Plans referenced by subscriptions cannot be deleted.
     """
+    # if not is_admin(current_user):
+    #     raise HTTPException(
+    #         status_code=status.HTTP_403_FORBIDDEN,
+    #         detail="Administrator access required.",
+    #     )
+
+    plan = await get_plan_by_slug(db, slug)
+
+    count = await count_subscriptions(
+        db,
+        slug=plan.slug,
+    )
+
+    if count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This plan cannot be deleted because subscriptions "
+                "reference it."
+            ),
+        )
+
+    try:
+        await db.delete(plan)
+        await commit_or_rollback(
+            db,
+            operation="deleting a plan",
+        )
+
+    except HTTPException:
+        raise
+
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise database_error(
+            "deleting a plan",
+            exc,
+        ) from exc
+
+    return {
+        "message": "Subscription plan deleted successfully."
+        }
 
 
-#end
+# ---------------------------------------------------------------------------
+# Lookup helpers
+# ---------------------------------------------------------------------------
+    
+async def get_plan_by_slug(
+    db: AsyncSession,
+    slug: str,
+) -> SubscriptionPlan:
+    try:
+        result = await db.execute(
+            select(SubscriptionPlan).where(
+                SubscriptionPlan.slug == slug
+            )
+        )
+        
+        #tier = result.scalars().first()
+        plan = result.scalars().first()
+    except SQLAlchemyError as exc:
+        raise database_error("looking up a tier by slug", exc) from exc
+
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription plan not found.",
+        )
+    return plan
 
 
 
+
+
+async def get_plan_by_id(
+    db: AsyncSession,
+    plan_id: int,
+) -> SubscriptionPlan:
+    try:
+        result = await db.execute(
+            select(SubscriptionPlan).where(
+                SubscriptionPlan.id == plan_id
+            )
+        )
+        plan = result.scalars().first()
+    except SQLAlchemyError as exc:
+        raise database_error("looking up a plan", exc) from exc
+
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription plan not found.",
+        )
+
+    return plan
+
+
+
+
+# end plan
 # =============================================================================
 # TIER — READ (with plans)
 # =============================================================================
