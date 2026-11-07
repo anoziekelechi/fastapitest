@@ -1,178 +1,950 @@
 
+
+
+"""Subscription plan schemas."""
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
+
+from api.core.validators import normalize_field
+
+
 # =============================================================================
-# PLAN — CREATE
-# # =============================================================================
+# PLAN — REQUEST
+# =============================================================================
+
+ALLOWED_SUBSCRIPTION_DURATIONS = (1, 2, 3, 6, 12)
+
+
+class PlanCreate(BaseModel):
+    """
+    Create a plan under a tier.
+
+    `tier_id` is NOT here — the parent tier is resolved from the URL
+    (`POST /services/{svc}/tiers/{tier}/plans`). The service and tier
+    are part of the resource address.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=2, max_length=100)
+    description: str | None = Field(None, max_length=2000)
+    duration_months: int = Field(..., gt=0)
+    price: Decimal = Field(..., gt=0, max_digits=10, decimal_places=2)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, v: str) -> str:
+        return normalize_field(v)
+
+    @field_validator("duration_months")
+    @classmethod
+    def validate_duration(cls, v: int) -> int:
+        if v not in ALLOWED_SUBSCRIPTION_DURATIONS:
+            raise ValueError(
+                f"Duration must be one of "
+                f"{', '.join(str(d) for d in ALLOWED_SUBSCRIPTION_DURATIONS)} months."
+            )
+        return v
+
+
+class PlanUpdate(BaseModel):
+    """
+    Update a plan.
+
+    Mutable:
+        - description
+        - duration_months
+        - price
+        - is_active
+
+    Immutable:
+        - name        (URL and receipts key on it)
+        - slug        (derived from tier + name at creation)
+        - tier_id     (a plan never moves between tiers)
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    description: str | None = Field(None, max_length=2000)
+    duration_months: int | None = Field(None, gt=0)
+    price: Decimal | None = Field(None, gt=0, max_digits=10, decimal_places=2)
+    is_active: bool | None = None
+
+    @field_validator("duration_months")
+    @classmethod
+    def validate_duration(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        if v not in ALLOWED_SUBSCRIPTION_DURATIONS:
+            raise ValueError(
+                f"Duration must be one of "
+                f"{', '.join(str(d) for d in ALLOWED_SUBSCRIPTION_DURATIONS)} months."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def reject_explicit_nulls(self):
+        for field in ("description", "duration_months", "price", "is_active"):
+            if (
+                field in self.model_fields_set
+                and getattr(self, field) is None
+            ):
+                raise ValueError(f"{field} cannot be null.")
+        return self
+
+
+# =============================================================================
+# PLAN — READ
+# =============================================================================
+
+class PlanRead(BaseModel):
+    """Full plan shape."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    tier_id: int
+    name: str
+    description: str | None = None
+    slug: str
+    duration_months: int
+    price: Decimal
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("price")
+    def serialize_price(self, v: Decimal) -> str:
+        return f"{v:.2f}"
+
+
+class PlanSummaryRead(BaseModel):
+    """
+    Compact plan row used inside tier-detail responses.
+
+    Also reused by `read_tier_by_slug` — keep this in sync with
+    whatever fields that view needs.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    duration_months: int
+    price: Decimal
+    is_active: bool
+
+    @field_serializer("price")
+    def serialize_price(self, v: Decimal) -> str:
+        return f"{v:.2f}"
+
+
+# =============================================================================
+# RESPONSE ENVELOPES
+# =============================================================================
+
+class CreatePlanResponse(BaseModel):
+    message: str
+    plan: PlanRead
+
+
+class UpdatePlanResponse(BaseModel):
+    message: str
+    plan: PlanRead
+
+
+class DeletePlanResponse(BaseModel):
+    message: str
+    plan_name: str
+
+
+
+
+
+"""Subscription plan business logic."""
+
+import logging
+
+from fastapi import HTTPException, status
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import col
+
+from api.core.slug import generate_slug
+from api.models.subscription import (
+    Subscription,
+    SubscriptionPlan,
+    SubscriptionService,
+    SubscriptionTier,
+)
+from api.subscriptions.schemas import (
+    ALLOWED_SUBSCRIPTION_DURATIONS,
+    PlanCreate,
+    PlanRead,
+    PlanSummaryRead,
+    PlanUpdate,
+)
+from api.users.schemas import ReadUser
+
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# ID NARROWING
+# =============================================================================
+
+def plan_id_of(plan: SubscriptionPlan) -> int:
+    if plan.id is None:
+        logger.error(
+            "SubscriptionPlan row has no id — data integrity issue",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load plan. Please try again.",
+        )
+    return plan.id
+
+
+def tier_id_of(tier: SubscriptionTier) -> int:
+    if tier.id is None:
+        logger.error(
+            "SubscriptionTier row has no id — data integrity issue",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load tier. Please try again.",
+        )
+    return tier.id
+
+
+def service_id_of(service: SubscriptionService) -> int:
+    if service.id is None:
+        logger.error(
+            "SubscriptionService row has no id — data integrity issue",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load service. Please try again.",
+        )
+    return service.id
+
+
+# =============================================================================
+# LOADERS
+# =============================================================================
+
+async def get_service_by_slug(
+    db: AsyncSession,
+    slug: str,
+) -> SubscriptionService:
+    """Fetch a service by slug or raise 404."""
+    normalized_slug = slug.strip().lower()
+    try:
+        result = await db.execute(
+            select(SubscriptionService).where(
+                SubscriptionService.slug == normalized_slug,
+            )
+        )
+        service = result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch service slug=%s", normalized_slug,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load service. Please try again.",
+        ) from exc
+
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Service '{slug}' not found.",
+        )
+    return service
+
+
+async def get_tier_by_id(
+    db: AsyncSession,
+    tier_id: int,
+) -> SubscriptionTier:
+    """Fetch a tier by numeric id or raise 404."""
+    try:
+        tier = await db.get(SubscriptionTier, tier_id)
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch tier id=%s", tier_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load tier. Please try again.",
+        ) from exc
+
+    if tier is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tier id={tier_id} not found.",
+        )
+    return tier
+
+
+async def get_tier_by_service_and_slug(
+    db: AsyncSession,
+    service_id: int,
+    tier_slug: str,
+) -> SubscriptionTier:
+    """Fetch a tier by (service_id, slug) or raise 404."""
+    normalized_slug = tier_slug.strip().lower()
+    try:
+        result = await db.execute(
+            select(SubscriptionTier).where(
+                SubscriptionTier.service_id == service_id,
+                SubscriptionTier.slug == normalized_slug,
+            )
+        )
+        tier = result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch tier service_id=%s slug=%s",
+            service_id, normalized_slug,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load tier. Please try again.",
+        ) from exc
+
+    if tier is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tier '{tier_slug}' not found for this service.",
+        )
+    return tier
+
+
+async def get_plan_by_slug(
+    db: AsyncSession,
+    slug: str,
+    *,
+    must_exist: bool = True,
+) -> SubscriptionPlan | None:
+    """
+    Fetch a plan by slug (globally unique).
+
+    Plan slugs are prefixed by tier slug at creation
+    (`{tier.slug}-{plan.name}`), and tier slugs are prefixed by
+    service name — so plan slugs are globally unique by construction.
+    """
+    normalized_slug = slug.strip().lower()
+    try:
+        result = await db.execute(
+            select(SubscriptionPlan).where(
+                SubscriptionPlan.slug == normalized_slug,
+            )
+        )
+        plan = result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch plan slug=%s", normalized_slug,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load plan. Please try again.",
+        ) from exc
+
+    if plan is None and must_exist:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Plan '{slug}' not found.",
+        )
+    return plan
+
+
+async def get_plan_by_tier_and_slug(
+    db: AsyncSession,
+    tier_id: int,
+    plan_slug: str,
+) -> SubscriptionPlan:
+    """Fetch a plan by (tier_id, slug) — used by scoped routes."""
+    normalized_slug = plan_slug.strip().lower()
+    try:
+        result = await db.execute(
+            select(SubscriptionPlan).where(
+                SubscriptionPlan.tier_id == tier_id,
+                SubscriptionPlan.slug == normalized_slug,
+            )
+        )
+        plan = result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch plan tier_id=%s slug=%s",
+            tier_id, normalized_slug,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load plan. Please try again.",
+        ) from exc
+
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Plan '{plan_slug}' not found for this tier.",
+        )
+    return plan
+
+
+async def get_plan_by_tier_and_name(
+    db: AsyncSession,
+    tier_id: int,
+    name: str,
+) -> SubscriptionPlan | None:
+    """Fetch a plan by (tier_id, name) — for uniqueness pre-checks."""
+    try:
+        result = await db.execute(
+            select(SubscriptionPlan).where(
+                SubscriptionPlan.tier_id == tier_id,
+                SubscriptionPlan.name == name,
+            )
+        )
+        return result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch plan tier_id=%s name=%s", tier_id, name,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load plan. Please try again.",
+        ) from exc
+
+
+async def count_subscriptions_for_plan(
+    db: AsyncSession,
+    plan_id: int,
+) -> int:
+    """Count subscriptions attached to a plan (FK guard for delete)."""
+    try:
+        result = await db.execute(
+            select(func.count())
+            .select_from(Subscription)
+            .where(Subscription.plan_id == plan_id)
+        )
+        return result.scalar() or 0
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to count subscriptions for plan_id=%s", plan_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load plan. Please try again.",
+        ) from exc
+
+
+# =============================================================================
+# BUILDERS — pure, no DB, no HTTP
+# =============================================================================
+
+def to_plan_read(plan: SubscriptionPlan) -> PlanRead:
+    """Assemble a full PlanRead from a SubscriptionPlan row."""
+    return PlanRead.model_validate(plan)
+
+
+def to_plan_summary_read(plan: SubscriptionPlan) -> PlanSummaryRead:
+    """Assemble a compact PlanSummaryRead (for nested tier views)."""
+    return PlanSummaryRead.model_validate(plan)
+
+
+def to_plan_list(
+    plans: list[SubscriptionPlan] | tuple[SubscriptionPlan, ...],
+) -> list[PlanRead]:
+    """Assemble a list of PlanRead."""
+    return [to_plan_read(p) for p in plans]
+
+
+# =============================================================================
+# CREATE
+# =============================================================================
 
 async def create_plan(
+    service_slug: str,
+    tier_slug: str,
     data: PlanCreate,
     db: AsyncSession,
     current_user: ReadUser,
-):
-    if not is_admin(current_user):
+) -> dict:
+    """
+    Create a plan under a tier.
+
+    URL: POST /services/{service_slug}/tiers/{tier_slug}/plans
+
+    - The service and tier must exist (404 otherwise).
+    - The tier must be active — you cannot add plans to a disabled
+      tier.
+    - `(tier_id, name)` must be unique per tier.
+    - Slug is `{tier.slug}-{plan.name}` — globally unique by
+      construction (tier slugs are already globally unique).
+    - `duration_months` is constrained to the allowed set.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Resolve the service
+    # ------------------------------------------------------------------
+    service = await get_service_by_slug(db, service_slug)
+    sid = service_id_of(service)
+
+    # ------------------------------------------------------------------
+    # 2. Resolve the tier within the service
+    # ------------------------------------------------------------------
+    tier = await get_tier_by_service_and_slug(
+        db, service_id=sid, tier_slug=tier_slug,
+    )
+    tid = tier_id_of(tier)
+
+    # ------------------------------------------------------------------
+    # 3. Tier must be active
+    # ------------------------------------------------------------------
+    if not tier.is_active:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator access required.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot create a plan for an inactive tier.",
         )
 
-    # Defensive check in case the function is called with an object
-    # constructed without normal Pydantic validation.
-    if data.duration_months not in ALLOWED_SUBSCRIPTION_DURATIONS:
+    # ------------------------------------------------------------------
+    # 4. Pre-check: (tier_id, name) uniqueness
+    # ------------------------------------------------------------------
+    existing = await get_plan_by_tier_and_name(
+        db, tier_id=tid, name=data.name,
+    )
+    if existing is not None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "Invalid subscription duration. Allowed durations "
-                "are 1, 2, 3, 6, and 12 months."
+                f"A plan named '{data.name}' already exists "
+                f"for this tier."
             ),
         )
 
+    # ------------------------------------------------------------------
+    # 5. Prepare the model
+    # ------------------------------------------------------------------
+    plan = SubscriptionPlan(
+        tier_id=tid,
+        name=data.name,
+        description=data.description,
+        duration_months=data.duration_months,
+        price=data.price,
+        slug=generate_slug(f"{tier.slug or tier.name}-{data.name}"),
+        is_active=True,
+    )
+
+    db.add(plan)
+
+    # ------------------------------------------------------------------
+    # 6. Flush
+    # ------------------------------------------------------------------
     try:
-        tier = await get_tier_by_id(db, data.tier_id)
+        await db.flush()
 
-        if not tier.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Cannot create a plan for an inactive tier.",
+    except IntegrityError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after plan IntegrityError: "
+                "tier_id=%s, name=%s", tid, data.name,
             )
 
-        existing_plan_id = await db.scalar(
-            select(SubscriptionPlan.id).where(
-                col(SubscriptionPlan.tier_id) == tier.id,
-                col(SubscriptionPlan.name) == data.name,
-            )
+        logger.warning(
+            "Plan creation violated a database integrity constraint: "
+            "tier_id=%s, name=%s, rollback_succeeded=%s",
+            tid, data.name, rollback_succeeded,
         )
 
-        if existing_plan_id is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A plan with this name already exists for the tier.",
-            )
-
-        plan = SubscriptionPlan(
-            tier_id=data.tier_id,
-            name=data.name,
-            description=data.description,
-            duration_months=data.duration_months,
-            price=data.price,
-            slug=generate_slug(
-                f"{tier.slug or tier.name}-{data.name}"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A plan named '{data.name}' (or its slug) "
+                f"already exists."
             ),
-            is_active=True,
-        )
-
-        db.add(plan)
-
-        await commit_or_rollback(
-            db,
-            operation="creating a plan",
-        )
-
-        await refresh_or_raise(
-            db,
-            plan,
-            operation="refreshing a plan",
-        )
-
-        return {
-            "message": "Subscription plan created successfully.",
-            "plan": to_plan_read(plan),
-        }
-
-    except HTTPException:
-        raise
+        ) from exc
 
     except SQLAlchemyError as exc:
-        await db.rollback()
-        raise database_error("creating a plan", exc) from exc
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after plan flush error: tier_id=%s",
+                tid,
+            )
 
+        logger.exception(
+            "Database error while flushing new plan: "
+            "tier_id=%s, rollback_succeeded=%s",
+            tid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Failed to create plan. "
+                "Check its state if the database could not be recovered."
+            ),
+        ) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected plan flush error: "
+                "tier_id=%s", tid,
+            )
+
+        logger.exception(
+            "Unexpected error while flushing new plan: "
+            "tier_id=%s, rollback_succeeded=%s",
+            tid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while creating plan.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 7. Commit
+    # ------------------------------------------------------------------
+    try:
+        await db.commit()
+
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: "
+                "tier_id=%s, name=%s", tid, data.name,
+            )
+
+        logger.exception(
+            "Plan commit failed or has an uncertain outcome: "
+            "tier_id=%s, name=%s", tid, data.name,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The plan creation could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 8. Refresh (best-effort) + return
+    # ------------------------------------------------------------------
+    try:
+        await db.refresh(plan)
+    except Exception:
+        logger.exception(
+            "Failed to refresh plan after create: tier_id=%s", tid,
+        )
+
+    logger.info(
+        "Plan '%s' (slug=%s) created for tier_id=%s by user_id=%s",
+        plan.name, plan.slug, tid, current_user.id,
+    )
+
+    return {
+        "message": "Subscription plan created successfully.",
+        "plan": to_plan_read(plan),
+    }
 
 
 # =============================================================================
-# PLAN — READ FOR TIER BY SLUG (ADMIN ONLY)
+# READ — for a tier (scoped)
 # =============================================================================
 
 async def read_plans_for_tier(
+    service_slug: str,
     tier_slug: str,
     db: AsyncSession,
     current_user: ReadUser,
 ) -> list[PlanRead]:
     """
-    Read all subscription plans belonging to a tier by tier slug.
+    List all plans under a tier.
 
-    Administrators only.
-    Includes inactive plans and plans belonging to inactive services.
+    URL: GET /services/{service_slug}/tiers/{tier_slug}/plans
+
+    Includes inactive plans. Admin-only via route. Sorted by
+    `duration_months`, then `name` (stable tiebreak).
     """
-    if not is_admin(current_user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrator access required.",
-        )
+    service = await get_service_by_slug(db, service_slug)
+    sid = service_id_of(service)
 
-    # ---------------------------------------------------------
-    # Retrieve tier by slug
-    # ---------------------------------------------------------
-    tier = await get_tier_by_slug(db, tier_slug)
-
-    # ---------------------------------------------------------
-    # Retrieve all plans belonging to the tier
-    # ---------------------------------------------------------
-    query = (
-        select(SubscriptionPlan)
-        .where(
-            col(SubscriptionPlan.tier_id) == tier.id
-        )
-        .order_by(
-            col(SubscriptionPlan.duration_months)
-        )
+    tier = await get_tier_by_service_and_slug(
+        db, service_id=sid, tier_slug=tier_slug,
     )
+    tid = tier_id_of(tier)
 
     try:
-        result = await db.execute(query)
-
-        return [
-            to_plan_read(plan)
-            for plan in result.scalars().all()
-        ]
-
+        result = await db.execute(
+            select(SubscriptionPlan)
+            .where(SubscriptionPlan.tier_id == tid)
+            .order_by(
+                col(SubscriptionPlan.duration_months).asc(),
+                col(SubscriptionPlan.name).asc(),
+            )
+        )
+        plans = list(result.scalars().all())
     except SQLAlchemyError as exc:
-        raise database_error(
-            "reading plans for a subscription tier",
-            exc,
+        logger.exception(
+            "Failed to load plans for tier_id=%s", tid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load plans. Please try again.",
         ) from exc
 
+    return to_plan_list(plans)
 
 
 # =============================================================================
-# PLAN — UPDATE
+# READ — single by slug (flat)
+# =============================================================================
+
+async def read_plan_by_slug(
+    slug: str,
+    db: AsyncSession,
+) -> PlanRead:
+    """
+    Read a single plan by slug (admin-only via route).
+
+    URL: GET /plans/{plan_slug}
+
+    Slug is globally unique (tier slug + plan name), so no
+    ambiguity across tiers.
+    """
+    plan = await get_plan_by_slug(db, slug)
+    assert plan is not None
+    return to_plan_read(plan)
+
+
+# =============================================================================
+# UPDATE — scoped by (service, tier, plan)
 # =============================================================================
 
 async def update_plan(
-    slug: str,
+    service_slug: str,
+    tier_slug: str,
+    plan_slug: str,
     data: PlanUpdate,
     db: AsyncSession,
 ) -> dict:
-    plan = await get_plan_by_slug(db, slug)
-    changes = data.model_dump(exclude_unset=True)
+    """
+    Update a plan under a tier.
 
-    if not changes:
+    URL: PATCH /services/{svc}/tiers/{tier}/plans/{plan}
+
+    Mutable:
+        - description
+        - duration_months
+        - price
+        - is_active
+
+    Immutable:
+        - name        (URL and receipts key on it)
+        - slug        (derived at creation)
+        - tier_id     (a plan never moves between tiers)
+
+    Contract:
+        - Empty payload rejected.
+        - No-op rejected.
+        - flush → commit → refresh.
+        - No IntegrityError branch: name and slug are immutable here.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Resolve the hierarchy
+    # ------------------------------------------------------------------
+    service = await get_service_by_slug(db, service_slug)
+    sid = service_id_of(service)
+
+    tier = await get_tier_by_service_and_slug(
+        db, service_id=sid, tier_slug=tier_slug,
+    )
+    tid = tier_id_of(tier)
+
+    plan = await get_plan_by_tier_and_slug(
+        db, tier_id=tid, plan_slug=plan_slug,
+    )
+    pid = plan_id_of(plan)
+
+    # ==============================================================
+    # 2. Reject completely empty update payload
+    # ==============================================================
+    if all(
+        v is None
+        for v in (
+            data.description,
+            data.duration_months,
+            data.price,
+            data.is_active,
+        )
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided.",
+            detail="At least one field must be provided for update",
         )
 
-    changed = False
-    for field_name, value in changes.items():
-        if getattr(plan, field_name) != value:
-            setattr(plan, field_name, value)
-            changed = True
+    # ==============================================================
+    # 3. Update only fields that actually changed
+    # ==============================================================
+    updated_fields: list[str] = []
 
-    if not changed:
+    if (
+        data.description is not None
+        and data.description != plan.description
+    ):
+        plan.description = data.description
+        updated_fields.append("description")
+
+    if (
+        data.duration_months is not None
+        and data.duration_months != plan.duration_months
+    ):
+        plan.duration_months = data.duration_months
+        updated_fields.append("duration_months")
+
+    if (
+        data.price is not None
+        and data.price != plan.price
+    ):
+        plan.price = data.price
+        updated_fields.append("price")
+
+    if (
+        data.is_active is not None
+        and data.is_active != plan.is_active
+    ):
+        plan.is_active = data.is_active
+        updated_fields.append("is_active")
+
+    # ==============================================================
+    # 4. Reject no-op
+    # ==============================================================
+    if not updated_fields:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No changes were made.",
+            detail="No changes were made",
         )
 
-    await commit_or_rollback(db, operation="updating a plan")
-    await refresh_or_raise(db, plan, operation="refreshing a plan")
+    # ---------------------------------------------------------
+    # 5. Flush
+    # ---------------------------------------------------------
+    try:
+        await db.flush()
+
+    except SQLAlchemyError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after plan flush error: plan_id=%s",
+                pid,
+            )
+
+        logger.exception(
+            "Database error while flushing plan update: "
+            "plan_id=%s, rollback_succeeded=%s",
+            pid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Failed to update plan. "
+                "Check its state if the database could not be recovered."
+            ),
+        ) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected flush error: "
+                "plan_id=%s", pid,
+            )
+
+        logger.exception(
+            "Unexpected error while flushing plan update: "
+            "plan_id=%s, rollback_succeeded=%s",
+            pid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while updating plan.",
+        ) from exc
+
+    # ---------------------------------------------------------
+    # 6. Commit
+    # ---------------------------------------------------------
+    try:
+        await db.commit()
+
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: plan_id=%s",
+                pid,
+            )
+
+        logger.exception(
+            "Plan commit failed or has an uncertain outcome: "
+            "plan_id=%s", pid,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The plan update could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    # ---------------------------------------------------------
+    # 7. Refresh (best-effort) + return
+    # ---------------------------------------------------------
+    try:
+        await db.refresh(plan)
+    except Exception:
+        logger.exception(
+            "Failed to refresh plan after update: plan_id=%s", pid,
+        )
+
+    logger.info(
+        "Plan updated successfully: plan_id=%s, fields=%s",
+        pid, ",".join(updated_fields),
+    )
 
     return {
         "message": "Subscription plan updated successfully.",
@@ -181,116 +953,313 @@ async def update_plan(
 
 
 # =============================================================================
-# PLAN — DELETE BY SLUG
+# DELETE — scoped by (service, tier, plan)
 # =============================================================================
 
 async def delete_plan(
-    slug: str,
+    service_slug: str,
+    tier_slug: str,
+    plan_slug: str,
     db: AsyncSession,
-    #current_user: ReadUser,
 ) -> dict[str, str]:
     """
-    Delete a subscription plan by slug.
+    Delete a plan under a tier.
 
-    Administrators only.
-    Plans referenced by subscriptions cannot be deleted.
+    URL: DELETE /services/{svc}/tiers/{tier}/plans/{plan}
+
+    Refused if subscriptions reference it (FK RESTRICT). The
+    friendly pre-check backs the FK against the concurrent-
+    subscription race.
     """
-    # if not is_admin(current_user):
-    #     raise HTTPException(
-    #         status_code=status.HTTP_403_FORBIDDEN,
-    #         detail="Administrator access required.",
-    #     )
 
-    plan = await get_plan_by_slug(db, slug)
+    # ------------------------------------------------------------------
+    # 1. Resolve the hierarchy
+    # ------------------------------------------------------------------
+    service = await get_service_by_slug(db, service_slug)
+    sid = service_id_of(service)
 
-    count = await count_subscriptions(
-        db,
-        slug=plan.slug,
+    tier = await get_tier_by_service_and_slug(
+        db, service_id=sid, tier_slug=tier_slug,
     )
+    tid = tier_id_of(tier)
 
+    plan = await get_plan_by_tier_and_slug(
+        db, tier_id=tid, plan_slug=plan_slug,
+    )
+    pid = plan_id_of(plan)
+    plan_name = plan.name
+
+    # ------------------------------------------------------------------
+    # 2. Refuse if subscriptions reference it
+    # ------------------------------------------------------------------
+    count = await count_subscriptions_for_plan(db, pid)
     if count:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "This plan cannot be deleted because subscriptions "
-                "reference it."
+                f"Plan '{plan_name}' cannot be deleted because "
+                f"{count} "
+                f"{'subscription references' if count == 1 else 'subscriptions reference'} "
+                f"it."
             ),
         )
 
+    # ------------------------------------------------------------------
+    # 3. Stage the delete + flush
+    # ------------------------------------------------------------------
     try:
         await db.delete(plan)
-        await commit_or_rollback(
-            db,
-            operation="deleting a plan",
+        await db.flush()
+
+    except IntegrityError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after plan IntegrityError: plan_id=%s",
+                pid,
+            )
+
+        logger.warning(
+            "Plan delete blocked by FK constraint: plan_id=%s, "
+            "rollback_succeeded=%s",
+            pid, rollback_succeeded,
         )
 
-    except HTTPException:
-        raise
-
-    except SQLAlchemyError as exc:
-        await db.rollback()
-        raise database_error(
-            "deleting a plan",
-            exc,
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Plan '{plan_name}' now has subscriptions and "
+                f"cannot be deleted. Refresh and try again."
+            ),
         ) from exc
 
+    except SQLAlchemyError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after plan delete flush error: "
+                "plan_id=%s", pid,
+            )
+
+        logger.exception(
+            "Database error while flushing plan delete: "
+            "plan_id=%s, rollback_succeeded=%s",
+            pid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Failed to delete plan. "
+                "Check its state if the database could not be recovered."
+            ),
+        ) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected delete flush error: "
+                "plan_id=%s", pid,
+            )
+
+        logger.exception(
+            "Unexpected error while flushing plan delete: "
+            "plan_id=%s, rollback_succeeded=%s",
+            pid, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while deleting plan.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 4. Commit
+    # ------------------------------------------------------------------
+    try:
+        await db.commit()
+
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: plan_id=%s",
+                pid,
+            )
+
+        logger.exception(
+            "Plan delete commit failed or has an uncertain outcome: "
+            "plan_id=%s", pid,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The plan deletion could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    logger.info("Plan '%s' (id=%s) deleted", plan_name, pid)
+
     return {
-        "message": "Subscription plan deleted successfully."
+        "message": "Subscription plan deleted successfully.",
+        "plan_name": plan_name,
         }
 
 
-# ---------------------------------------------------------------------------
-# Lookup helpers
-# ---------------------------------------------------------------------------
-    
-async def get_plan_by_slug(
-    db: AsyncSession,
-    slug: str,
-) -> SubscriptionPlan:
-    try:
-        result = await db.execute(
-            select(SubscriptionPlan).where(
-                SubscriptionPlan.slug == slug
-            )
-        )
-        
-        #tier = result.scalars().first()
-        plan = result.scalars().first()
-    except SQLAlchemyError as exc:
-        raise database_error("looking up a tier by slug", exc) from exc
-
-    if plan is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription plan not found.",
-        )
-    return plan
 
 
+"""Subscription plan routes."""
+
+from fastapi import APIRouter, status
+
+from api.deps import AdminUser, DBDep
+from api.subscriptions.logics.plan import (
+    create_plan,
+    delete_plan,
+    read_plan_by_slug,
+    read_plans_for_tier,
+    update_plan,
+)
+from api.subscriptions.schemas import (
+    CreatePlanResponse,
+    DeletePlanResponse,
+    PlanCreate,
+    PlanRead,
+    PlanUpdate,
+    UpdatePlanResponse,
+)
 
 
+router = APIRouter(tags=["Subscription Plans"])
 
-async def get_plan_by_id(
-    db: AsyncSession,
-    plan_id: int,
-) -> SubscriptionPlan:
-    try:
-        result = await db.execute(
-            select(SubscriptionPlan).where(
-                SubscriptionPlan.id == plan_id
-            )
-        )
-        plan = result.scalars().first()
-    except SQLAlchemyError as exc:
-        raise database_error("looking up a plan", exc) from exc
 
-    if plan is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription plan not found.",
-        )
+# =============================================================================
+# CREATE — POST /services/{svc}/tiers/{tier}/plans
+# =============================================================================
 
-    return plan
+@router.post(
+    "/services/{service_slug}/tiers/{tier_slug}/plans",
+    response_model=CreatePlanResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a plan under a tier (admin)",
+)
+async def create(
+    service_slug: str,
+    tier_slug: str,
+    data: PlanCreate,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await create_plan(
+        service_slug=service_slug,
+        tier_slug=tier_slug,
+        data=data,
+        db=db,
+        current_user=current_user,
+    )
+
+
+# =============================================================================
+# READ — GET /services/{svc}/tiers/{tier}/plans
+# =============================================================================
+
+@router.get(
+    "/services/{service_slug}/tiers/{tier_slug}/plans",
+    response_model=list[PlanRead],
+    summary="List plans for a tier (admin)",
+)
+async def list_for_tier(
+    service_slug: str,
+    tier_slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await read_plans_for_tier(
+        service_slug=service_slug,
+        tier_slug=tier_slug,
+        db=db,
+        current_user=current_user,
+    )
+
+
+# =============================================================================
+# READ — GET /plans/{plan_slug}
+# =============================================================================
+
+@router.get(
+    "/plans/{plan_slug}",
+    response_model=PlanRead,
+    summary="Get a plan by slug (admin)",
+)
+async def read_single(
+    plan_slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await read_plan_by_slug(slug=plan_slug, db=db)
+
+
+# =============================================================================
+# UPDATE — PATCH /services/{svc}/tiers/{tier}/plans/{plan}
+# =============================================================================
+
+@router.patch(
+    "/services/{service_slug}/tiers/{tier_slug}/plans/{plan_slug}",
+    response_model=UpdatePlanResponse,
+    summary="Update a plan (admin)",
+)
+async def update(
+    service_slug: str,
+    tier_slug: str,
+    plan_slug: str,
+    data: PlanUpdate,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await update_plan(
+        service_slug=service_slug,
+        tier_slug=tier_slug,
+        plan_slug=plan_slug,
+        data=data,
+        db=db,
+    )
+
+
+# =============================================================================
+# DELETE — DELETE /services/{svc}/tiers/{tier}/plans/{plan}
+# =============================================================================
+
+@router.delete(
+    "/services/{service_slug}/tiers/{tier_slug}/plans/{plan_slug}",
+    response_model=DeletePlanResponse,
+    summary="Delete a plan (admin)",
+)
+async def delete(
+    service_slug: str,
+    tier_slug: str,
+    plan_slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await delete_plan(
+        service_slug=service_slug,
+        tier_slug=tier_slug,
+        plan_slug=plan_slug,
+        db=db,
+)
 
 
 
