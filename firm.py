@@ -1,32 +1,4 @@
-def to_tier_with_plans_read(
-    tier: SubscriptionTier,
-    visible_plans: list[SubscriptionPlan],
-) -> TierWithPlansRead:
-    """
-    Assemble a TierWithPlansRead for one tier.
 
-    `visible_plans` is pre-filtered by the caller (admin vs public)
-    so the builder stays free of authorization logic.
-    """
-    return TierWithPlansRead(
-        **TierRead.model_validate(tier).model_dump(),
-        plans=[to_plan_read(p) for p in visible_plans],
-    )
-"""
-    Argument of type "list[PlanRead]" cannot be assigned to parameter "plans" of type 
-    "list[PlanSummaryRead]" in function "__init__"PylancereportArgumentType
-
-
-
-class TierWithPlansRead(TierRead):
-    """A tier with its list of plans, sorted by name."""
-    plans: list[PlanSummaryRead] = []# if i used this updated one the error appear
-
-
-class TierWithPlansRead(TierRead):
-    plans: list[PlanRead] = Field(default_factory=list) # if i used this no error
-
-"""
 
 
 
@@ -61,7 +33,8 @@ async def read_tier_by_slug(
         plans_result = await db.execute(
             select(SubscriptionPlan)
             .where(SubscriptionPlan.tier_id == tid)
-            .order_by(SubscriptionPlan.name.asc())
+            .order_by(SubscriptionPlan.name.asc())#Cannot access attribute "asc" for class "str"
+  #Attribute "asc" is unknownPylancereportAttrib
         )
         plans = list(plans_result.scalars().all())
     except SQLAlchemyError as exc:
@@ -84,35 +57,6 @@ async def read_tier_by_slug(
   Type "SubscriptionTier | None" is not assignable to type "SubscriptionTier"
     "None" is not assignable to "SubscriptionTier"PylancereportArgumentType
     """
-
-
-
-
-
-
-
-
-
-
-
-
-# builder
-
-
-
-
-
-# =============================================================================
-# READ — SINGLE BY SLUG (with plans)
-# =============================================================================
-
-
-
-
-
-
-
-
 
 
 #end
