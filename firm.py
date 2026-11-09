@@ -1,3 +1,61 @@
+async def read_tiers_with_plans_for_service(
+    service_slug: str,
+    db: AsyncSession,
+) -> ServiceWithTiersRead:
+    """
+    Read a service with all its tiers and plans (admin-only).
+
+    URL: GET /services/{service_slug}/tiers
+
+    Returns the full tree:
+        Receipt
+          ├─ Starter
+          │    ├─ 1 month  $5
+          │    └─ 3 month  $10
+          └─ Pro
+               └─ 1 month  $10
+    """
+    service = await get_service_by_slug(db, service_slug)
+    sid = service_id_of(service)
+
+    # Load tiers with plans eager-loaded
+    try:
+        result = await db.execute(
+            select(SubscriptionTier)
+            .where(col(SubscriptionTier.service_id) == sid)
+            .options(load_relationship(SubscriptionTier.plans))
+            .order_by(col(SubscriptionTier.name).asc())
+        )
+        tiers = list(result.scalars().all())
+    except SQLAlchemyError as exc:
+        raise database_error(
+            "reading service tiers", exc,
+        ) from exc
+
+    tier_reads = []
+    for tier in tiers:
+        plans = sorted(tier.plans or [], key=lambda p: p.name)
+        tier_reads.append(to_tier_with_plans_read(tier, plans))
+
+    # Reuse the ServiceWithTiersRead builder from earlier
+    return to_service_with_tiers_read(service, tier_reads)
+
+
+
+
+@router.get(
+    "/services/{service_slug}/tiers",
+    response_model=ServiceWithTiersRead,
+    summary="List all tiers with plans for a service (admin)",
+)
+async def list_tiers_for_service(
+    service_slug: str,
+    db: DBDep,
+    current_user: AdminUser,
+):
+    return await read_tiers_with_plans_for_service(
+        service_slug=service_slug, db=db,
+    )
 
 
 
