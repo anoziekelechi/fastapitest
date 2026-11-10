@@ -13,7 +13,7 @@ class SubscriptionUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     auto_renew: bool
-
+# you introduced SubscriptionStatusLabel
 
 class SubscriptionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -40,7 +40,8 @@ class SubscriptionRead(BaseModel):
     days_remaining: int | None = None
     status_label: str | None = None
     can_access: bool = False
-
+    # you added 
+    status_label
 
 class SubscriptionStatusRead(BaseModel):
     """Status of one firm subscription for one service."""
@@ -54,7 +55,7 @@ class SubscriptionStatusRead(BaseModel):
     is_active: bool
     is_on_trial: bool
     days_remaining: int
-    status_label: str
+    status_label: str vs your own usesSubscriptionStatusLabel
     can_access: bool
 
 
