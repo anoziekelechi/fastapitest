@@ -5,54 +5,10 @@
 
 
 
-# only select those logics not above
-
-"""Subscription operations: read, update, trial, activate."""
-
-import logging
-from datetime import timedelta
-
-from fastapi import HTTPException, status
-from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import col
-
-from api.core.media import resolve_logo_url
-from api.firms.logics import firm_id_of, require_firm_access
-from api.models.firm import Firm
-from api.models.subscription import (
-    Subscription,
-    SubscriptionPlan,
-    SubscriptionService,
-    SubscriptionTier,
-)
-from api.core.guards import guard_firm_state, guard_user_state
-from api.subscriptions.logics.subscription import (
-    as_utc,
-    compute_status_label,
-    to_subscription_list,
-    to_subscription_read,
-    utc_now,
-)
-from api.subscriptions.schemas import (
-    SubscriptionActivate,
-    SubscriptionRead,
-    SubscriptionStatusRead,
-    SubscriptionUpdate,
-    TrialServiceListRead,
-    TrialServiceRead,
-)
-from api.users.schemas import ReadUser
-
-
-logger = logging.getLogger(__name__)
 
 
 
-# =============================================================================
-# LOADERS
-# =============================================================================
+
 
 
 
