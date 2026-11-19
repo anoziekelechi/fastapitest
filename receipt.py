@@ -781,93 +781,7 @@ async def create_receipt(
 
 # =============================================================================
 # EMAIL (background task — owns its own session)
-# =============================================================================
-
-async def send_receipt_email(
-    receipt_slug: str,
-    firm_id: int,
-    mailer: FastMail,
-) -> None:
-    """
-    Send a receipt to the customer's email.
-
-    Must not raise. Runs in a FastAPI BackgroundTask; opens its own
-    DB session (the request-scoped one is already closed).
-    """
-    # Local import to avoid a circular import at module load time
-    from api.db.session import async_session_maker
-
-    try:
-        async with async_session_maker() as db:
-            receipt = await get_receipt_by_slug(db, receipt_slug)
-            if not receipt or not receipt.customer_email:
-                logger.warning(
-                    "Receipt email skipped: slug=%s missing or no customer_email",
-                    receipt_slug,
-                )
-                return
-
-            firm = await db.get(Firm, firm_id)
-            if not firm:
-                logger.warning(
-                    "Receipt email skipped: firm_id=%s not found",
-                    firm_id,
-                )
-                return
-
-            sitename = (await get_home_settings_logic(db)).sitename
-
-            context = {
-                "firm": firm,
-                "receipt": receipt,
-                "current_year": datetime.now(timezone.utc).year,
-                "sitename": sitename,
-                "full_names": receipt.customer_fullname,
-            }
-
-            # Attach PDF (best-effort)
-            attachments: list[dict] = []
-            try:
-                pdf_bytes = render_pdf(
-                    template_name="receipts/customer_receipt_pdf.html",
-                    context=context,
-                )
-                attachments.append(
-                    {
-                        "file": pdf_bytes,
-                        "filename": f"receipt-{receipt.receipt_number}.pdf",
-                        "mime_type": "application",
-                        "mime_subtype": "pdf",
-                    }
-                )
-            except Exception:
-                logger.exception(
-                    "PDF generation failed for receipt=%s — "
-                    "sending HTML-only email",
-                    receipt.receipt_number,
-                )
-
-            await send_email(
-                recipient=receipt.customer_email,
-                subject=f"Receipt #{receipt.receipt_number} from {firm.name}",
-                mailer=mailer,
-                db=db,
-                full_names=receipt.customer_fullname,
-                template_name="receipts/customer_receipt.html",
-                template_body=context,
-                attachments=attachments,
-            )
-
-            logger.info(
-                "Receipt #%s emailed to %s (pdf_attached=%s)",
-                receipt.receipt_number,
-                receipt.customer_email,
-                bool(attachments),
-            )
-    except Exception:
-        logger.exception(
-            "Failed to send receipt email for slug=%s", receipt_slug
-        )
+# ===========================================================================
 
 
 # =============================================================================
@@ -914,64 +828,7 @@ async def render_receipt_pdf(
         )
 
 
-# =============================================================================
-# READ 
-# this should returns receipt per branch
-# =============================================================================
 
-async def read_my_receipts(
-    db: AsyncSession,
-    current_user: ReadUser,
-    firm_slug: str | None = None,
-    skip: int = 0,
-    limit: int = 100,
-) -> ReceiptListRead:
-    """Get receipts for the current user's firms."""
-
-    base_query = (
-        select(Receipt)
-        .join(Firm, Receipt.firm_id == Firm.id)
-        .where(Firm.user_id == current_user.id)
-    )
-
-    if firm_slug:
-        from api.firms.logics import get_firm_by_slug
-
-        firm = await get_firm_by_slug(db, firm_slug)
-        if not firm or firm.user_id != current_user.id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Firm '{firm_slug}' not found",
-            )
-        base_query = base_query.where(Receipt.firm_id == firm.id)
-
-    try:
-        total: int = (
-            await db.execute(
-                select(func.count()).select_from(base_query.subquery())
-            )
-        ).scalar() or 0
-
-        result = await db.execute(
-            base_query
-            .order_by(Receipt.created_at.desc())
-            .offset(skip)
-            .limit(limit)
-        )
-        receipts = result.scalars().all()
-    except Exception:
-        logger.exception(
-            "Failed to load receipts for user_id=%s", current_user.id
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load receipts. Please try again.",
-        )
-
-    return ReceiptListRead(
-        total=total,
-        receipts=[ReceiptRead.model_validate(r) for r in receipts],
-    )
 
 
 async def read_single_receipt(
