@@ -1,5 +1,221 @@
 
 
+async def setup_home_logic(
+    db: AsyncSession,
+    sitename: str | None = None,
+    intro: str | None = None,
+    logo_key: UploadFile | None = None,
+    banner_key: UploadFile | None = None,
+) -> dict:
+    """
+    Create or partially update the MAIN home configuration.
+    """
+
+    # ------------------------------------------------------------------
+    # Load existing config
+    # ------------------------------------------------------------------
+    try:
+        result = await db.execute(
+            select(Home).where(Home.config_type == "MAIN")
+        )
+        current = result.scalars().first()
+    except Exception:
+        logger.exception("Failed to load MAIN home config")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load home configuration",
+        )
+
+    # =========================================================================
+    # FIRST-TIME SETUP
+    # =========================================================================
+    if current is None:
+        if sitename is None or not sitename.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Site name is required for initial home setup",
+            )
+
+        cleaned_sitename = sitename.strip()
+        cleaned_intro = intro.strip() if intro is not None else None
+
+        # Uploads happen BEFORE the DB insert so we can clean up on failure
+        new_logo_key = await handle_file_update(
+            file=logo_key, current_key=None,
+            prefix=LOGO_FOLDER, max_size=LOGO_MAX_SIZE,
+        )
+        new_banner_key = await handle_file_update(
+            file=banner_key, current_key=None,
+            prefix=BANNER_FOLDER, max_size=BANNER_MAX_SIZE,
+        )
+
+        try:
+            record = Home(
+                config_type="MAIN",
+                sitename=cleaned_sitename,
+                intro=cleaned_intro,
+                logo_key=new_logo_key,
+                banner_key=new_banner_key,
+            )
+            db.add(record)
+            await db.commit()
+            await db.refresh(record)
+        except Exception as exc:
+            await db.rollback()
+            logger.exception("Failed to create home configuration")
+
+            # Best-effort cleanup of files uploaded before commit
+            if new_logo_key:
+                delete_from_r2(new_logo_key)
+            if new_banner_key:
+                delete_from_r2(new_banner_key)
+
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create home configuration",
+            ) from exc
+
+        return {
+            "message":"Home configuration created successfully",
+             "home": ReadHome(
+                id=record.id,
+                sitename=record.sitename,
+                intro=record.intro,
+                logo_key=get_public_url(record.logo_key),
+                banner_key=get_public_url(record.banner_key),
+            ),
+        }
+
+    # =========================================================================
+    # PARTIAL UPDATE
+    # =========================================================================
+    old_logo_key = current.logo_key
+    old_banner_key = current.banner_key
+
+    new_logo_key: str | None = None
+    new_banner_key: str | None = None
+
+    try:
+        if sitename is not None:
+            cleaned = sitename.strip()
+            if not cleaned:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Site name cannot be empty",
+                )
+            current.sitename = cleaned
+
+        if intro is not None:
+            current.intro = intro.strip()
+
+        if logo_key is not None:
+            new_logo_key = await handle_file_update(
+                file=logo_key, current_key=old_logo_key,
+                prefix=LOGO_FOLDER, max_size=LOGO_MAX_SIZE,
+            )
+            current.logo_key = new_logo_key
+
+        if banner_key is not None:
+            new_banner_key = await handle_file_update(
+                file=banner_key, current_key=old_banner_key,
+                prefix=BANNER_FOLDER, max_size=BANNER_MAX_SIZE,
+            )
+            current.banner_key = new_banner_key
+
+        if (
+            sitename is None
+            and intro is None
+            and logo_key is None
+            and banner_key is None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="At least one field must be provided",
+            )
+
+        db.add(current)
+        await db.commit()
+        await db.refresh(current)
+
+    except HTTPException:
+        await db.rollback()
+        # Validation failed AFTER uploads → remove orphans
+        if new_logo_key and new_logo_key != old_logo_key:
+            delete_from_r2(new_logo_key)
+        if new_banner_key and new_banner_key != old_banner_key:
+            delete_from_r2(new_banner_key)
+        raise
+
+    except Exception as exc:
+        await db.rollback()
+        logger.exception("Failed to update home configuration")
+
+        if new_logo_key and new_logo_key != old_logo_key:
+            delete_from_r2(new_logo_key)
+        if new_banner_key and new_banner_key != old_banner_key:
+            delete_from_r2(new_banner_key)
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update home configuration",
+        ) from exc
+
+    # Delete old files ONLY after successful commit
+    if new_logo_key and old_logo_key and new_logo_key != old_logo_key:
+        delete_from_r2(old_logo_key)
+    if new_banner_key and old_banner_key and new_banner_key != old_banner_key:
+        delete_from_r2(old_banner_key)
+
+    return {
+        "message":"Home confiuration updated successfully",
+        "home":ReadHome(
+            id=current.id,
+            sitename=current.sitename,
+            intro=current.intro,
+            logo_key=get_public_url(current.logo_key),
+            banner_key=get_public_url(current.banner_key),
+        ), 
+    }
+
+
+
+
+# =============================================================================
+# PUBLIC HOME SETTINGS
+# =============================================================================
+
+async def get_home_settings_logic(db: AsyncSession) -> ReadHome:
+    """Public — returns MAIN config or a safe default."""
+    try:
+        result = await db.execute(
+            select(Home).where(Home.config_type == "MAIN")
+        )
+        home = result.scalars().first()
+    except Exception:
+        logger.exception("Failed to load home settings")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load home settings",
+        )
+
+    if home is None:
+        return ReadHome(
+            id=0,
+            sitename="Ecommerce",
+            intro="",
+            logo_key=None,
+            banner_key=None,
+        )
+
+    return ReadHome(
+        id=home.id,
+        sitename=home.sitename,
+        intro=home.intro,
+        logo_key=get_public_url(home.logo_key),
+        banner_key=get_public_url(home.banner_key),
+    )
+
+
 
 
 
