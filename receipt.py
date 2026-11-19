@@ -47,6 +47,157 @@ class ReceiptCsvResponse(BaseModel):
     row_count: int
 
 
+#Model
+class Receipt(BaseModel, table=True):
+    """
+    Receipt issued by a firm to a customer.
+    
+    Financial calculations:
+        subtotal    = quantity × unit_price
+        net_total   = subtotal - discount
+        grand_total = net_total + tax + shipping
+    """
+    __tablename__ = "receipts"  # type: ignore
+
+    # FK to Firm
+    firm_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("firms.id", ondelete="SET NULL"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    # FK to PaymentMethods
+    payment_method_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("paymentmethods.id", ondelete="RESTRICT"),
+            nullable=False,
+        )
+    )
+
+    # Receipt number - unique 10 char identifier
+    receipt_number: str = Field(
+        default_factory=generate_receipt_number,
+        sa_column=Column(
+            String(20),
+            nullable=False,
+            unique=True,
+            index=True,
+        )
+    )
+
+    slug: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), 
+        nullable=True,
+        index=True)
+    )
+    branch_id: int = Field(
+        sa_column=Column(
+        Integer,
+        ForeignKey("brancges.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True
+    )
+
+    )
+    # Customer details
+    customer_fullname: str = Field(
+        sa_column=Column(String(200), nullable=False)
+    )
+    customer_email: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), nullable=True)
+    )
+    customer_address: str = Field(
+        sa_column=Column(Text, nullable=False)
+    )
+    customer_phone: str = Field(
+        sa_column=Column(String(20), nullable=False)
+    )
+
+
+    # Product details
+    product_name: str = Field(
+        sa_column=Column(String(200), nullable=False)
+    )
+    serial_number: str = Field(
+        sa_column=Column(String(100), nullable=False)
+    )
+    quantity: int = Field(
+        sa_column=Column(Integer, nullable=False)
+    )
+
+    # Pricing
+    unit_price: Decimal = Field(
+        sa_column=Column(Numeric(precision=12, scale=2), nullable=False)
+    )
+   
+    discount: Decimal = Field(
+    default=Decimal("0.00"),
+    sa_column=Column(
+        Numeric(precision=12, scale=2),
+        nullable=False,
+        server_default="0"
+        ),
+    )
+
+    tax: Decimal = Field(
+    default=Decimal("0.00"),
+    sa_column=Column(
+        Numeric(precision=12, scale=2),
+        nullable=False,
+        server_default="0",
+        ),
+    )
+   
+    shipping: Decimal = Field(
+    default=Decimal("0.00"),
+    sa_column=Column(
+        Numeric(precision=12, scale=2),
+        nullable=False,
+        server_default="0"
+        ),
+    )
+
+    # Calculated totals - stored for historical accuracy
+    #calculated at creation time frozen for historical accuracy
+    # Do not recompute on read
+    subtotal: Decimal = Field(
+        sa_column=Column(Numeric(precision=12, scale=2), nullable=False)
+    )
+    
+    net_total: Decimal = Field(
+        sa_column=Column(Numeric(precision=12, scale=2), nullable=False)
+    )
+    grand_total: Decimal = Field(
+        sa_column=Column(Numeric(precision=12, scale=2), nullable=False)
+    )
+
+    # Status
+    status: str = Field(
+        default="paid",
+        sa_column=Column(
+            String(20),
+            nullable=False,
+            server_default="paid"
+        )
+    )
+    prepared_by: str = Field(
+        sa_column=Column(String(200), nullable=False)
+    )
+    # Relationships
+    branch:Optional["Branch"] = Relationship(back_populates="receipts")
+    firm: Optional["Firm"] = Relationship(back_populates="receipts")
+    payment_method: Optional["PaymentMethods"] = Relationship(
+        back_populates="receipts"
+    )
+
+
+
 
 # api/receipts/logics.py (additions)
 
@@ -54,157 +205,6 @@ import csv
 import io
 
 
-# =============================================================================
-# READ — receipts for a single firm (used by FirmDetail.tsx)
-# =============================================================================
-
-async def read_firm_receipts(
-    firm_slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-    skip: int = 0,
-    limit: int = 100,
-) -> FirmReceiptsRead:
-    """
-    Return all receipts for a single firm.
-
-    Access:
-        - owner of the firm
-        - any admin
-
-    Returns:
-        FirmReceiptsRead with total + paginated receipts.
-    """
-
-    # ---------------------------------------------------------------
-    # Resolve + authorize the firm
-    # ---------------------------------------------------------------
-    from api.firms.logics import get_firm_by_slug
-
-    firm = await get_firm_by_slug(db, firm_slug)
-    if not firm:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Firm '{firm_slug}' not found",
-        )
-
-    if firm.user_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only view receipts from your own firms",
-            headers={"X-Error-Code": "wrong_permission"},
-        )
-
-    # ---------------------------------------------------------------
-    # Count + fetch
-    # ---------------------------------------------------------------
-    try:
-        total: int = (
-            await db.execute(
-                select(func.count())
-                .select_from(Receipt)
-                .where(Receipt.firm_id == firm.id)
-            )
-        ).scalar() or 0
-
-        result = await db.execute(
-            select(Receipt)
-            .where(Receipt.firm_id == firm.id)
-            .order_by(Receipt.created_at.desc())
-            .offset(skip)
-            .limit(limit)
-        )
-        receipts = result.scalars().all()
-    except Exception:
-        logger.exception(
-            "Failed to load receipts for firm_id=%s", firm.id
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load receipts. Please try again.",
-        )
-
-    return FirmReceiptsRead(
-        firm_id=firm.id,
-        firm_name=firm.name,
-        firm_slug=firm.slug,
-        total=total,
-        receipts=[ReceiptRead.model_validate(r) for r in receipts],
-    )
-
-
-# =============================================================================
-# READ — all receipts grouped by firm (used by /receipts/all)
-# =============================================================================
-
-async def read_all_receipts_grouped(
-    db: AsyncSession,
-    current_user: ReadUser,
-    skip: int = 0,
-    limit: int = 100,
-) -> AllReceiptsGroupedRead:
-    """
-    Return all receipts grouped by firm.
-
-    Scope:
-        - non-admin: only firms the caller owns
-        - admin: every firm
-
-    Structure mirrors payment methods grouped by country.
-    """
-
-    # ---------------------------------------------------------------
-    # Base query — which firms' receipts to include
-    # ---------------------------------------------------------------
-    firms_query = select(Firm).order_by(Firm.name)
-
-    if not current_user.is_admin:
-        firms_query = firms_query.where(Firm.user_id == current_user.id)
-
-    firms_query = firms_query.offset(skip).limit(limit)
-
-    try:
-        result = await db.execute(firms_query)
-        firms = result.scalars().all()
-
-        grouped: list[FirmReceiptsRead] = []
-        total_receipts = 0
-
-        for firm in firms:
-            receipts_result = await db.execute(
-                select(Receipt)
-                .where(Receipt.firm_id == firm.id)
-                .order_by(Receipt.created_at.desc())
-            )
-            receipts = receipts_result.scalars().all()
-            total_receipts += len(receipts)
-
-            grouped.append(
-                FirmReceiptsRead(
-                    firm_id=firm.id,
-                    firm_name=firm.name,
-                    firm_slug=firm.slug,
-                    total=len(receipts),
-                    receipts=[
-                        ReceiptRead.model_validate(r) for r in receipts
-                    ],
-                )
-            )
-    except Exception:
-        logger.exception(
-            "Failed to load grouped receipts for user_id=%s",
-            current_user.id,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load receipts. Please try again.",
-        )
-
-    return AllReceiptsGroupedRead(
-        total_firms=len(grouped),
-        total_receipts=total_receipts,
-        data=grouped,
-    )
 
 
 # =============================================================================
@@ -601,7 +601,7 @@ async def _load_owned_receipt(
 # country is removed 
 #we dont have country field in db again default currency is 
 # USD
-# lets use our user_state_guard firm-guard
+# lets use our user_state_guard firm-guard functions
 # =============================================================================
 
 async def create_receipt(
@@ -1024,7 +1024,7 @@ async def create_receipt(
             headers={"X-Error-Code": "wrong_permission"},
         )
 
-    _guard_firm_state(firm)
+    guard_firm_state(firm)
 
     # ... rest of the function unchanged ...
 
