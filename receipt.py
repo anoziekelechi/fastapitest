@@ -598,6 +598,10 @@ async def _load_owned_receipt(
 
 # =============================================================================
 # CREATE
+# country is removed 
+#we dont have country field in db again default currency is 
+# USD
+# lets use our user_state_guard firm-guard
 # =============================================================================
 
 async def create_receipt(
@@ -911,7 +915,8 @@ async def render_receipt_pdf(
 
 
 # =============================================================================
-# READ
+# READ 
+# this should returns receipt per branch
 # =============================================================================
 
 async def read_my_receipts(
