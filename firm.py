@@ -1,3 +1,37 @@
+# api/core/currency.py
+
+from enum import Enum
+
+
+class Currency(str, Enum):
+    """
+    Currencies the platform supports.
+
+    Inherits from `str` so values serialize as plain strings in
+    JSON (`"LRD"`, not `{"value": "LRD"}`) and so SQLAlchemy can
+    store them in a `String` column without a custom type adapter.
+    """
+    LRD = "LRD"
+    NGN = "NGN"
+    CFA = "CFA"
+
+
+
+
+
+currency: str = Field(
+    sa_column=Column(
+        String(3),
+        nullable=False,
+        # no default — must be supplied
+    ),
+)
+
+
+
+
+
+
 """Receipt schemas."""
 
 from datetime import datetime
