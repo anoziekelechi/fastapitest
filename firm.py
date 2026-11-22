@@ -1,279 +1,91 @@
-# api/core/currency.py
-
-from enum import Enum
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-"""Receipt business logic."""
-
-import csv
-import io
-import logging
-from decimal import Decimal
-
-from fastapi import BackgroundTasks, HTTPException, status
-from fastapi_mail import FastMail
-from sqlalchemy import func
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import col, select
-
-from api.core.guards import guard_firm_state, guard_user_state
-from api.core.media import resolve_logo_url
-from api.core.slug import generate_slug
-from api.firms.logics import (
-    firm_id_of,
-    get_firm_by_slug,
-    require_firm_access,
-)
-from api.models.firm import Branch, Firm
-from api.models.payments import PaymentMethods
-from api.models.receipts import Receipt
-from api.receipts.schemas import (
-    BranchReceiptListRead,
-    FirmReceiptListItemRead,
-    FirmReceiptListRead,
-    ReceiptCreate,
-    ReceiptListItemRead,
-    ReceiptRead,
-)
-from api.users.schemas import ReadUser
-
-
-logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# ID NARROWING
-# =============================================================================
-
-def receipt_id_of(receipt: Receipt) -> int:
-    if receipt.id is None:
-        logger.error("Receipt row has no id — data integrity issue")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load receipt. Please try again.",
-        )
-    return receipt.id
-
-
-def branch_id_of(branch: Branch) -> int:
-    if branch.id is None:
-        logger.error("Branch row has no id — data integrity issue")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load branch. Please try again.",
-        )
-    return branch.id
-
-
-# =============================================================================
-# LOADERS
-# =============================================================================
-
-async def get_branch_by_firm_and_slug(
-    db: AsyncSession,
+async def send_receipt_email(
+    receipt_slug: str,
     firm_id: int,
-    branch_slug: str,
-    *,
-    must_exist: bool = True,
-) -> Branch | None:
-    """Fetch a branch by (firm_id, slug)."""
-    normalized_slug = branch_slug.strip().lower()
+    mailer: FastMail,
+) -> None:
+    """
+    Send a receipt to the customer's email.
+
+    Must not raise. Runs in a FastAPI BackgroundTask; opens its own
+    DB session (the request-scoped one is already closed).
+    """
+    # Local import to avoid a circular import at module load time
+    #from api.db.session import async_session_maker
+
     try:
-        result = await db.execute(
-            select(Branch).where(
-                col(Branch.firm_id) == firm_id,
-                col(Branch.slug) == normalized_slug,
+        async with AsyncSessionFactory() as db:
+            receipt = await get_receipt_by_slug(db, receipt_slug) #
+            if not receipt or not receipt.customer_email:
+                logger.warning(
+                    "Receipt email skipped: slug=%s missing or no customer_email",
+                    receipt_slug,
+                )
+                return
+
+            firm = await db.get(Firm, firm_id)
+            if not firm:
+                logger.warning(
+                    "Receipt email skipped: firm_id=%s not found",
+                    firm_id,
+                )
+                return
+            branch = await db.get(Branch, receipt.branch_id)
+            sitename = (await get_home_settings_logic(db)).sitename
+
+            context = {
+                "firm": firm,
+                "branch":branch,
+                "receipt": receipt,
+                "current_year": datetime.now(timezone.utc).year,
+                "sitename": sitename,
+                "full_names": receipt.customer_fullname,
+            }
+
+            # Attach PDF (best-effort)
+            attachments: list[dict] = []
+            try:
+                pdf_bytes = render_pdf(
+                    template_name="receipts/customer_receipt_pdf.html",
+                    context=context,
+                )
+                attachments.append(
+                    {
+                        "file": pdf_bytes,
+                        "filename": f"receipt-{receipt.receipt_number}.pdf",
+                        "mime_type": "application",
+                        "mime_subtype": "pdf",
+                    }
+                )
+            except Exception:
+                logger.exception(
+                    "PDF generation failed for receipt=%s — "
+                    "sending HTML-only email",
+                    receipt.receipt_number,
+                )
+
+            await send_email(
+                recipient=receipt.customer_email,
+                subject=f"Receipt #{receipt.receipt_number} from {firm.name}",
+                mailer=mailer,
+                db=db,
+                full_names=receipt.customer_fullname,
+                template_name="receipts/customer_receipt.html",
+                template_body=context,
+                attachments=attachments,
             )
-        )
-        branch = result.scalars().first()
-    except Exception as exc:
-        logger.exception(
-            "Failed to fetch branch firm_id=%s slug=%s",
-            firm_id, normalized_slug,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load branch. Please try again.",
-        ) from exc
 
-    if branch is None and must_exist:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Branch '{branch_slug}' not found for this firm.",
-        )
-    return branch
-
-
-async def get_receipt_by_number(
-    db: AsyncSession,
-    receipt_number: str,
-) -> Receipt | None:
-    """
-    Fetch a receipt by its globally unique receipt_number.
-
-    `receipt_number` has a UNIQUE constraint at the DB level, so
-    `.first()` is deterministic.
-    """
-    normalized = receipt_number.strip().upper()
-    try:
-        result = await db.execute(
-            select(Receipt).where(
-                col(Receipt.receipt_number) == normalized,
+            logger.info(
+                "Receipt #%s emailed to %s (pdf_attached=%s)",
+                receipt.receipt_number,
+                receipt.customer_email,
+                bool(attachments),
             )
-        )
-        return result.scalars().first()
-    except Exception as exc:
-        logger.exception(
-            "Failed to fetch receipt number=%s", normalized,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load receipt. Please try again.",
-        ) from exc
-
-
-async def _load_owned_receipt_by_number(
-    receipt_number: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> tuple[Receipt, Firm, Branch | None]:
-    """
-    Load a receipt + its firm + branch, enforcing owner/admin access.
-    """
-    receipt = await get_receipt_by_number(db, receipt_number)
-    if not receipt:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Receipt '{receipt_number}' not found",
-        )
-
-    try:
-        firm = await db.get(Firm, receipt.firm_id)
-        branch = await db.get(Branch, receipt.branch_id)
     except Exception:
         logger.exception(
-            "Failed to load firm/branch for receipt number=%s",
-            receipt_number,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load receipt. Please try again.",
+            "Failed to send receipt email for slug=%s", receipt_slug
         )
 
-    if not firm:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Firm not found for this receipt",
-        )
 
-    if firm.user_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only access receipts from your own firms",
-            headers={"X-Error-Code": "wrong_permission"},
-        )
-
-    return receipt, firm, branch
-
-
-# =============================================================================
-# BUILDERS — pure, no DB, no HTTP
-# =============================================================================
-
-def to_receipt_read(
-    receipt: Receipt,
-    *,
-    firm: Firm | None = None,
-    branch: Branch | None = None,
-) -> ReceiptRead:
-    """
-    Assemble the full ReceiptRead.
-
-    `firm` and `branch` are optional so callers who already have
-    them loaded can avoid extra lookups. When omitted, denormalized
-    context is left as None.
-    """
-    read = ReceiptRead.model_validate(receipt)
-
-    if firm is not None:
-        read.firm_name = firm.name
-        read.firm_logo_url = resolve_logo_url(firm.firm_logo_key)
-
-    if branch is not None:
-        read.branch_no = branch.branch_no
-
-    return read
-
-
-def to_receipt_list_item(receipt: Receipt) -> ReceiptListItemRead:
-    """Assemble a compact list item for a branch's receipt list."""
-    return ReceiptListItemRead.model_validate(receipt)
-
-
-def to_receipt_list(
-    receipts: list[Receipt] | tuple[Receipt, ...],
-) -> list[ReceiptListItemRead]:
-    return [to_receipt_list_item(r) for r in receipts]
-
-
-def to_firm_receipt_list_item(
-    receipt: Receipt,
-    branch: Branch | None,
-) -> FirmReceiptListItemRead:
-    """
-    Assemble a compact list item for a firm-wide receipt list.
-
-    `branch` is passed in so the caller can batch-load branches
-    once instead of re-querying per receipt.
-    """
-    return FirmReceiptListItemRead(
-        receipt_number=receipt.receipt_number,
-        branch_no=branch.branch_no if branch else "—",
-        created_at=receipt.created_at,
-    )
-
-
-def to_firm_receipt_list(
-    receipts: list[Receipt] | tuple[Receipt, ...],
-    branches_by_id: dict[int, Branch],
-) -> list[FirmReceiptListItemRead]:
-    return [
-        to_firm_receipt_list_item(r, branches_by_id.get(r.branch_id))
-        for r in receipts
-    ]
-
-
-# =============================================================================
-# CALCULATIONS
-# =============================================================================
-
-def calculate_totals(
-    quantity: int,
-    unit_price: Decimal,
-    discount: Decimal,
-    tax: Decimal,
-    shipping: Decimal,
-) -> tuple[Decimal, Decimal, Decimal]:
-    subtotal = Decimal(quantity) * unit_price
-    net_total = subtotal - discount
-    grand_total = net_total + tax + shipping
-    return subtotal, net_total, grand_total
 
 
 # =============================================================================
