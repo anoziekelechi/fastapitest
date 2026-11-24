@@ -1,231 +1,151 @@
-#FIRM MODELS
-
-#from __future__ import annotations
-from datetime import datetime, timezone
-from sqlalchemy import Column, Text, Boolean, DateTime,String,Integer, ForeignKey,Numeric
-from api.core.base import BaseModel, utc_now
-from sqlmodel import Field,Relationship,UniqueConstraint
-from pydantic import  EmailStr
-from pydantic_extra_types.phone_numbers import PhoneNumber
-from typing import List, Optional
-from hashlib import md5
-
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from api.models.payments import SubscriptionPayment
-    from api.models.receipts import Receipt
-    from api.models.users import User
-    from api.models.orders import Order
-    from api.models.subscriptions import Subscription
-
-
-class Firm(BaseModel, table=True):
+async def read_my_firms(
+    db: AsyncSession,
+    current_user: ReadUser,
+    *,
+    active_only: bool = False,
+) -> FirmListRead:
     """
-    Company/firm profile.
-    One user can own many firms.
-    A firm can have many branches.
+    List current user's firms with branch_count and firm_logo_url.
 
-    Subscription is at FIRM level:
-        Firm A subscribes → all Firm A branches get access
-        No need to subscribe per branch
+    Args:
+        active_only:
+            When True, return only active firms.
+            Defaults to False to preserve existing behaviour.
+
+    No receipt counts — the list contract intentionally omits them.
     """
-    __tablename__ = "firms" # type: ignore
 
-    # FK to User - NOT unique (user can own many firms)
-    user_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("users.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
+    guard_user_state(current_user)
+
+    try:
+        query = (
+            select(Firm)
+            .where(Firm.user_id == current_user.id)
+            .order_by(col(Firm.name))
         )
-    )
 
-    name: str = Field(
-        sa_column=Column(String(200), nullable=False, unique=True, index=True)
-        # e.g. "ABC Business Entity", "XYZ and Sons Trading Company"
-    )
+        if active_only:
+            query = query.where(Firm.is_disabled.is_(False))
 
-    # firm_phone_number: str = Field(
-    #     sa_column=Column(String(20), nullable=False)
-    # )
-    firm_logo_key: str | None = Field(
-    default=None,
-    sa_column=Column(
-        String(500),
-        nullable=True,
-    ),
-    )
-    slug: str | None = Field(
-        default=None,
-        sa_column=Column(String(250), nullable=True, unique=True, index=True)
-    )
+        result = await db.execute(query)
 
-    # Government registration number e.g. CAC in Nigeria
-    registration_number: str | None = Field(
-        default=None,
-        sa_column=Column(String(100), nullable=True, unique=True)
-    )
+        firms = list(result.scalars().all())
 
-    deals_on: str = Field(
-        sa_column=Column(Text, nullable=False)
-        # What the firm trades/deals in
-    )
-    
-    disabled: bool = Field(
-        default=False,
-        sa_column=Column(
-            Boolean,nullable=False,server_default="false"
+        ids = [firm_id_of(f) for f in firms]
+
+        branch_counts, _ = await counts_by_firm(db, ids)
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception(
+            "Failed to load firms for user_id=%s",
+            current_user.id,
         )
-    )
 
-    # Relationships
-    owner: Optional["User"] = Relationship(back_populates="firms")
-    branches: list["Branch"] = Relationship(back_populates="firm")
-    subscriptions: list["Subscription"] = Relationship(  # ✅ Firm level
-        back_populates="firm"
-    )
-    receipts: list["Receipt"] = Relationship(back_populates="firm")
-    
-    orders:list["Order"] = Relationship(back_populates="firm")
-    subscription_payments:list["SubscriptionPayment"] = Relationship(back_populates="firm")
-
-
-
-class Branch(BaseModel, table=True):
-    """
-    Physical branch of a firm.
-    A firm can have many branches.
-
-    Access to services is determined by FIRM subscription:
-        Branch checks firm.subscriptions to see what is active
-        Branch itself has NO subscription - firm handles it
-    """
-    __tablename__ = "branches" # type: ignore
-    __table_args__ = (
-        UniqueConstraint(
-            "firm_id",
-            "branch_no",
-            name="unique_branch_no_per_firm"
-            # Same branch_no cannot appear twice in same firm
-            # Different firms can have "HQ" or "001"
-        ),
-        
-         UniqueConstraint(
-            "firm_id",
-            "slug",
-            name="unique_slug_per_firm"
-            # Same branch_no cannot appear twice in same firm
-            # Different firms can have "HQ" or "001"
-        ),
-    )
-
-    # FK to Firm
-    firm_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("firms.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load your firms. Please try again.",
         )
+
+    if active_only and not firms:
+        # Distinguish no firms from firms that are all disabled.
+        try:
+            result = await db.execute(
+                select(Firm.id)
+                .where(Firm.user_id == current_user.id)
+                .limit(1)
+            )
+
+            has_firms = result.scalar_one_or_none() is not None
+
+        except Exception:
+            logger.exception(
+                "Failed to check firm existence for user_id=%s",
+                current_user.id,
+            )
+
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to load your firms. Please try again.",
+            )
+
+        if not has_firms:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="You don't have any firm associated with you.",
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="You don't have any active firm associated with you.",
+        )
+
+    return to_firm_list(firms, branch_counts)
+
+
+@router.get(
+    "/buy-now/firms",
+    response_model=FirmListRead,
+    status_code=status.HTTP_200_OK,
+)
+async def read_buy_now_firms(
+    db: AsyncSession = Depends(get_db),
+    current_user: ReadUser = Depends(get_current_user),
+):
+    return await read_my_firms(
+        db=db,
+        current_user=current_user,
+        active_only=True,
     )
 
-    branch_no: str = Field(
-        sa_column=Column(String(50), nullable=False)
-        # e.g. "001", "HQ", "MONROVIA-01", "BUCHANA-02"
-    )
-
-    slug: str | None = Field(
-        default=None,
-        sa_column=Column(String(200), nullable=True,index=True)
-    )
-
-    address: str = Field(
-        sa_column=Column(Text, nullable=False)
-    )
-
-    phone_number: str = Field(
-        sa_column=Column(String(20), nullable=False)
-    )
-
-    # Relationships
-    firm: Optional["Firm"] = Relationship(back_populates="branches")
-    receipts: list["Receipt"] = Relationship(back_populates="branch")
 
 
 
-# ORDER
+# api/models/orders.py
 
-
-import secrets
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
+
 from sqlalchemy import (
-    Boolean, Column, String, Integer, ForeignKey,
-    Text, Numeric, UniqueConstraint,CheckConstraint
+    Column,
+    String,
+    Integer,
+    ForeignKey,
+    Numeric,
+    CheckConstraint,
 )
 from sqlmodel import Field, Relationship
+
 from api.core.base import BaseModel
-from sqlalchemy import Column, Text, DateTime
 
 if TYPE_CHECKING:
-    from api.models.firm import Firm 
+    from api.models.firm import Firm
     from api.models.payments import SubscriptionPayment
     from api.models.subscriptions import (
-        SubscriptionPlan,
-        SubscriptionService,
-        SubscriptionTier
-        )
-
-
+        OrderItem,
+    )
 
 
 class Order(BaseModel, table=True):
     """
-    Represents a customer's subscription purchase.
+    One checkout order belongs to one user.
 
-    The order records the selected service, tier, plan, duration,
-    and financial details at the time of purchase.
-
-    Typical lifecycle:
-        pending_payment -> paid
-        pending_payment -> cancelled
-        pending_payment -> expired
+    An order can contain multiple subscription items, and each
+    item can belong to a different firm.
     """
 
     __tablename__ = "orders"  # type: ignore
 
     __table_args__ = (
-        UniqueConstraint(
-            "order_number",
-            name="uq_orders_order_number",
-        ),
         CheckConstraint(
-            "duration_months > 0",
-            name="ck_orders_duration_months_positive",
-        ),
-        CheckConstraint(
-            "amount > 0",
-            name="ck_orders_amount_positive",
-        ),
-        CheckConstraint(
-            "discount_amount >= 0",
-            name="ck_orders_discount_nonnegative",
-        ),
-        CheckConstraint(
-            "total_amount > 0",
-            name="ck_orders_total_positive",
-        ),
-        CheckConstraint(
-            "status IN ('pending_payment', 'paid', 'cancelled', 'expired')",
+            "status IN ('pending_checkout', 'pending_payment', "
+            "'paid', 'cancelled', 'expired')",
             name="ck_orders_status",
         ),
     )
-
-    # ------------------------------------------------------------------
-    # Order identification
-    # ------------------------------------------------------------------
 
     order_number: str = Field(
         sa_column=Column(
@@ -236,9 +156,87 @@ class Order(BaseModel, table=True):
         )
     )
 
-    # ------------------------------------------------------------------
-    # Foreign keys
-    # ------------------------------------------------------------------
+    user_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("users.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    status: str = Field(
+        default="pending_checkout",
+        sa_column=Column(
+            String(30),
+            nullable=False,
+            server_default="pending_checkout",
+            index=True,
+        ),
+    )
+
+    paid_at: datetime | None = Field(
+        default=None,
+        nullable=True,
+    )
+
+    items: list["OrderItem"] = Relationship(
+        back_populates="order",
+        sa_relationship_kwargs={
+            "cascade": "all, delete-orphan",
+        },
+    )
+
+    payments: list["SubscriptionPayment"] = Relationship(
+        back_populates="order",
+    )
+
+
+
+from sqlalchemy import UniqueConstraint
+
+
+class OrderItem(BaseModel, table=True):
+    """
+    One subscription purchase inside an order.
+
+    Each item belongs to one firm. An order can contain items
+    for multiple firms, including the same service for different firms.
+    """
+
+    __tablename__ = "order_items"  # type: ignore
+
+    __table_args__ = (
+        CheckConstraint(
+            "duration_months IN (1, 2, 3, 6, 12)",
+            name="ck_order_items_duration_months",
+        ),
+        CheckConstraint(
+            "unit_price >= 0",
+            name="ck_order_items_unit_price",
+        ),
+        CheckConstraint(
+            "discount_amount >= 0",
+            name="ck_order_items_discount_amount",
+        ),
+        CheckConstraint(
+            "total_amount >= 0",
+            name="ck_order_items_total_amount",
+        ),
+        CheckConstraint(
+            "total_amount = unit_price - discount_amount",
+            name="ck_order_items_total_calculation",
+        ),
+    )
+
+    order_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("orders.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
 
     firm_id: int = Field(
         sa_column=Column(
@@ -276,44 +274,25 @@ class Order(BaseModel, table=True):
         )
     )
 
-    # ------------------------------------------------------------------
-    # Purchase snapshots
-    # ------------------------------------------------------------------
-
+    # Purchase-time snapshots
     service_name: str = Field(
-        sa_column=Column(
-            String(120),
-            nullable=False,
-        )
+        sa_column=Column(String(120), nullable=False)
     )
 
     tier_name: str = Field(
-        sa_column=Column(
-            String(120),
-            nullable=False,
-        )
+        sa_column=Column(String(120), nullable=False)
     )
 
     plan_name: str = Field(
-        sa_column=Column(
-            String(120),
-            nullable=False,
-        )
+        sa_column=Column(String(120), nullable=False)
     )
 
     duration_months: int = Field(
-        gt=0,
-        sa_column=Column(
-            Integer,
-            nullable=False,
-        ),
+        sa_column=Column(Integer, nullable=False)
     )
 
-    # ------------------------------------------------------------------
-    # Financial details
-    # ------------------------------------------------------------------
-
-    amount: Decimal = Field(
+    # Purchase-time financial snapshots
+    unit_price: Decimal = Field(
         sa_column=Column(
             Numeric(precision=10, scale=2),
             nullable=False,
@@ -346,141 +325,121 @@ class Order(BaseModel, table=True):
         ),
     )
 
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
-
-    status: str = Field(
-        default="pending_payment",
-        sa_column=Column(
-            String(30),
-            nullable=False,
-            server_default="pending_payment",
-            index=True,
-        ),
-    )
-
-    # ------------------------------------------------------------------
-    # Timestamps
-    # ------------------------------------------------------------------
-
-    paid_at: datetime | None = Field(
-        default=None,
-        sa_type=DateTime(timezone=True),
-        sa_column_kwargs={"nullable": True},
-    )
-
-    # ------------------------------------------------------------------
     # Relationships
-    # ------------------------------------------------------------------
+    order: "Order" = Relationship(
+        back_populates="items",
+    )
 
-    firm: Optional["Firm"] = Relationship(back_populates="orders")
-    service: Optional["SubscriptionService"] = Relationship(back_populates="orders")
-    tier: Optional["SubscriptionTier"] = Relationship(back_populates="orders")
-    plan: Optional["SubscriptionPlan"] = Relationship(back_populates="orders")
-    payments:list["SubscriptionPayment"] = Relationship(back_populates="order")
+    firm: "Firm" = Relationship(
+        back_populates="order_items",
+    )
+
+    service: "SubscriptionService" = Relationship(
+        back_populates="order_items",
+    )
+
+    tier: "SubscriptionTier" = Relationship(
+        back_populates="order_items",
+    )
+
+    plan: "SubscriptionPlan" = Relationship(
+        back_populates="order_items",
+    )
 
 
 
+# firm relationship 
+if TYPE_CHECKING:
+    from api.models.orders import OrderItem
+#remove
+orders: list["Order"] = Relationship(back_populates="firm")
 
-# PAYMENTS 
-
-
-"""Receipt model."""
-import secrets
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
-from decimal import Decimal
-from regex import B
-from sqlalchemy import (
-    Boolean, Column, String, Integer, ForeignKey,
-    Text, Numeric, UniqueConstraint,CheckConstraint
+subscription_payments: list["SubscriptionPayment"] = Relationship(
+    back_populates="firm"
 )
-from sqlmodel import Field, Relationship
-from api.core.base import BaseModel
-from sqlalchemy import Column, Text, DateTime
+
+
+#replace
+order_items: list["OrderItem"] = Relationship(
+    back_populates="firm",
+)
+
+
+#SubscriptionService 
+
+#remove
+orders: list["Order"] = Relationship(back_populates="service")
+#replace
+
+order_items: list["OrderItem"] = Relationship(
+    back_populates="service",
+)
+
+#Tier
+#remove
+orders: list["Order"] = Relationship(back_populates="tier")
+
+
+
+#replace
+order_items: list["OrderItem"] = Relationship(
+    back_populates="tier",
+)
+#plan
+#remove
+orders: list["Order"] = Relationship(back_populates="plan")
+#replace
+order_items: list["OrderItem"] = Relationship(
+    back_populates="plan",
+)
+
+
+
+Remove the Order type-checking imports from your subscription model
+and add OrderItem:
+
 
 if TYPE_CHECKING:
-    from api.models.firm import Firm,Branch
-    from api.models.orders import Order
-    from api.models.receipts import Receipt
-    from api.models.subscriptions import SubscriptionPlan
+    from api.models.orders import OrderItem
+    from api.models.payments import SubscriptionPayment
 
 
 
 
 
 
+Small import correction: because OrderItem is defined in api/models/orders.py alongside Order, do not import it from api.models.subscriptions. Your orders.py type-checking imports should instead be:
+5. Updated S
 
-class PaymentMethods(BaseModel, table=True): 
-    """
-    Payment methods available per country.
-    
-    Examples:
-        Nigeria:  Cash, Paystack, Opay, Flutterwave
-        Liberia:  Momo Liberia, Orange Money, Cash
-    
-    Same name can exist in different countries (e.g. Cash in Nigeria + Liberia).
-    Same name CANNOT exist twice in same country.
-    """
-    __tablename__ = "paymentmethods"  # type: ignore
-    
 
-    name: str = Field(
-        sa_column=Column(String(100), unique=True,nullable=False, index=True)
-        
-    )
-    
-    provider_code: str = Field(
-        sa_column=Column(String(100), unique=True,nullable=False, index=True) #new
-        
-    )
-    payment_logo_key: str | None = Field(
-    default=None,
-    sa_column=Column(
-        String(500),
-        nullable=True,
-    ),
-    )
-    is_active: bool = Field(
-        default=True,
-        sa_column=Column(
-            Boolean,
-            nullable=False,
-            server_default="true"
-        )
-        ) #new
 
-    slug: str | None = Field(
-        default=None,
-        sa_column=Column(String(150), nullable=True, unique=True, index=True)
-    )
+if TYPE_CHECKING:
+    from api.models.firm import Firm
+    from api.models.payments import SubscriptionPayment
+    from api.models.subscriptions import (
+        SubscriptionPlan,
+        SubscriptionService,
+        SubscriptionTier,
+)
 
-    # Relationships
-    receipts: list["Receipt"] = Relationship(back_populates="payment_method")
-    subscription_payments:list["SubscriptionPayment"]= Relationship(back_populates="payment_method")
-    
+
+
+
 
 class SubscriptionPayment(BaseModel, table=True):
     """
-    One payment attempt for an order.
+    One payment attempt for an entire subscription order.
 
-    Typical lifecycle:
-        pending -> paid
-        pending -> failed
-        pending -> cancelled
-
-    A payment can remain pending while awaiting gateway confirmation
-    or reconciliation after an uncertain gateway response.
+    An order may contain multiple firms and multiple subscription plans.
     """
 
     __tablename__ = "subscription_payments"  # type: ignore
 
     __table_args__ = (
         UniqueConstraint(
-            "firm_id",
+            "order_id",
             "idempotency_key",
-            name="uq_subscription_payment_firm_idempotency",
+            name="uq_subscription_payment_order_idempotency",
         ),
         CheckConstraint(
             "amount > 0",
@@ -492,20 +451,6 @@ class SubscriptionPayment(BaseModel, table=True):
         ),
     )
 
-    # ------------------------------------------------------------------
-    # Relationships to existing records
-    # ------------------------------------------------------------------
-
-    firm_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("firms.id", ondelete="RESTRICT"),
-            nullable=False,
-            index=True,
-        )
-    )
-
-    # New: payment belongs to an order.
     order_id: int = Field(
         sa_column=Column(
             Integer,
@@ -515,35 +460,14 @@ class SubscriptionPayment(BaseModel, table=True):
         )
     )
 
-    # Retained for convenient access and compatibility with existing logic.
-    # The plan should match the plan recorded on the associated order.
-    plan_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey(
-                "subscription_plans.id",
-                ondelete="RESTRICT",
-            ),
-            nullable=False,
-            index=True,
-        )
-    )
-
     payment_method_id: int = Field(
         sa_column=Column(
             Integer,
-            ForeignKey(
-                "paymentmethods.id",
-                ondelete="RESTRICT",
-            ),
+            ForeignKey("paymentmethods.id", ondelete="RESTRICT"),
             nullable=False,
             index=True,
         )
     )
-
-    # ------------------------------------------------------------------
-    # Idempotency
-    # ------------------------------------------------------------------
 
     idempotency_key: str = Field(
         sa_column=Column(
@@ -551,10 +475,6 @@ class SubscriptionPayment(BaseModel, table=True):
             nullable=False,
         )
     )
-
-    # ------------------------------------------------------------------
-    # Payment details
-    # ------------------------------------------------------------------
 
     amount: Decimal = Field(
         sa_column=Column(
@@ -564,11 +484,11 @@ class SubscriptionPayment(BaseModel, table=True):
     )
 
     currency: str = Field(
-        default="USD",
+        default="LRD",
         sa_column=Column(
             String(3),
             nullable=False,
-            server_default="USD",
+            server_default="LRD",
         ),
     )
 
@@ -597,22 +517,15 @@ class SubscriptionPayment(BaseModel, table=True):
         )
     )
 
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
-
     status: str = Field(
         default="pending",
         sa_column=Column(
             String(20),
             nullable=False,
             server_default="pending",
+            index=True,
         ),
     )
-
-    # ------------------------------------------------------------------
-    # Timestamps
-    # ------------------------------------------------------------------
 
     paid_at: datetime | None = Field(
         default=None,
@@ -620,432 +533,459 @@ class SubscriptionPayment(BaseModel, table=True):
         sa_column_kwargs={"nullable": True},
     )
 
-    # ------------------------------------------------------------------
-    # Relationships
-    # ------------------------------------------------------------------
+    order: Optional["Order"] = Relationship(
+        back_populates="payments",
+    )
 
-    firm: Optional["Firm"] = Relationship(back_populates="subscription_payments")
-    order: Optional["Order"] = Relationship(back_populates="payments")
-    plan: Optional["SubscriptionPlan"] = Relationship(back_populates="subscription_payments")
-    payment_method: Optional["PaymentMethods"] = Relationship(back_populates="subscription_payments")
-
-
-# SERVICE
+    payment_method: Optional["PaymentMethods"] = Relationship(
+        back_populates="subscription_payments",
+    )
 
 
-
-
-#from __future__ import annotations
-from datetime import datetime, timezone
-from decimal import Decimal
-from sqlalchemy import Column, Text, Boolean, DateTime,String,Integer, ForeignKey,Numeric
-from api.core.base import BaseModel, utc_now
-from sqlmodel import Field,Relationship,UniqueConstraint,CheckConstraint
-from pydantic import  EmailStr
-from pydantic_extra_types.phone_numbers import PhoneNumber
-from typing import List, Optional
-from hashlib import md5
-
-from typing import TYPE_CHECKING
+# in payments.py
 if TYPE_CHECKING:
-    from api.models.firm import Firm
     from api.models.orders import Order
-    from api.models.payments import SubscriptionPayment
+    from api.models.receipts import Receipt
+
+
+
+#payment methods relationships 
+subscription_payments: list["SubscriptionPayment"] = Relationship(
+    back_populates="payment_method",
+)
+
+
+
+Remove the old imports for Firm and SubscriptionPlan if they are no longer used elsewhere in that file.
 
 
 
 
-class SubscriptionService(BaseModel, table=True):
-    """
-    Available subscription services stored in DB.
-    Admin adds new services here - no code changes needed.
-
-    Examples:
-        receipt → Receipt generation service
-        debtors → Debtor tracking service
-    """
-    __tablename__ = "subscription_services" # type: ignore
-
-    name: str = Field(
-        sa_column=Column(String(50), nullable=False, unique=True, index=True)
-        # e.g. "receipt", "debtors"
-    )
-    
-    service_logo_key: str | None = Field(
-    default=None,
-    sa_column=Column(String(500),nullable=True),
-    )
-    description: str = Field(
-        sa_column=Column(Text, nullable=False)
-    )
-    slug: str | None = Field(
-        default=None,
-        sa_column=Column(String(100), nullable=True, unique=True, index=True)
-    )
-    is_active: bool = Field(
-        default=True,
-        sa_column=Column(Boolean, nullable=False, server_default="true")
-    )
-    trial_days: int = Field(
-        default=30,
-        sa_column=Column(Integer, nullable=False, server_default="30")
-    )
-
-    # Relationships
-    tiers: list["SubscriptionTier"] = Relationship(
-        back_populates="service"
-    )
-    subscriptions: list["Subscription"] = Relationship(
-        back_populates="service"
-    )
-    orders: list["Order"] = Relationship(back_populates="service")
-
-
-class SubscriptionTier(BaseModel, table=True):
-    """
-    Subscription tiers per service.
-    Defines WHAT features you get.
-
-    Examples:
-        receipt service:
-            starter → basic receipts, 100/month
-            pro     → unlimited receipts, custom branding, email delivery
-
-        debtors service:
-            starter → track up to 50 debtors
-            pro     → unlimited debtors, reminders, reports
-    """
-    __tablename__ = "subscription_tiers" # type: ignore
-    __table_args__ = (
-        UniqueConstraint(
-            "slug",
-            name="uq_subscription_tiers_slug"
-        ),
-         UniqueConstraint(
-            "service_id","name",
-            name="uq_subscription_tiers_service_name"
-        ),
-    )
-
-    # FK to SubscriptionService
-    service_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("subscription_services.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        )
-    )
-
-    name: str = Field(
-        sa_column=Column(String(50), nullable=False)
-        # e.g. "starter", "pro", "enterprise"
-    )
-    slug: str | None = Field(
-        default=None,
-        sa_column=Column(String(150), nullable=False,index=True)
-    )
-    description: str = Field(
-        sa_column=Column(Text, nullable=False)
-    )
-   
-    is_active: bool = Field(
-        default=True,
-        sa_column=Column(Boolean, nullable=False, server_default="true")
-    )
-    
-    is_trial_tier: bool = Field(
-        default=False,
-        sa_column=Column(Boolean,nullable=False,default=False,index=True,),
-    )
-
-    # Relationships
-    service: Optional["SubscriptionService"] = Relationship(
-        back_populates="tiers"
-    )
-    plans: list["SubscriptionPlan"] = Relationship(
-        back_populates="tier"
-    )
-    subscriptions: list["Subscription"] = Relationship(
-        back_populates="tier"
-    )
-    
-    orders: list["Order"] = Relationship(back_populates="tier")
-
-
-class SubscriptionPlan(BaseModel, table=True):
-    """
-    Subscription plans per tier.
-    Defines HOW LONG and HOW MUCH.
-
-    Examples:
-        starter tier:
-            monthly   → 30 days,  USD 5
-            quarterly → 90 days,  USD 12
-            biannual  → 180 days, USD 20
-            annual    → 365 days, USD 35
-
-        pro tier:
-            monthly   → 30 days,  USD 10
-            quarterly → 90 days,  USD 25
-            biannual  → 180 days, USD 45
-            annual    → 365 days, USD 70
-    """
-    __tablename__ = "subscription_plans" # type: ignore
-    __table_args__ = (
-        UniqueConstraint(
-            "name",
-            "tier_id",
-            name="unique_plan_per_tier"
-        ),
-        CheckConstraint(
-            "duration_months IN (1, 2, 3, 6, 12)",
-            name="ck_subscription_plan_duration_months",
-        ),
-    )
-
-    # FK to SubscriptionTier
-    tier_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("subscription_tiers.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        )
-    )
-
-    name: str = Field(
-        sa_column=Column(String(50), nullable=False)
-        # e.g. "monthly", "quarterly", "biannual", "annual"
-    )
-    slug: str | None = Field(
-        default=None,
-        sa_column=Column(String(200), nullable=False, unique=True, index=True)
-    )
-    description: str = Field(
-        sa_column=Column(Text, nullable=False)
-    )
-    duration_months: int = Field(
-        sa_column=Column(Integer, nullable=False),
-    )
-
-    price: Decimal = Field(
-        sa_column=Column(Numeric(precision=10, scale=2), nullable=False)
-    )
-   
-    is_active: bool = Field(
-        default=True,
-        sa_column=Column(Boolean, nullable=False, server_default="true")
-    )
-
-    # Relationships
-    tier: Optional["SubscriptionTier"] = Relationship(
-        back_populates="plans"
-    )
-    subscriptions: list["Subscription"] = Relationship(
-        back_populates="plan"
-    )
-    orders: list["Order"] =  Relationship(back_populates="plan")
-    subscription_payments:list["SubscriptionPayment"]= Relationship(back_populates="plan")
+Your SubscriptionPlan should no longer have a subscription_payments relationship, because payments now belong to orders rather than individual plans.
 
 
 
-class Subscription(BaseModel, table=True):
-    """
-    Represents a firm's access to a subscription service.
+    from decimal import Decimal
+from pydantic import BaseModel, ConfigDict, Field
 
-    A subscription can be either a trial or a paid subscription.
 
-    Trial lifecycle:
-        is_on_trial = True
-        trial_started_at and trial_ends_at are populated.
+class BuyNowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-    Paid subscription lifecycle:
-        is_on_trial = False
-        subscription_started_at and subscription_ends_at are populated.
+    firm_id: int = Field(gt=0)
+    plan_id: int = Field(gt=0)
 
-    A firm can have only one subscription record per service.
-    """
 
-    __tablename__ = "subscriptions"  # type: ignore
+class BuyNowResponse(BaseModel):
+    order_number: str
+    order_item_id: int
+    firm_id: int
+    firm_name: str
+    service_name: str
+    tier_name: str
+    plan_name: str
+    duration_months: int
+    amount: Decimal
+    currency: str
 
-    __table_args__ = (
-        UniqueConstraint(
-            "firm_id",
-            "service_id",
-            name="unique_subscription_per_firm_service",
-        ),
-    )
 
-    # ------------------------------------------------------------------
-    # Foreign keys
-    # ------------------------------------------------------------------
+class CheckoutItemRead(BaseModel):
+    order_item_id: int
+    firm_id: int
+    firm_name: str
+    service_name: str
+    tier_name: str
+    plan_name: str
+    duration_months: int
+    amount: Decimal
+    currency: str
 
-    firm_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("firms.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        )
-    )
 
-    service_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("subscription_services.id", ondelete="RESTRICT"),
-            nullable=False,
-            index=True,
-        )
-    )
+class CheckoutDetailsRead(BaseModel):
+    order_number: str
+    items: list[CheckoutItemRead]
+    total_amount: Decimal
+    currency: str
 
-    tier_id: int | None = Field(
-        default=None,
-        sa_column=Column(
-            Integer,
-            ForeignKey("subscription_tiers.id", ondelete="SET NULL"),
-            nullable=True,
-            index=True,
-        ),
-    )
-
-    plan_id: int | None = Field(
-        default=None,
-        sa_column=Column(
-            Integer,
-            ForeignKey("subscription_plans.id", ondelete="SET NULL"),
-            nullable=True,
-            index=True,
-        ),
-    )
-
-    # ------------------------------------------------------------------
-    # Last successful payment
-    # ------------------------------------------------------------------
-
-    last_payment_id: int | None = Field(
-        default=None,
-        sa_column=Column(
-            Integer,
-            ForeignKey(
-                "subscription_payments.id",
-                ondelete="SET NULL",
-            ),
-            nullable=True,
-            index=True,
-        ),
-    )
-
-    # ------------------------------------------------------------------
-    # Trial fields
-    # ------------------------------------------------------------------
-
-    is_on_trial: bool = Field(
-        default=False,
-        index=True,
-    )
-
-    trial_started_at: datetime | None = Field(
-        default=None,
-        nullable=True,
-    )
-
-    trial_ends_at: datetime | None = Field(
-        default=None,
-        nullable=True,
-        index=True,
-    )
-
-    # ------------------------------------------------------------------
-    # Subscription status
-    # ------------------------------------------------------------------
-
-    is_active: bool = Field(
-        default=True,
-        index=True,
-    )
-
-    # ------------------------------------------------------------------
-    # Paid subscription dates
-    # ------------------------------------------------------------------
-
-    subscription_started_at: datetime | None = Field(
-        default=None,
-        nullable=True,
-    )
-
-    subscription_ends_at: datetime | None = Field(
-        default=None,
-        nullable=True,
-        index=True,
-    )
-
-    # ------------------------------------------------------------------
-    # Renewal settings
-    # ------------------------------------------------------------------
-
-    auto_renew: bool = Field(
-        default=False,
-    )
-
-    # ------------------------------------------------------------------
-    # Relationships
-    # ------------------------------------------------------------------
-
-    firm: Optional["Firm"] = Relationship(
-        back_populates="subscriptions",
-    )
-
-    service: Optional["SubscriptionService"] = Relationship(
-        back_populates="subscriptions",
-    )
-
-    tier: Optional["SubscriptionTier"] = Relationship(
-        back_populates="subscriptions",
-    )
-
-    plan: Optional["SubscriptionPlan"] = Relationship(
-        back_populates="subscriptions",
-    )
-
-    last_payment: Optional["SubscriptionPayment"] = Relationship(
-        sa_relationship_kwargs={
-            "foreign_keys": "[Subscription.last_payment_id]",
-        },
-    )
-
-  
-  
+    # Reuse the existing public response schema.
+    payment_methods: AvailablePaymentMethodsRead
 
 
 
-#PAYMENT LOGIC
 
-# =============================================================================
-# READ — AVAILABLE (public) — active only
-# =============================================================================
+import secrets
+from decimal import Decimal
 
-async def read_available_payment_methods(
+from fastapi import HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+
+UNFINISHED_ORDER_STATUSES = (
+    "pending_checkout",
+    "pending_payment",
+)
+
+
+def generate_order_number() -> str:
+    return f"ORD-{secrets.token_hex(8).upper()}"
+
+
+async def buy_subscription_now(
+    data: BuyNowRequest,
     db: AsyncSession,
-) -> AvailablePaymentMethodsRead:
-    """
-    Public 'We accept' widget. Active methods only.
+    current_user: ReadUser,
+) -> BuyNowResponse:
+    guard_user_state(current_user)
 
-    Inactive methods remain in the DB and are visible to admins.
-    """
     try:
-        result = await db.execute(
-            select(PaymentMethods)
-            .where(col(PaymentMethods.is_active).is_(True))
-            .order_by(col(PaymentMethods.name))
-        )
-        methods = list(result.scalars().all())
+        # --------------------------------------------------
+        # 1. Validate and lock the selected firm
+        # --------------------------------------------------
 
-    except SQLAlchemyError as exc:
-        logger.exception("Failed to load available payment methods")
+        firm_result = await db.execute(
+            select(Firm)
+            .where(
+                Firm.id == data.firm_id,
+                Firm.user_id == current_user.id,
+            )
+            .with_for_update()
+        )
+        firm = firm_result.scalar_one_or_none()
+
+        if firm is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Firm not found.",
+            )
+
+        if firm.disabled:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This firm is disabled.",
+            )
+
+        # --------------------------------------------------
+        # 2. Validate the selected plan
+        # --------------------------------------------------
+
+        plan_result = await db.execute(
+            select(SubscriptionPlan).where(
+                SubscriptionPlan.id == data.plan_id,
+                SubscriptionPlan.is_active.is_(True),
+            )
+        )
+        plan = plan_result.scalar_one_or_none()
+
+        if plan is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Subscription plan not found or inactive.",
+            )
+
+        # --------------------------------------------------
+        # 3. Validate its tier
+        # --------------------------------------------------
+
+        tier_result = await db.execute(
+            select(SubscriptionTier).where(
+                SubscriptionTier.id == plan.tier_id,
+                SubscriptionTier.is_active.is_(True),
+            )
+        )
+        tier = tier_result.scalar_one_or_none()
+
+        if tier is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The subscription tier is inactive.",
+            )
+
+        # --------------------------------------------------
+        # 4. Validate its service
+        # --------------------------------------------------
+
+        service_result = await db.execute(
+            select(SubscriptionService).where(
+                SubscriptionService.id == tier.service_id,
+                SubscriptionService.is_active.is_(True),
+            )
+        )
+        service = service_result.scalar_one_or_none()
+
+        if service is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The subscription service is inactive.",
+            )
+
+        # --------------------------------------------------
+        # 5. Prevent duplicate service for the same firm
+        # --------------------------------------------------
+
+        duplicate_result = await db.execute(
+            select(OrderItem.id)
+            .join(Order, Order.id == OrderItem.order_id)
+            .where(
+                Order.user_id == current_user.id,
+                Order.status.in_(UNFINISHED_ORDER_STATUSES),
+                OrderItem.firm_id == firm.id,
+                OrderItem.service_id == service.id,
+            )
+            .limit(1)
+        )
+
+        if duplicate_result.scalar_one_or_none() is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Service already in cart for this firm.",
+            )
+
+        # --------------------------------------------------
+        # 6. Find an editable order or create one
+        # --------------------------------------------------
+
+        order_result = await db.execute(
+            select(Order)
+            .where(
+                Order.user_id == current_user.id,
+                Order.status == "pending_checkout",
+            )
+            .order_by(Order.id.desc())
+            .with_for_update()
+            .limit(1)
+        )
+        order = order_result.scalar_one_or_none()
+
+        if order is None:
+            order = Order(
+                order_number=generate_order_number(),
+                user_id=current_user.id,
+                status="pending_checkout",
+            )
+            db.add(order)
+            await db.flush()
+
+        # --------------------------------------------------
+        # 7. Save the purchase-time snapshots
+        # --------------------------------------------------
+
+        price = Decimal(str(plan.price))
+        discount = Decimal("0.00")
+        total = price - discount
+        currency = "LRD"
+
+        order_item = OrderItem(
+            order_id=order.id,
+            firm_id=firm.id,
+            service_id=service.id,
+            tier_id=tier.id,
+            plan_id=plan.id,
+            service_name=service.name,
+            tier_name=tier.name,
+            plan_name=plan.name,
+            duration_months=plan.duration_months,
+            unit_price=price,
+            discount_amount=discount,
+            total_amount=total,
+            currency=currency,
+        )
+
+        db.add(order_item)
+        await db.flush()
+
+        response = BuyNowResponse(
+            order_number=order.order_number,
+            order_item_id=order_item.id,
+            firm_id=firm.id,
+            firm_name=firm.name,
+            service_name=service.name,
+            tier_name=tier.name,
+            plan_name=plan.name,
+            duration_months=plan.duration_months,
+            amount=total,
+            currency=currency,
+        )
+
+        await db.commit()
+        return response
+
+    except HTTPException:
+        await db.rollback()
+        raise
+
+    except SQLAlchemyError:
+        await db.rollback()
+        logger.exception(
+            "Failed to add subscription to cart for user_id=%s",
+            current_user.id,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load payment methods. Please try again.",
-        ) from exc
+            detail="Unable to add this subscription to your cart.",
+    )
 
-    return to_payment_method_list(methods)
+
+
+
+from decimal import Decimal
+
+from fastapi import HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+
+async def get_checkout_details(
+    order_number: str,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> CheckoutDetailsRead:
+    guard_user_state(current_user)
+
+    try:
+        result = await db.execute(
+            select(Order)
+            .options(
+                selectinload(Order.items).selectinload(OrderItem.firm),
+            )
+            .where(
+                Order.order_number == order_number,
+                Order.user_id == current_user.id,
+                Order.status.in_(UNFINISHED_ORDER_STATUSES),
+            )
+        )
+
+        order = result.scalar_one_or_none()
+
+        if order is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Checkout order not found.",
+            )
+
+        if not order.items:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Your checkout order is empty.",
+            )
+
+        currencies = {item.currency for item in order.items}
+
+        if len(currencies) != 1:
+            logger.error(
+                "Order %s contains inconsistent currencies: %s",
+                order.order_number,
+                currencies,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This order contains inconsistent currencies.",
+            )
+
+        currency = next(iter(currencies))
+        total_amount = Decimal("0.00")
+        checkout_items: list[CheckoutItemRead] = []
+
+        for item in order.items:
+            if item.firm is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A firm associated with this order could not be found.",
+                )
+
+            item_amount = Decimal(str(item.total_amount))
+            total_amount += item_amount
+
+            checkout_items.append(
+                CheckoutItemRead(
+                    order_item_id=item.id,
+                    firm_id=item.firm_id,
+                    firm_name=item.firm.name,
+                    service_name=item.service_name,
+                    tier_name=item.tier_name,
+                    plan_name=item.plan_name,
+                    duration_months=item.duration_months,
+                    amount=item_amount,
+                    currency=item.currency,
+                )
+            )
+
+        # Reuse your existing public active payment-method function.
+        payment_methods = await read_available_payment_methods(db)
+
+        return CheckoutDetailsRead(
+            order_number=order.order_number,
+            items=checkout_items,
+            total_amount=total_amount,
+            currency=currency,
+            payment_methods=payment_methods,
+        )
+
+    except HTTPException:
+        raise
+
+    except SQLAlchemyError:
+        logger.exception(
+            "Failed to load checkout for user_id=%s, order_number=%s",
+            current_user.id,
+            order_number,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to load checkout details. Please try again.",
+        )
+
+
+
+
+
+
+@router.post(
+    "/buy-now",
+    response_model=BuyNowResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def buy_now(
+    data: BuyNowRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: ReadUser = Depends(get_current_user),
+):
+    return await buy_subscription_now(
+        data=data,
+        db=db,
+        current_user=current_user,
+    )
+
+
+@router.get(
+    "/checkout/{order_number}",
+    response_model=CheckoutDetailsRead,
+)
+async def checkout_details(
+    order_number: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: ReadUser = Depends(get_current_user),
+):
+    return await get_checkout_details(
+        order_number=order_number,
+        db=db,
+        current_user=current_user,
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
