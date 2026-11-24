@@ -1,3 +1,206 @@
+# new routes for receipt 
+"""Receipt routes."""
+
+from fastapi import APIRouter, BackgroundTasks, Query, Response, status
+
+from api.core.database import DBDep
+from api.core.mail import MailDep
+from api.receipts.logics import (
+    create_receipt,
+    export_branch_receipt_csv,
+    export_firm_receipt_csv,
+    list_receipt_per_firm,
+    read_receipt_per_branch,
+    read_single_receipt,
+)
+from api.receipts.schemas import (
+    BranchReceiptListRead,
+    CreateReceiptResponse,
+    FirmReceiptListRead,
+    ReceiptCreate,
+    ReceiptRead,
+)
+from api.users.deps import CurrentUser
+
+
+router = APIRouter(tags=["Receipts"])
+
+
+# =============================================================================
+# CREATE — POST /firms/{fs}/branches/{bs}/receipts
+# =============================================================================
+
+@router.post(
+    "/firms/{firm_slug}/branches/{branch_slug}/receipts",
+    response_model=CreateReceiptResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a receipt for a branch",
+)
+async def create(
+    firm_slug: str,
+    branch_slug: str,
+    data: ReceiptCreate,
+    background_tasks: BackgroundTasks,
+    db: DBDep,
+    mailer: MailDep,
+    current_user: CurrentUser,
+):
+    return await create_receipt(
+        firm_slug=firm_slug,
+        branch_slug=branch_slug,
+        data=data,
+        db=db,
+        current_user=current_user,
+        mailer=mailer,
+        background_tasks=background_tasks,
+    )
+
+
+# =============================================================================
+# READ — LIST PER BRANCH
+# =============================================================================
+
+@router.get(
+    "/firms/{firm_slug}/branches/{branch_slug}/receipts",
+    response_model=BranchReceiptListRead,
+    summary="List receipts for a branch (compact)",
+)
+async def list_per_branch(
+    firm_slug: str,
+    branch_slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+):
+    return await read_receipt_per_branch(
+        firm_slug=firm_slug,
+        branch_slug=branch_slug,
+        db=db,
+        current_user=current_user,
+        skip=skip,
+        limit=limit,
+    )
+
+
+# =============================================================================
+# READ — LIST PER FIRM (across all branches)
+# =============================================================================
+
+@router.get(
+    "/firms/{firm_slug}/receipts",
+    response_model=FirmReceiptListRead,
+    summary="List all receipts for a firm (compact)",
+)
+async def list_per_firm(
+    firm_slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+):
+    return await list_receipt_per_firm(
+        firm_slug=firm_slug,
+        db=db,
+        current_user=current_user,
+        skip=skip,
+        limit=limit,
+    )
+
+
+# =============================================================================
+# READ — SINGLE BY RECEIPT NUMBER
+# =============================================================================
+
+@router.get(
+    "/receipts/{receipt_number}",
+    response_model=ReceiptRead,
+    summary="Get a receipt's full detail by receipt_number",
+)
+async def read_one(
+    receipt_number: str,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    return await read_single_receipt(
+        receipt_number=receipt_number,
+        db=db,
+        current_user=current_user,
+    )
+
+
+# =============================================================================
+# CSV — BRANCH
+# =============================================================================
+
+@router.get(
+    "/firms/{firm_slug}/branches/{branch_slug}/receipts/csv",
+    response_class=Response,
+    summary="Download branch receipts as CSV",
+    responses={
+        200: {
+            "content": {"text/csv": {}},
+            "description": "CSV file of all receipts for the branch",
+        },
+    },
+)
+async def branch_csv(
+    firm_slug: str,
+    branch_slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    csv_bytes, filename = await export_branch_receipt_csv(
+        firm_slug=firm_slug,
+        branch_slug=branch_slug,
+        db=db,
+        current_user=current_user,
+    )
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+# =============================================================================
+# CSV — FIRM-WIDE
+# =============================================================================
+
+@router.get(
+    "/firms/{firm_slug}/receipts/csv",
+    response_class=Response,
+    summary="Download firm-wide receipts as CSV",
+    responses={
+        200: {
+            "content": {"text/csv": {}},
+            "description": "CSV file of all receipts for the firm",
+        },
+    },
+)
+async def firm_csv(
+    firm_slug: str,
+    db: DBDep,
+    current_user: CurrentUser,
+):
+    csv_bytes, filename = await export_firm_receipt_csv(
+        firm_slug=firm_slug,
+        db=db,
+        current_user=current_user,
+    )
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
 # you said this earlier
 // src/lib/receiptPdfUrl.ts
 
