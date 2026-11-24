@@ -1,3 +1,16 @@
+UNFINISHED_ORDER_STATUSES = (
+    "pending_checkout",
+    "pending_payment",
+)
+
+
+def generate_order_number() -> str:
+    return f"ORD-{uuid4().hex[:16].upper()}"
+
+
+
+
+
 async def read_my_firms(
     db: AsyncSession,
     current_user: ReadUser,
