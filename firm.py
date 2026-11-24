@@ -1,91 +1,36 @@
-async def send_receipt_email(
-    receipt_slug: str,
-    firm_id: int,
-    mailer: FastMail,
-) -> None:
-    """
-    Send a receipt to the customer's email.
 
-    Must not raise. Runs in a FastAPI BackgroundTask; opens its own
-    DB session (the request-scoped one is already closed).
+async def read_my_firms(
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> FirmListRead:
     """
-    # Local import to avoid a circular import at module load time
-    #from api.db.session import async_session_maker
+    List current user's firms with branch_count and firm_logo_url.
+
+    No receipt counts — the list contract intentionally omits them.
+    """
+    guard_user_state(current_user)
 
     try:
-        async with AsyncSessionFactory() as db:
-            receipt = await get_receipt_by_slug(db, receipt_slug) #
-            if not receipt or not receipt.customer_email:
-                logger.warning(
-                    "Receipt email skipped: slug=%s missing or no customer_email",
-                    receipt_slug,
-                )
-                return
-
-            firm = await db.get(Firm, firm_id)
-            if not firm:
-                logger.warning(
-                    "Receipt email skipped: firm_id=%s not found",
-                    firm_id,
-                )
-                return
-            branch = await db.get(Branch, receipt.branch_id)
-            sitename = (await get_home_settings_logic(db)).sitename
-
-            context = {
-                "firm": firm,
-                "branch":branch,
-                "receipt": receipt,
-                "current_year": datetime.now(timezone.utc).year,
-                "sitename": sitename,
-                "full_names": receipt.customer_fullname,
-            }
-
-            # Attach PDF (best-effort)
-            attachments: list[dict] = []
-            try:
-                pdf_bytes = render_pdf(
-                    template_name="receipts/customer_receipt_pdf.html",
-                    context=context,
-                )
-                attachments.append(
-                    {
-                        "file": pdf_bytes,
-                        "filename": f"receipt-{receipt.receipt_number}.pdf",
-                        "mime_type": "application",
-                        "mime_subtype": "pdf",
-                    }
-                )
-            except Exception:
-                logger.exception(
-                    "PDF generation failed for receipt=%s — "
-                    "sending HTML-only email",
-                    receipt.receipt_number,
-                )
-
-            await send_email(
-                recipient=receipt.customer_email,
-                subject=f"Receipt #{receipt.receipt_number} from {firm.name}",
-                mailer=mailer,
-                db=db,
-                full_names=receipt.customer_fullname,
-                template_name="receipts/customer_receipt.html",
-                template_body=context,
-                attachments=attachments,
-            )
-
-            logger.info(
-                "Receipt #%s emailed to %s (pdf_attached=%s)",
-                receipt.receipt_number,
-                receipt.customer_email,
-                bool(attachments),
-            )
+        result = await db.execute(
+            select(Firm)
+            .where(Firm.user_id == current_user.id)
+            .order_by(col(Firm.name))
+        )
+        firms = list(result.scalars().all())
+        ids = [firm_id_of(f) for f in firms]
+        branch_counts, _ = await counts_by_firm(db, ids)
+    except HTTPException:
+        raise
     except Exception:
         logger.exception(
-            "Failed to send receipt email for slug=%s", receipt_slug
+            "Failed to load firms for user_id=%s", current_user.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load your firms. Please try again.",
         )
 
-
+    return to_firm_list(firms, branch_counts)
 
 
 # =============================================================================
