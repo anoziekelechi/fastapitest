@@ -1,3 +1,124 @@
+class SubscriptionPayment(BaseModel, table=True):
+    """
+    One payment attempt for an entire subscription order.
+
+    An order may contain multiple firms and multiple subscription plans.
+    """
+
+    __tablename__ = "subscription_payments"  # type: ignore
+
+    __table_args__ = (
+        UniqueConstraint(
+            "order_id",
+            "idempotency_key",
+            name="uq_subscription_payment_order_idempotency",
+        ),
+        CheckConstraint(
+            "amount > 0",
+            name="ck_subscription_payment_amount_positive",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'paid', 'failed', 'cancelled')",
+            name="ck_subscription_payment_status",
+        ),
+    )
+
+    order_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("orders.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    payment_method_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("paymentmethods.id", ondelete="RESTRICT"),
+            nullable=False,
+            index=True,
+        )
+    )
+
+    idempotency_key: str = Field(
+        sa_column=Column(
+            String(100),
+            nullable=False,
+        )
+    )
+
+    amount: Decimal = Field(
+        sa_column=Column(
+            Numeric(precision=10, scale=2),
+            nullable=False,
+        )
+    )
+
+    currency: str = Field(
+        default="LRD",
+        sa_column=Column(
+            String(3),
+            nullable=False,
+            server_default="LRD",
+        ),
+    )
+
+    payment_reference: str = Field(
+        sa_column=Column(
+            String(100),
+            nullable=False,
+            unique=True,
+            index=True,
+        )
+    )
+
+    provider_reference: str | None = Field(
+        default=None,
+        sa_column=Column(
+            String(150),
+            nullable=True,
+            index=True,
+        ),
+    )
+
+    provider_code: str = Field(
+        sa_column=Column(
+            String(30),
+            nullable=False,
+        )
+    )
+
+    status: str = Field(
+        default="pending",
+        sa_column=Column(
+            String(20),
+            nullable=False,
+            server_default="pending",
+            index=True,
+        ),
+    )
+
+    paid_at: datetime | None = Field(
+        default=None,
+        sa_type=DateTime(timezone=True),
+        sa_column_kwargs={"nullable": True},
+    )
+
+    order: Optional["Order"] = Relationship(
+        back_populates="payments",
+    )
+
+    payment_method: Optional["PaymentMethods"] = Relationship(
+        back_populates="subscription_payments",
+    )
+
+
+
+
+
+
+
 async def require_firm_access(
     db: AsyncSession,
     *,
