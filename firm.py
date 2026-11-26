@@ -1,3 +1,58 @@
+class Country(str, Enum):
+    LIBERIA = "Liberia"
+    GHANA = "Ghana"
+    NIGERIA = "Nigeria"
+
+
+# Automatic base reporting currency per country
+COUNTRY_BASE_CURRENCY: dict[Country, str] = {
+    Country.LIBERIA: "USD",
+    Country.GHANA: "GHS",
+    Country.NIGERIA: "NGN",
+}
+
+# Currencies allowed when creating receipts/invoices
+ALLOWED_RECEIPT_CURRENCIES: dict[Country, list[str]] = {
+    Country.LIBERIA: ["USD", "LRD"],
+    Country.GHANA: ["GHS", "USD"],
+    Country.NIGERIA: ["NGN", "USD"],
+}
+
+
+class Organization(SQLModel, table=True):
+    __tablename__ = "organizations"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    name: str = Field(max_length=255)
+    country: Country = Field(default=Country.LIBERIA)
+    base_currency: str = Field(max_length=3)  # Auto-set to USD, GHS, or NGN
+
+
+class OrganizationCreate(SQLModel):
+    name: str
+    country: Country = Country.LIBERIA
+
+
+@router.post("/organizations", response_model=Organization)
+def create_organization(payload: OrganizationCreate, session: Session = Depends(get_session)):
+    org = Organization(
+        name=payload.name,
+        country=payload.country,
+        base_currency=COUNTRY_BASE_CURRENCY[payload.country],
+    )
+    session.add(org)
+    session.commit()
+    session.refresh(org)
+    return org
+
+
+
+
+
+
+
+
+
 class SubscriptionPayment(BaseModel, table=True):
     """
     One payment attempt for an entire subscription order.
