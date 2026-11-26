@@ -1,50 +1,60 @@
+
 class Country(str, Enum):
     LIBERIA = "Liberia"
     GHANA = "Ghana"
     NIGERIA = "Nigeria"
 
 
-# Automatic base reporting currency per country
-COUNTRY_BASE_CURRENCY: dict[Country, str] = {
-    Country.LIBERIA: "USD",
-    Country.GHANA: "GHS",
-    Country.NIGERIA: "NGN",
+class Currency(str, Enum):
+    USD = "USD"
+    LRD = "LRD"
+    GHS = "GHS"
+    NGN = "NGN"
+
+
+# 1. Auto-assigned base reporting currency per country
+COUNTRY_BASE_CURRENCY: dict[Country, Currency] = {
+    Country.LIBERIA: Currency.USD,
+    Country.GHANA: Currency.GHS,
+    Country.NIGERIA: Currency.NGN,
 }
 
-# Currencies allowed when creating receipts/invoices
-ALLOWED_RECEIPT_CURRENCIES: dict[Country, list[str]] = {
-    Country.LIBERIA: ["USD", "LRD"],
-    Country.GHANA: ["GHS", "USD"],
-    Country.NIGERIA: ["NGN", "USD"],
+# 2. Allowed payment currencies on receipts (Liberia still supports BOTH USD and LRD)
+COUNTRY_ALLOWED_CURRENCIES: dict[Country, list[Currency]] = {
+    Country.LIBERIA: [Currency.USD, Currency.LRD],
+    Country.GHANA: [Currency.GHS],
+    Country.NIGERIA: [Currency.NGN],
 }
 
 
+# 3. Database Model: base_currency is REQUIRED (not None)
 class Organization(SQLModel, table=True):
     __tablename__ = "organizations"
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     name: str = Field(max_length=255)
     country: Country = Field(default=Country.LIBERIA)
-    base_currency: str = Field(max_length=3)  # Auto-set to USD, GHS, or NGN
+    base_currency: Currency = Field(nullable=False)  # Required in PostgreSQL
 
 
+# 4. API Input Schema: User only provides name & country
 class OrganizationCreate(SQLModel):
     name: str
     country: Country = Country.LIBERIA
 
 
+# 5. Endpoint: Automatically fills base_currency from org.country
 @router.post("/organizations", response_model=Organization)
 def create_organization(payload: OrganizationCreate, session: Session = Depends(get_session)):
     org = Organization(
         name=payload.name,
         country=payload.country,
-        base_currency=COUNTRY_BASE_CURRENCY[payload.country],
+        base_currency=COUNTRY_BASE_CURRENCY[payload.country],  # Auto-filled!
     )
     session.add(org)
     session.commit()
     session.refresh(org)
     return org
-
 
 
 
