@@ -1,3 +1,24 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlmodel import Session, select
+
+router = APIRouter()
+
+
+@router.get("/organizations/{org_id}/payment-methods", response_model=list[PaymentMethod])
+def get_org_payment_methods(org_id: uuid.UUID, session: Session = Depends(get_session)):
+    org = session.get(Organization, org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    statement = select(PaymentMethod).where(
+        PaymentMethod.country == org.country,
+        PaymentMethod.active == True,
+    )
+    return session.exec(statement).all()
+
+
+
+
 """Subscription service & plan schemas."""
 
 from datetime import datetime
