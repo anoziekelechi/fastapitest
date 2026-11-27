@@ -1,30 +1,37 @@
-
-class Country(str, Enum):
-    LIBERIA = "Liberia"
-    GHANA = "Ghana"
-    NIGERIA = "Nigeria"
+Argument of type "str" cannot be assigned to parameter "country" of type "Country" in function "__init__"
+  "str" is not assignable to "Country"PylancereportArgumentType
 
 
-class Currency(str, Enum):
-    USD = "USD"
-    LRD = "LRD"
-    GHS = "GHS"
-    NGN = "NGN"
 
-
-# 1. Auto-assigned base reporting currency per country
-COUNTRY_BASE_CURRENCY: dict[Country, Currency] = {
-    Country.LIBERIA: Currency.USD,
-    Country.GHANA: Currency.GHS,
-    Country.NIGERIA: Currency.NGN,
-}
-
-# 2. Allowed payment currencies on receipts (Liberia still supports BOTH USD and LRD)
-COUNTRY_ALLOWED_CURRENCIES: dict[Country, list[Currency]] = {
-    Country.LIBERIA: [Currency.USD, Currency.LRD],
-    Country.GHANA: [Currency.GHS],
-    Country.NIGERIA: [Currency.NGN],
-}
+@router.post(
+    "/add",
+    response_model=CreateFirmResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a firm (authenticated)",
+)
+async def create(
+    db: DBDep,
+    current_user: CurrentUser,
+    name: Annotated[str, Form(min_length=2, max_length=200)],
+    country: Annotated[str, Form(min_length=2, max_length=200)],
+    deals_on: Annotated[str, Form(min_length=10, max_length=2000)],
+    registration_number: Annotated[
+        str | None, Form(max_length=50)
+    ] = None,
+    firm_logo_key: UploadFile | None = File(None),
+):
+    data = FirmCreate(
+        name=name,
+        deals_on=deals_on,
+        registration_number=registration_number,
+        country=country,
+    )
+    return await create_firm(
+        data=data,
+        db=db,
+        current_user=current_user,
+        firm_logo_key=firm_logo_key,
+    )
 
 
 # 3. Database Model: base_currency is REQUIRED (not None)
