@@ -1,443 +1,54 @@
-  """
-    user come online read_service display all service name,logo,description,user click
-    say receipt frontend call read_service_with_plans and display
-    1 month 5$ buy now
-    3 months 10$ buy now
-    """
+
+#api/core/country
 
 
-# is this not the same with read_plans_for_service and read_service_with_plans
-async def read_service_with_plans(
-    slug: str,
-    db: AsyncSession,
-    current_user: ReadUser | None = None,
-) -> ServiceWithPlansRead:
-    """
-    Read a service with plans.
-
-    Admin: all plans. Public: active plans only, service must be
-    active and buyable.
-    """
-    admin = bool(current_user and getattr(current_user, "is_admin", False))
-    service = await get_service_by_slug(db, slug)
-    return await load_service_detail(db, service, admin=admin)
+class Country(str, Enum):
+    LIBERIA = "Liberia"
+    GHANA = "Ghana"
+    NIGERIA = "Nigeria"
 
 
-async def read_plans_for_service(
-    service_slug: str,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> list[PlanRead]:
-    """
-    List all plans under a service (admin-only).
-
-    URL: GET /services/{service_slug}/plans
-
-    Ordered by duration_months asc, then name asc.
-    """
-    service = await get_service_by_slug(db, service_slug)
-    sid = service_id_of(service)
-
-    try:
-        result = await db.execute(
-            select(SubscriptionPlan)
-            .where(col(SubscriptionPlan.service_id) == sid)
-            .order_by(
-                col(SubscriptionPlan.duration_months).asc(),
-                col(SubscriptionPlan.name).asc(),
-            )
-        )
-        plans = list(result.scalars().all())
-    except SQLAlchemyError as exc:
-        logger.exception(
-            "Failed to load plans for service_id=%s", sid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load plans. Please try again.",
-        ) from exc
-
-    return to_plan_list(plans)
+class Currency(str, Enum):
+    USD = "USD"
+    LRD = "LRD"
+    GHS = "GHS"
+    NGN = "NGN"
 
 
+# 1. Auto-assigned base reporting currency per country
+COUNTRY_BASE_CURRENCY: dict[Country, Currency] = {
+    Country.LIBERIA: Currency.USD,
+    Country.GHANA: Currency.GHS,
+    Country.NIGERIA: Currency.NGN,
+}
 
-
-@router.post(
-    "/services",
-    response_model=CreateServiceResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a subscription service (admin only)",
-)
-async def create_service_route(
-    db: DBDep,
-    admin: AdminUser,
-    data: Annotated[ServiceCreate, Form()],
-    service_image: Annotated[UploadFile | None, File()] = None,
-):
-    return await create_service(
-        data=data,
-        service_image=service_image,
-        db=db,
-        current_user=admin,
+"""
+then i updated the firm to have a country 
+"""
+ firm = Firm(
+        user_id=owner_id,
+        name=data.name,
+        registration_number=data.registration_number,
+        country=data.country,#new
+        base_currency=COUNTRY_BASE_CURRENCY[data.country], #new
+        slug=generate_slug(data.name),
+        deals_on=data.deals_on,
+        firm_logo_key=new_logo_key,
+        disabled=False,
     )
 
-vs
-
-@router.post(
-    "/services",
-    response_model=CreateServiceResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a subscription service (admin only)",
-)
-async def create_service_route(
-    db: DBDep,
-    admin: AdminUser,
-    name: str = Form(...),
-    description: str = Form(...),
-    trial_days: int = Form(30),
-    service_image: UploadFile | None = File(None),
-):
-    """
-    Multipart endpoint.
-
-    FastAPI cannot read a Pydantic body and a file from the same
-    request. So each field is declared individually and re-assembled
-    into `ServiceCreate` before hitting the logic — that way the
-    schema validators still run.
-    """
-    data = ServiceCreate(
-        name=name,
-        description=description,
-        trial_days=trial_days,
-    )
-
-    return await create_service(
-        data=data,
-        service_image=service_image,
-        db=db,
-        current_user=admin,
-    )
-
-
-
-
-
-
-
-# api/subscriptions/logics/subscription_ops.py
-
-async def start_trial_for_service(
-    firm_id: int,
-    service_id: int,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """Start a free trial for one service."""
-    guard_user_state(current_user)
-
-    firm = await require_firm_access(
-        db, firm_id=firm_id, current_user=current_user,
-        require_active=True,
-    )
-    fid = firm_id_of(firm)
-
-    try:
-        service = await db.get(SubscriptionService, service_id)
-    except SQLAlchemyError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load service. Please try again.",
-        ) from exc
-
-    if service is None or not service.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Subscription service not found or inactive.",
-        )
-
-    existing = await get_subscription_by_firm_service(db, fid, service_id)
-    if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"This firm has already used '{service.name}'. "
-                f"Free trials are only available once per service."
-            ),
-        )
-
-    # Service must have at least one active plan
-    if not await service_has_buyable(db, service_id):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"'{service.name}' is not currently available "
-                f"for trial — no active plan."
-            ),
-        )
-
-    now = utc_now()
-    trial_ends_at = now + timedelta(days=service.trial_days)
-
-    sub = Subscription(
-        firm_id=fid,
-        service_id=service_id,
-        plan_id=None,             # trial doesn't bind a plan
-        is_on_trial=True,
-        trial_started_at=now,
-        trial_ends_at=trial_ends_at,
-        is_active=True,
-        subscription_started_at=None,
-        subscription_ends_at=None,
-        auto_renew=False,
-    )
-    db.add(sub)
-
-    # ... flush → commit → refresh as before
-
-
-
-
-
-async def activate_subscription(
-    data: SubscriptionActivate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
-    """Admin: activate / extend a subscription without payment."""
-    # data now has: firm_id, service_id, plan_id
-    if not is_admin(current_user):
-        raise HTTPException(403, "Administrator access required.")
-
-    guard_user_state(current_user)
-
-    firm = await db.get(Firm, data.firm_id)
-    service = await db.get(SubscriptionService, data.service_id)
-    if firm is None:
-        raise HTTPException(404, "Firm not found.")
-    fid = firm_id_of(firm)
-    guard_firm_state(firm)
-
-    if service is None or not service.is_active:
-        raise HTTPException(404, "Subscription service not found or inactive.")
-    sid = service_id_of(service)
-
-    plan = await get_plan_by_service_and_slug(
-        db, service_id=sid, plan_slug=data.plan_slug,
-    )
-    pid = plan_id_of(plan)
-    if not plan.is_active:
-        raise HTTPException(400, "The selected plan is inactive.")
-
-    now = utc_now()
-    sub = await get_subscription_by_firm_service(db, fid, sid)
-
-    same_plan = (
-        sub is not None
-        and sub.plan_id == pid
-        and not sub.is_on_trial
-        and sub.is_active
-        and sub.subscription_ends_at is not None
-        and as_utc(sub.subscription_ends_at) > now
-    )
-
-    base_time = (
-        as_utc(sub.subscription_ends_at)
-        if same_plan and sub and sub.subscription_ends_at
-        else now
-    )
-    ends_at = add_calendar_months(base_time, plan.duration_months)
-
-    if sub is None:
-        sub = Subscription(
-            firm_id=fid,
-            service_id=sid,
-            plan_id=pid,
-            is_on_trial=False,
-            trial_started_at=None,
-            trial_ends_at=None,
-            is_active=True,
-            subscription_started_at=now,
-            subscription_ends_at=ends_at,
-            auto_renew=False,
-        )
-        db.add(sub)
-    else:
-        sub.plan_id = pid
-        sub.is_on_trial = False
-        sub.trial_started_at = None
-        sub.trial_ends_at = None
-        sub.is_active = True
-        sub.subscription_ends_at = ends_at
-        sub.auto_renew = False
-        if not same_plan:
-            sub.subscription_started_at = now
-        db.add(sub)
-
-    # ... flush → commit → refresh
-
-
-class SubscriptionActivate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    firm_id: int
-    service_id: int
-    plan_slug: str       # <-- plan by slug, no tier
-
-
-# api/subscriptions/routes/service.py
-
-from fastapi import APIRouter, File, UploadFile, status
-from api.deps import AdminUser, CurrentUser, DBDep
-from api.subscriptions.logics.service import (
-    create_service,
-    delete_service,
-    read_service_with_plans,
-    read_services,
-    update_service,
-)
-from api.subscriptions.schemas import (
-    CreateServiceResponse,
-    DeleteServiceResponse,
-    ServiceCreate,
-    ServiceRead,
-    ServiceUpdate,
-    ServiceWithPlansRead,
-    UpdateServiceResponse,
-)
-
-
-router = APIRouter(prefix="/services", tags=["Subscription Services"])
-
-
-
-
-# api/subscriptions/routes/plan.py
-
-from fastapi import APIRouter, status
-from api.deps import AdminUser, DBDep
-from api.subscriptions.logics.plan import (
-    create_plan,
-    delete_plan,
-    read_plans_for_service,
-    update_plan,
-)
-from api.subscriptions.schemas import (
-    CreatePlanResponse,
-    DeletePlanResponse,
-    PlanCreate,
-    PlanRead,
-    PlanUpdate,
-    UpdatePlanResponse,
-)
-
-
-router = APIRouter(tags=["Subscription Plans"])
-
-
-
-
-# subscription
-
-SubscriptionStatusLabel = Literal[
-    "active",
-    "trial",
-    "trial_expired",
-    "expired",
-    "inactive",
-    "unknown",
-]
-
-
-class SubscriptionRead(BaseModel):
-    """
-    A single subscription as returned to the frontend.
-
-    Derived fields (`is_active`, `is_on_trial`, `days_remaining`,
-    `status_label`, `can_access`) are computed by the builder from
-    the raw row and the current time — the caller never assembles
-    them inline.
-    """
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    firm_id: int
-    service_id: int
-    tier_id: int | None = None
-    plan_id: int | None = None
-    last_payment_id: int | None = None
-
-    is_on_trial: bool
-    trial_started_at: datetime | None = None
-    trial_ends_at: datetime | None = None
-
-    subscription_started_at: datetime | None = None
-    subscription_ends_at: datetime | None = None
-
-    auto_renew: bool
-
-    # Derived
-    is_active: bool
-    days_remaining: int | None = None
-    status_label: SubscriptionStatusLabel = "unknown"
-    can_access: bool
-
-    created_at: datetime
-    updated_at: datetime
-
-
-class SubscriptionStatusRead(BaseModel):
-    """
-    Compact status payload for the "is my firm subscribed?" widget.
-    """
-    firm_id: int
-    service_id: int
-    service_name: str
-    tier_name: str | None = None
-    plan_name: str | None = None
-    is_active: bool
-    is_on_trial: bool
-    days_remaining: int
-    status_label: SubscriptionStatusLabel = "unknown"
-    can_access: bool
-
-
-
-class SubscriptionActivate(BaseModel):
-    """
-    Admin override: activate/extend a subscription without payment.
-    """
-    model_config = ConfigDict(extra="forbid")
-
-    firm_id: int
-    service_id: int
-    tier_id: int
-    plan_id: int
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    db.add(firm)
+i need to write a check in create_firm so 2 firms with same name name cant create firm 
+raise an error if abc limited already registerd in Liberia then block another firm from liberia from using same abc limited
+so lets update the create and update also we can add country in FIRMRead
+
+
+# 2. Allowed payment currencies on receipts (Liberia still supports BOTH USD and LRD)
+COUNTRY_ALLOWED_CURRENCIES: dict[Country, list[Currency]] = {
+    Country.LIBERIA: [Currency.USD, Currency.LRD],
+    Country.GHANA: [Currency.GHS],
+    Country.NIGERIA: [Currency.NGN],
+}
 
 async def buy_subscription_now(
     data: BuyNowRequest,
