@@ -172,105 +172,19 @@ class PlanUpdate(BaseModel):
 # PLAN — READ
 # =============================================================================
 
-class PlanRead(BaseModel):
-    """Full plan shape."""
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    service_id: int
-    name: str
-    description: str | None = None
-    slug: str
-    duration_months: int
-    price: Decimal
-    is_active: bool
-    created_at: datetime
-    updated_at: datetime
-
-    @field_serializer("price")
-    def serialize_price(self, v: Decimal) -> str:
-        return f"{v:.2f}"
 
 
-class PlanSummaryRead(BaseModel):
-    """Compact plan row for the service detail view."""
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    name: str
-    duration_months: int
-    price: Decimal
-    is_active: bool
-
-    @field_serializer("price")
-    def serialize_price(self, v: Decimal) -> str:
-        return f"{v:.2f}"
 
 
-# =============================================================================
-# SERVICE — READ
-# =============================================================================
-
-class ServiceRead(BaseModel):
-    """A service without plans."""
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    name: str
-    slug: str | None = None
-    description: str
-    service_logo_url: str | None = None
-    is_active: bool
-    trial_days: int
-    created_at: datetime
-    updated_at: datetime
 
 
-class ServiceWithPlansRead(ServiceRead):
-    """A service with its list of plans, sorted by name."""
-    plans: list[PlanSummaryRead] = []
-
-
-class ServicePlanNamesRead(ServiceRead):
-    """
-    Compact admin view: service + plan names (id + name + is_active).
-    Used by pickers / dropdowns.
-    """
-    plans: list[PlanSummaryRead] = []
 
 
 # =============================================================================
 # RESPONSE ENVELOPES
 # =============================================================================
 
-class CreateServiceResponse(BaseModel):
-    message: str
-    service: ServiceRead
 
-
-class UpdateServiceResponse(BaseModel):
-    message: str
-    service: ServiceRead
-
-
-class DeleteServiceResponse(BaseModel):
-    message: str
-    service_name: str
-
-
-class CreatePlanResponse(BaseModel):
-    message: str
-    plan: PlanRead
-
-
-class UpdatePlanResponse(BaseModel):
-    message: str
-    plan: PlanRead
-
-
-class DeletePlanResponse(BaseModel):
-    message: str
-    plan_name: str
 
 
 # =============================================================================
