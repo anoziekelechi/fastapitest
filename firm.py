@@ -1,3 +1,661 @@
+async def read_available_trial_services(
+    firm_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> TrialServiceListRead:
+    """
+    List services the firm can still start a trial for.
+
+    A service is available when ALL of the following hold:
+        - The service is active.
+        - The firm has never had a subscription for it
+          (trial or paid).
+        - The service has at least one ACTIVE plan
+          (all services are trialable now — no tier restriction).
+    """
+    guard_user_state(current_user)
+
+    await require_firm_access(
+        db,
+        firm_id=firm_id,
+        current_user=current_user,
+        require_active=False,
+    )
+
+    # ------------------------------------------------------------------
+    # 1. Service IDs the firm already has a subscription for
+    # ------------------------------------------------------------------
+    try:
+        used_rows = await db.execute(
+            select(Subscription.service_id)
+            .where(col(Subscription.firm_id) == firm_id)
+        )
+        used_service_ids = {row[0] for row in used_rows.all()}
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to load used services for firm_id=%s", firm_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load trial services. Please try again.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 2. Active services with at least one active plan
+    # ------------------------------------------------------------------
+    buyable_plan_exists = (
+        select(SubscriptionPlan.id)
+        .where(
+            col(SubscriptionPlan.service_id)
+            == col(SubscriptionService.id),
+            col(SubscriptionPlan.is_active).is_(True),
+        )
+        .correlate(SubscriptionService)
+        .exists()
+    )
+
+    try:
+        result = await db.execute(
+            select(SubscriptionService)
+            .where(
+                col(SubscriptionService.is_active).is_(True),
+                buyable_plan_exists,
+            )
+            .order_by(col(SubscriptionService.name).asc())
+        )
+        services = list(result.scalars().all())
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to load services for trial listing: firm_id=%s",
+            firm_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load trial services. Please try again.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 3. Filter out already-used services
+    # ------------------------------------------------------------------
+    available = [
+        s for s in services
+        if service_id_of(s) not in used_service_ids
+    ]
+
+    # ------------------------------------------------------------------
+    # 4. Cheapest plan per service (for "from $X")
+    # ------------------------------------------------------------------
+    service_ids = [service_id_of(s) for s in available]
+    cheapest: dict[int, object] = {}
+
+    if service_ids:
+        try:
+            rows = await db.execute(
+                select(
+                    col(SubscriptionPlan.service_id),
+                    func.min(SubscriptionPlan.price),
+                )
+                .where(
+                    col(SubscriptionPlan.service_id).in_(service_ids),
+                    col(SubscriptionPlan.is_active).is_(True),
+                )
+                .group_by(col(SubscriptionPlan.service_id))
+            )
+            cheapest = {row[0]: row[1] for row in rows.all()}
+        except SQLAlchemyError:
+            logger.exception(
+                "Failed to compute cheapest plans: firm_id=%s",
+                firm_id,
+            )
+            # Non-fatal — proceed without price_from
+
+    # ------------------------------------------------------------------
+    # 5. Assemble
+    # ------------------------------------------------------------------
+    items = [
+        TrialServiceRead(
+            service_id=service_id_of(s),
+            service_name=s.name,
+            service_slug=s.slug or s.name,
+            service_logo_url=resolve_logo_url(s.service_logo_key),
+            description=s.description,
+            trial_days=s.trial_days,
+            price_from=cheapest.get(service_id_of(s)),
+        )
+        for s in available
+    ]
+
+    return TrialServiceListRead(
+        firm_id=firm_id,
+        total=len(items),
+        services=items,
+    )
+
+
+async def start_trial_for_service(
+    firm_id: int,
+    service_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Start a free trial for a firm on a specific service.
+
+    Preconditions:
+        - Firm is accessible and active.
+        - Service exists and is active.
+        - Firm has NEVER had a subscription for this service
+          (trial or paid).
+        - Service has at least one ACTIVE plan.
+
+    The trial is created without a plan — the firm chooses a plan
+    when they upgrade. Trials are free by definition, so no tier
+    or plan is bound until payment.
+    """
+    guard_user_state(current_user)
+
+    firm = await require_firm_access(
+        db,
+        firm_id=firm_id,
+        current_user=current_user,
+        require_active=True,
+    )
+    fid = firm_id_of(firm)
+
+    # ------------------------------------------------------------------
+    # 1. Resolve the service
+    # ------------------------------------------------------------------
+    try:
+        service = await db.get(SubscriptionService, service_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load service. Please try again.",
+        ) from exc
+
+    if service is None or not service.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription service not found or inactive.",
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Firm must not have tried this service before
+    # ------------------------------------------------------------------
+    existing = await get_subscription_by_firm_service(
+        db, fid, service_id,
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"This firm has already used '{service.name}'. "
+                f"Free trials are only available once per service."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Service must be buyable (has at least one active plan)
+    # ------------------------------------------------------------------
+    if not await service_has_buyable(db, service_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"'{service.name}' is not currently available for "
+                f"trial — no active plan."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Create the trial subscription
+    # ------------------------------------------------------------------
+    now = utc_now()
+    trial_ends_at = now + timedelta(days=service.trial_days)
+
+    sub = Subscription(
+        firm_id=fid,
+        service_id=service_id,
+        plan_id=None,
+        last_payment_id=None,
+        is_on_trial=True,
+        trial_started_at=now,
+        trial_ends_at=trial_ends_at,
+        is_active=True,
+        subscription_started_at=None,
+        subscription_ends_at=None,
+        auto_renew=False,
+    )
+    db.add(sub)
+
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback failed after trial IntegrityError: "
+                "firm_id=%s service_id=%s", fid, service_id,
+            )
+        logger.warning(
+            "Trial creation violated a database integrity constraint: "
+            "firm_id=%s service_id=%s",
+            fid, service_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"This firm already has a subscription for "
+                f"'{service.name}'."
+            ),
+        ) from exc
+    except SQLAlchemyError as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback failed after trial flush error: "
+                "firm_id=%s service_id=%s", fid, service_id,
+            )
+        logger.exception(
+            "Database error while flushing trial: "
+            "firm_id=%s service_id=%s", fid, service_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Failed to start the trial. "
+                "Check its state if the database could not be recovered."
+            ),
+        ) from exc
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected trial flush error: "
+                "firm_id=%s service_id=%s", fid, service_id,
+            )
+        logger.exception(
+            "Unexpected error while flushing trial: "
+            "firm_id=%s service_id=%s", fid, service_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while starting trial.",
+        ) from exc
+
+    try:
+        await db.commit()
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: "
+                "firm_id=%s service_id=%s", fid, service_id,
+            )
+        logger.exception(
+            "Trial commit failed or has an uncertain outcome: "
+            "firm_id=%s service_id=%s", fid, service_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The trial could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    try:
+        await db.refresh(sub)
+    except Exception:
+        logger.exception(
+            "Failed to refresh subscription after trial: "
+            "firm_id=%s service_id=%s", fid, service_id,
+        )
+
+    logger.info(
+        "Trial started: firm_id=%s service_id=%s trial_ends_at=%s "
+        "by user_id=%s",
+        fid, service_id, trial_ends_at, current_user.id,
+    )
+
+    return {
+        "message": (
+            f"Free trial for '{service.name}' activated until "
+            f"{trial_ends_at.strftime('%Y-%m-%d')}."
+        ),
+        "subscription": to_subscription_read(sub, now=now),
+    }
+
+
+async def read_subscription_status(
+    firm_id: int,
+    service_id: int,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> SubscriptionStatusRead:
+    """
+    Compact status for the 'is my firm subscribed?' widget.
+
+    - Includes plan name (if a plan is bound).
+    - No tier_name — plans are the smallest granularity now.
+    """
+    guard_user_state(current_user)
+
+    await require_firm_access(
+        db,
+        firm_id=firm_id,
+        current_user=current_user,
+        require_active=False,
+    )
+
+    # ------------------------------------------------------------------
+    # 1. Resolve the service
+    # ------------------------------------------------------------------
+    try:
+        service = await db.get(SubscriptionService, service_id)
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to load service id=%s", service_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load service. Please try again.",
+        ) from exc
+
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription service not found.",
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Load the subscription
+    # ------------------------------------------------------------------
+    sub = await get_subscription_by_firm_service(
+        db, firm_id, service_id,
+    )
+    if sub is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No subscription found for this firm and service.",
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Resolve the plan name (if any)
+    # ------------------------------------------------------------------
+    plan = (
+        await db.get(SubscriptionPlan, sub.plan_id)
+        if sub.plan_id is not None
+        else None
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Compute status + assemble
+    # ------------------------------------------------------------------
+    now = utc_now()
+    status_label, can_access = compute_status_label(
+        is_on_trial=sub.is_on_trial,
+        is_active=sub.is_active,
+        trial_ends_at=sub.trial_ends_at,
+        subscription_ends_at=sub.subscription_ends_at,
+        now=now,
+    )
+    read = to_subscription_read(sub, now=now)
+
+    return SubscriptionStatusRead(
+        firm_id=firm_id,
+        service_id=service_id,
+        service_name=service.name,
+        plan_name=plan.name if plan else None,
+        is_active=read.is_active,
+        is_on_trial=read.is_on_trial,
+        days_remaining=read.days_remaining or 0,
+        status_label=read.status_label,
+        can_access=can_access,
+    )
+
+
+async def get_subscription_by_firm_service(
+    db: AsyncSession,
+    firm_id: int,
+    service_id: int,
+) -> Subscription | None:
+    try:
+        result = await db.execute(
+            select(Subscription).where(
+                col(Subscription.firm_id) == firm_id,
+                col(Subscription.service_id) == service_id,
+            )
+        )
+        return result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch subscription firm_id=%s service_id=%s",
+            firm_id, service_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load subscription. Please try again.",
+        ) from exc
+
+
+async def activate_subscription(
+    data: SubscriptionActivate,
+    db: AsyncSession,
+    current_user: ReadUser,
+) -> dict:
+    """
+    Admin override: activate or extend a subscription without payment.
+
+    Body: `{ firm_id, service_id, plan_slug }`.
+
+    Plan resolution:
+        - Plan is looked up by `(service_id, plan_slug)` — scoped to
+          the service in the request. Wrong service → 404.
+        - Plan must be active.
+
+    Extension semantics:
+        - Same plan, not on trial, still active, end date in the
+          future → extend from current end date.
+        - Otherwise → start a fresh window from now.
+    """
+    if not is_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator access required.",
+        )
+
+    guard_user_state(current_user)
+
+    # ------------------------------------------------------------------
+    # 1. Resolve firm + service
+    # ------------------------------------------------------------------
+    try:
+        firm = await db.get(Firm, data.firm_id)
+        service = await db.get(SubscriptionService, data.service_id)
+    except SQLAlchemyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load activation resources.",
+        ) from exc
+
+    if firm is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Firm not found.",
+        )
+    fid = firm_id_of(firm)
+    guard_firm_state(firm)
+
+    if service is None or not service.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Subscription service not found or inactive.",
+        )
+    sid = service_id_of(service)
+
+    # ------------------------------------------------------------------
+    # 2. Resolve + validate plan (scoped to service)
+    # ------------------------------------------------------------------
+    plan = await get_plan_by_service_and_slug(
+        db, service_id=sid, plan_slug=data.plan_slug,
+    )
+    pid = plan_id_of(plan)
+
+    if not plan.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The selected plan is inactive.",
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Load existing sub + determine extension base
+    # ------------------------------------------------------------------
+    now = utc_now()
+    sub = await get_subscription_by_firm_service(db, fid, sid)
+
+    same_plan = (
+        sub is not None
+        and sub.plan_id == pid
+        and not sub.is_on_trial
+        and sub.is_active
+        and sub.subscription_ends_at is not None
+        and as_utc(sub.subscription_ends_at) > now
+    )
+
+    if same_plan:
+        assert sub is not None
+        assert sub.subscription_ends_at is not None
+        base_time = as_utc(sub.subscription_ends_at)
+    else:
+        base_time = now
+
+    ends_at = add_calendar_months(base_time, plan.duration_months)
+
+    # ------------------------------------------------------------------
+    # 4. Create or update
+    # ------------------------------------------------------------------
+    if sub is None:
+        sub = Subscription(
+            firm_id=fid,
+            service_id=sid,
+            plan_id=pid,
+            last_payment_id=None,
+            is_on_trial=False,
+            trial_started_at=None,
+            trial_ends_at=None,
+            is_active=True,
+            subscription_started_at=now,
+            subscription_ends_at=ends_at,
+            auto_renew=False,
+        )
+        db.add(sub)
+    else:
+        sub.plan_id = pid
+        sub.is_on_trial = False
+        sub.trial_started_at = None
+        sub.trial_ends_at = None
+        sub.is_active = True
+        sub.subscription_ends_at = ends_at
+        sub.auto_renew = False
+        if not same_plan:
+            sub.subscription_started_at = now
+        db.add(sub)
+
+    # ------------------------------------------------------------------
+    # 5. Flush → commit → refresh
+    # ------------------------------------------------------------------
+    try:
+        await db.flush()
+    except SQLAlchemyError as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback failed after activation flush error: "
+                "firm_id=%s service_id=%s", fid, sid,
+            )
+        logger.exception(
+            "Database error while flushing activation: "
+            "firm_id=%s service_id=%s", fid, sid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Failed to activate subscription. "
+                "Check its state if the database could not be recovered."
+            ),
+        ) from exc
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected activation flush error: "
+                "firm_id=%s service_id=%s", fid, sid,
+            )
+        logger.exception(
+            "Unexpected error while flushing activation: "
+            "firm_id=%s service_id=%s", fid, sid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while activating subscription.",
+        ) from exc
+
+    try:
+        await db.commit()
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: "
+                "firm_id=%s service_id=%s", fid, sid,
+            )
+        logger.exception(
+            "Activation commit failed or has an uncertain outcome: "
+            "firm_id=%s service_id=%s", fid, sid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The activation could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    try:
+        await db.refresh(sub)
+    except Exception:
+        logger.exception(
+            "Failed to refresh subscription after activation: "
+            "firm_id=%s service_id=%s", fid, sid,
+        )
+
+    logger.info(
+        "Admin activated subscription: firm_id=%s service_id=%s "
+        "plan_id=%s plan_slug=%s by user_id=%s",
+        fid, sid, pid, plan.slug, current_user.id,
+    )
+
+    return {
+        "message": (
+            f"Subscription activated for '{service.name}' until "
+            f"{ends_at.strftime('%Y-%m-%d')}."
+        ),
+        "subscription": to_subscription_read(sub, now=now),
+    }
+
+
+
+
+
+
+
 # is this not the same with read_plans_ffor_service
 async def read_service_with_plans(
     slug: str,
