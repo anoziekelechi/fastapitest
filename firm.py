@@ -1,3 +1,457 @@
+class Firm(SQLModel, table=True):
+    __tablename__ = "firms"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "country", "name",
+            name="uq_firms_country_name",
+        ),
+    )
+
+    # ... existing fields ...
+
+    name: str = Field(
+        sa_column=Column(String(200), nullable=False, index=True)
+        # no unique=True — the compound constraint handles it
+    )
+
+    country: Country = Field(
+        sa_column=Column(
+            SAEnum(Country, name="country_enum"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    base_currency: Currency = Field(
+        sa_column=Column(
+            SAEnum(Currency, name="currency_enum"),
+            nullable=False,
+            server_default=Currency.USD.value,
+        ),
+    )
+
+
+
+from api.core.country import Country, Currency
+
+
+class FirmCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=2, max_length=200)
+    registration_number: str | None = Field(
+        default=None, min_length=2, max_length=50,
+    )
+    country: Country                                       # <-- new, required
+    deals_on: str = Field(..., min_length=10, max_length=2000)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_firm_name(cls, v: str) -> str:
+        return normalize_firm_name(v)
+
+    @field_validator("deals_on", mode="before")
+    @classmethod
+    def validate_deal_on_fields(
+        cls, v: str, info: FieldValidationInfo,
+    ) -> str:
+        raw_name = info.field_name or "field"
+        display_name = raw_name.replace("_", " ").capitalize()
+        return normalize_user_message(v, field_name=display_name)
+
+
+class FirmUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(None, min_length=2, max_length=200)
+    registration_number: str | None = Field(
+        default=None, min_length=2, max_length=50,
+    )
+    deals_on: str | None = Field(None, min_length=10, max_length=2000)
+
+    # Country is intentionally NOT mutable. Moving a firm between
+    # countries would:
+    #   - break the base_currency (firm would owe taxes in a
+    #     currency it was never registered under)
+    #   - break receipts (issued under the old country's tax rules)
+    #   - create audit ambiguity
+    # If the business needs country migration, that's a support
+    # action with its own audit trail — not a PATCH field.
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def validate_firmname(cls, v: str | None) -> str | None:
+        return normalize_firm_name(v) if v else None
+
+    @field_validator("deals_on", mode="before")
+    @classmethod
+    def validate_deal_on_fields(
+        cls, v: str | None, info: FieldValidationInfo,
+    ) -> str | None:
+        if v is None:
+            return None
+        raw_name = info.field_name or "field"
+        display_name = raw_name.replace("_", " ").capitalize()
+        return normalize_user_message(v, field_name=display_name)
+
+
+class FirmRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    name: str
+    registration_number: str | None = None
+    slug: str | None = None
+    deals_on: str
+    country: Country                 # <-- new
+    base_currency: Currency          # <-- new
+    disabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+    branch_count: int = 0
+    receipt_count: int = 0
+    branches: list[BranchRead] = []
+    firm_logo_url: str | None = None
+
+
+class FirmListItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    name: str
+    registration_number: str | None = None
+    slug: str | None = None
+    deals_on: str
+    country: Country                 # <-- new
+    base_currency: Currency          # <-- new
+    disabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+    branch_count: int = 0
+    firm_logo_url: str | None = None
+
+
+
+#new helper
+async def get_firm_by_name_and_country(
+    db: AsyncSession,
+    name: str,
+    country: Country,
+    *,
+    exclude_firm_id: int | None = None,
+) -> Firm | None:
+    """
+    Fetch a firm by (country, name).
+
+    This is the canonical uniqueness check now — firm names are
+    unique per country, not globally. Two firms can share a name
+    as long as they're in different countries.
+    """
+    normalized = normalize_firm_name(name)
+    try:
+        stmt = select(Firm).where(
+            col(Firm.name) == normalized,
+            col(Firm.country) == country,
+        )
+        if exclude_firm_id is not None:
+            stmt = stmt.where(col(Firm.id) != exclude_firm_id)
+        result = await db.execute(stmt)
+        return result.scalars().first()
+    except SQLAlchemyError as exc:
+        logger.exception(
+            "Failed to fetch firm name=%s country=%s",
+            normalized, country.value,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load firm. Please try again.",
+        ) from exc
+
+
+async def create_firm(
+    data: FirmCreate,
+    db: AsyncSession,
+    firm_logo_key: UploadFile | None,
+    current_user: ReadUser,
+) -> dict:
+    guard_user_state(current_user)
+
+    if current_user.id is None:
+        logger.error("Current user has no id — data integrity issue")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create firm. Please try again.",
+        )
+    owner_id = current_user.id
+
+    # ------------------------------------------------------------------
+    # 1. Pre-check: (country, name) uniqueness
+    # ------------------------------------------------------------------
+    existing = await get_firm_by_name_and_country(
+        db, name=data.name, country=data.country,
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A firm named '{data.name}' is already registered "
+                f"in {data.country.value}."
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Pre-check: registration_number uniqueness (unchanged)
+    # ------------------------------------------------------------------
+    if data.registration_number is not None:
+        existing_reg = await get_firm_by_registration_number(
+            db, data.registration_number,
+        )
+        if existing_reg is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Registration number "
+                    f"'{data.registration_number}' is already "
+                    f"registered."
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # 3. Upload the optional logo (unchanged)
+    # ------------------------------------------------------------------
+    new_logo_key: str | None = None
+    if firm_logo_key is not None:
+        try:
+            new_logo_key = await handle_file_update(
+                file=firm_logo_key,
+                current_key=None,
+                prefix=FIRM_LOGO,
+                max_size=FIRM_LOGO_MAX_SIZE,
+            )
+            if not new_logo_key:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Failed to upload the firm logo.",
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Firm logo upload failed for name=%s", data.name,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to upload firm logo.",
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # 4. Prepare the model — derive base_currency from country
+    # ------------------------------------------------------------------
+    firm = Firm(
+        user_id=owner_id,
+        name=data.name,
+        registration_number=data.registration_number,
+        country=data.country,
+        base_currency=COUNTRY_BASE_CURRENCY[data.country],
+        slug=generate_slug(data.name),
+        deals_on=data.deals_on,
+        firm_logo_key=new_logo_key,
+        disabled=False,
+    )
+
+    db.add(firm)
+
+    # ------------------------------------------------------------------
+    # 5. Flush
+    # ------------------------------------------------------------------
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after firm IntegrityError: name=%s",
+                data.name,
+            )
+
+        if rollback_succeeded and new_logo_key is not None:
+            try:
+                delete_from_r2(new_logo_key)
+            except Exception:
+                logger.exception(
+                    "Failed to clean up logo after IntegrityError: "
+                    "name=%s, logo_key=%s", data.name, new_logo_key,
+                )
+
+        logger.warning(
+            "Firm creation violated a database integrity constraint: "
+            "name=%s, country=%s, rollback_succeeded=%s",
+            data.name, data.country.value, rollback_succeeded,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A firm named '{data.name}' is already registered "
+                f"in {data.country.value}, or the registration "
+                f"number conflicts."
+            ),
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after firm flush error: name=%s",
+                data.name,
+            )
+        if rollback_succeeded and new_logo_key is not None:
+            try:
+                delete_from_r2(new_logo_key)
+            except Exception:
+                logger.exception(
+                    "Failed to clean up logo after flush error: "
+                    "name=%s, logo_key=%s", data.name, new_logo_key,
+                )
+        logger.exception(
+            "Database error while flushing new firm: "
+            "name=%s, rollback_succeeded=%s",
+            data.name, rollback_succeeded,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Failed to create firm. "
+                "Check its state if the database could not be recovered."
+            ),
+        ) from exc
+
+    except Exception as exc:
+        rollback_succeeded = False
+        try:
+            await db.rollback()
+            rollback_succeeded = True
+        except Exception:
+            logger.exception(
+                "Rollback failed after unexpected flush error: name=%s",
+                data.name,
+            )
+        if rollback_succeeded and new_logo_key is not None:
+            try:
+                delete_from_r2(new_logo_key)
+            except Exception:
+                logger.exception(
+                    "Failed to clean up logo after unexpected error: "
+                    "name=%s, logo_key=%s", data.name, new_logo_key,
+                )
+        logger.exception(
+            "Unexpected error while flushing new firm: "
+            "name=%s, rollback_succeeded=%s",
+            data.name, rollback_succeeded,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while creating firm.",
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 6. Commit (unchanged)
+    # ------------------------------------------------------------------
+    try:
+        await db.commit()
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                "Rollback attempt failed after commit error: name=%s",
+                data.name,
+            )
+        logger.exception(
+            "Firm commit failed or has an uncertain outcome. "
+            "Preserving logo for reconciliation: "
+            "name=%s, new_logo_key=%s", data.name, new_logo_key,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The firm creation could not be confirmed. "
+                "Check its current state before retrying."
+            ),
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # 7. Refresh (best-effort) + return (unchanged)
+    # ------------------------------------------------------------------
+    try:
+        await db.refresh(firm)
+    except Exception:
+        logger.exception(
+            "Failed to refresh firm after create: name=%s", data.name,
+        )
+
+    fid = firm_id_of(firm)
+
+    logger.info(
+        "Firm created: firm_id=%s, name=%s, country=%s, "
+        "base_currency=%s, owner_id=%s",
+        fid, firm.name, firm.country.value,
+        firm.base_currency.value, owner_id,
+    )
+
+    read = to_firm_detail(firm, branches=[], receipt_counts={})
+    read.branch_count = 0
+    read.receipt_count = 0
+
+    return {
+        "message": f"Firm '{firm.name}' created successfully",
+        "firm": read,
+                    }
+
+
+
+
+
+#update
+# --- name ---
+if data.name is not None and data.name != firm.name:
+    existing = await get_firm_by_name_and_country(
+        db,
+        name=data.name,
+        country=firm.country,       # <-- the firm's existing country
+        exclude_firm_id=fid,
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A firm named '{data.name}' is already registered "
+                f"in {firm.country.value}."
+            ),
+        )
+
+    old_slug = firm.slug
+    firm.name = data.name
+    firm.slug = generate_slug(data.name)
+    updated_fields.append("name")
+    logger.info(
+        "Firm slug updated: '%s' -> '%s'", old_slug, firm.slug,
+    )
+
+
+
+
 
 #api/core/country
 
