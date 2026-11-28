@@ -1,481 +1,19 @@
-@router.post(
-    "/services",
-    response_model=CreateServiceResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a subscription service (admin only)",
-)
-async def create_service_route(
-    db: DBDep,
-    admin: AdminUser,
-    data: Annotated[ServiceCreate, Form()],
-    service_image: Annotated[UploadFile | None, File()] = None,
-):
-    return await create_service(
-        data=data,
-        service_image=service_image,
-        db=db,
-        current_user=admin,
-    )
-
-vs
-
-@router.post(
-    "/services",
-    response_model=CreateServiceResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a subscription service (admin only)",
-)
-# async def create_service_route(
-#     db: DBDep,
-#     admin: AdminUser,
-#     name: str = Form(...),
-#     description: str = Form(...),
-#     trial_days: int = Form(30),
-#     service_image: UploadFile | None = File(None),
-# ):
-#     """
-#     Multipart endpoint.
-
-#     FastAPI cannot read a Pydantic body and a file from the same
-#     request. So each field is declared individually and re-assembled
-#     into `ServiceCreate` before hitting the logic — that way the
-#     schema validators still run.
-#     """
-#     data = ServiceCreate(
-#         name=name,
-#         description=description,
-#         trial_days=trial_days,
-#     )
-
-#     return await create_service(
-#         data=data,
-#         service_image=service_image,
-#         db=db,
-#         current_user=admin,
-#     )
-
-
-from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session, select
-
-router = APIRouter()
-
-
-@router.get("/organizations/{org_id}/payment-methods", response_model=list[PaymentMethod])
-def get_org_payment_methods(org_id: uuid.UUID, session: Session = Depends(get_session)):
-    org = session.get(Organization, org_id)
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found")
-
-    statement = select(PaymentMethod).where(
-        PaymentMethod.country == org.country,
-        PaymentMethod.active == True,
-    )
-    return session.exec(statement).all()
-
-
-
-
-"""Subscription service & plan schemas."""
-
-from datetime import datetime
-from decimal import Decimal
-from typing import Literal
-
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    field_serializer,
-    field_validator,
-    model_validator,
-)
-
-from api.core.currency import Currency
-from api.core.validators import normalize_field
-
-
-
-
-
-# =============================================================================
-# PLAN — REQUEST
-# =============================================================================
-
-
-
-
-# =============================================================================
-# PLAN — READ
-# =============================================================================
-
-
-
-
-
-
-
-
-
-# =============================================================================
-# RESPONSE ENVELOPES
-# =============================================================================
-
-
-
-
-# =============================================================================
-# TRIAL — SELECTION FLOW (unchanged from before, but no tier)
-# =============================================================================
-
-
-
-
-
-
-
-
-"""Service business logic — no tiers, plans hang directly off services."""
-
-import logging
-
-from fastapi import HTTPException, UploadFile, status
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import col, select
-
-from api.core.media import resolve_logo_url
-from api.core.file_storage import (
-    SERVICE_IMAGE,
-    SERVICE_IMAGE_MAX_SIZE,
-    delete_from_r2,
-    handle_file_update,
-)
-from api.core.slug import generate_slug
-from api.models.subscription import (
-    Subscription,
-    SubscriptionPlan,
-    SubscriptionService,
-)
-from api.subscriptions.schemas import (
-    PlanSummaryRead,
-    ServiceCreate,
-    ServiceRead,
-    ServiceUpdate,
-    ServiceWithPlansRead,
-)
-from api.users.schemas import ReadUser
-
-
-logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# ID NARROWING
-# =============================================================================
-
-def service_id_of(service: SubscriptionService) -> int:
-    if service.id is None:
-        logger.error(
-            "SubscriptionService row has no id — data integrity issue",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load service. Please try again.",
-        )
-    return service.id
-
-
-# =============================================================================
-# LOADERS
-# =============================================================================
-
-
-
-
-
-
-
-# =============================================================================
-# SERVICE — CREATE
-# =============================================================================
-
-
-
-
-
-
-
-"""Plan business logic — plans live directly under services."""
-
-import logging
-
-from fastapi import HTTPException, status
-from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import col, select
-
-from api.core.slug import generate_slug
-from api.models.subscription import (
-    Subscription,
-    SubscriptionPlan,
-    SubscriptionService,
-)
-from api.subscriptions.logics.service import (
-    get_service_by_slug,
-    service_id_of,
-)
-from api.subscriptions.schemas import PlanCreate, PlanRead, PlanUpdate
-from api.users.schemas import ReadUser
-
-
-logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# ID NARROWING
-# =============================================================================
-
-def plan_id_of(plan: SubscriptionPlan) -> int:
-    if plan.id is None:
-        logger.error(
-            "SubscriptionPlan row has no id — data integrity issue",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load plan. Please try again.",
-        )
-    return plan.id
-
-
-# =============================================================================
-# LOADERS
-# =============================================================================
-
-async def get_plan_by_service_and_slug(
+# is this not the same with read_plans_ffor_service
+async def read_service_with_plans(
+    slug: str,
     db: AsyncSession,
-    service_id: int,
-    plan_slug: str,
-) -> SubscriptionPlan:
-    """Fetch a plan by (service_id, slug) or raise 404."""
-    normalized_slug = plan_slug.strip().lower()
-    try:
-        result = await db.execute(
-            select(SubscriptionPlan).where(
-                col(SubscriptionPlan.service_id) == service_id,
-                col(SubscriptionPlan.slug) == normalized_slug,
-            )
-        )
-        plan = result.scalars().first()
-    except SQLAlchemyError as exc:
-        logger.exception(
-            "Failed to fetch plan service_id=%s slug=%s",
-            service_id, normalized_slug,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load plan. Please try again.",
-        ) from exc
-
-    if plan is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Plan '{plan_slug}' not found for this service.",
-        )
-    return plan
-
-
-async def get_plan_by_service_and_name(
-    db: AsyncSession,
-    service_id: int,
-    name: str,
-) -> SubscriptionPlan | None:
-    """Fetch a plan by (service_id, name) — for uniqueness checks."""
-    try:
-        result = await db.execute(
-            select(SubscriptionPlan).where(
-                col(SubscriptionPlan.service_id) == service_id,
-                col(SubscriptionPlan.name) == name,
-            )
-        )
-        return result.scalars().first()
-    except SQLAlchemyError as exc:
-        logger.exception(
-            "Failed to fetch plan service_id=%s name=%s",
-            service_id, name,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load plan. Please try again.",
-        ) from exc
-
-
-async def count_subscriptions_for_plan(
-    db: AsyncSession,
-    plan_id: int,
-) -> int:
-    try:
-        result = await db.execute(
-            select(func.count())
-            .select_from(Subscription)
-            .where(col(Subscription.plan_id) == plan_id)
-        )
-        return result.scalar() or 0
-    except SQLAlchemyError as exc:
-        logger.exception(
-            "Failed to count subscriptions for plan_id=%s", plan_id,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load plan. Please try again.",
-        ) from exc
-
-
-# =============================================================================
-# BUILDERS
-# =============================================================================
-
-def to_plan_read(plan: SubscriptionPlan) -> PlanRead:
-    return PlanRead.model_validate(plan)
-
-
-def to_plan_list(
-    plans: list[SubscriptionPlan] | tuple[SubscriptionPlan, ...],
-) -> list[PlanRead]:
-    return [to_plan_read(p) for p in plans]
-
-
-# =============================================================================
-# CREATE
-# =============================================================================
-
-async def create_plan(
-    service_slug: str,
-    data: PlanCreate,
-    db: AsyncSession,
-    current_user: ReadUser,
-) -> dict:
+    current_user: ReadUser | None = None,
+) -> ServiceWithPlansRead:
     """
-    Create a plan under a service.
+    Read a service with plans.
 
-    URL: POST /services/{service_slug}/plans
-
-    - Service must exist.
-    - (service_id, name) is unique per service.
-    - Slug is {service.slug}-{plan.name} — globally unique by
-      construction.
+    Admin: all plans. Public: active plans only, service must be
+    active and buyable.
     """
-    service = await get_service_by_slug(db, service_slug)
-    sid = service_id_of(service)
+    admin = bool(current_user and getattr(current_user, "is_admin", False))
+    service = await get_service_by_slug(db, slug)
+    return await load_service_detail(db, service, admin=admin)
 
-    existing = await get_plan_by_service_and_name(
-        db, service_id=sid, name=data.name,
-    )
-    if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"A plan named '{data.name}' already exists "
-                f"for this service."
-            ),
-        )
-
-    plan = SubscriptionPlan(
-        service_id=sid,
-        name=data.name,
-        description=data.description,
-        duration_months=data.duration_months,
-        price=data.price,
-        slug=generate_slug(f"{service.slug or service.name}-{data.name}"),
-        is_active=True,
-    )
-    db.add(plan)
-
-    try:
-        await db.flush()
-    except IntegrityError as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback failed after plan IntegrityError: "
-                "service_id=%s, name=%s", sid, data.name,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"A plan named '{data.name}' (or its slug) "
-                f"already exists."
-            ),
-        ) from exc
-    except SQLAlchemyError as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback failed after plan flush error: service_id=%s",
-                sid,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Failed to create plan. "
-                "Check its state if the database could not be recovered."
-            ),
-        ) from exc
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback failed after unexpected plan flush error: "
-                "service_id=%s", sid,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while creating plan.",
-        ) from exc
-
-    try:
-        await db.commit()
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback attempt failed after commit error: "
-                "service_id=%s, name=%s", sid, data.name,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "The plan creation could not be confirmed. "
-                "Check its current state before retrying."
-            ),
-        ) from exc
-
-    try:
-        await db.refresh(plan)
-    except Exception:
-        logger.exception(
-            "Failed to refresh plan after create: service_id=%s", sid,
-        )
-
-    logger.info(
-        "Plan '%s' (slug=%s) created for service_id=%s by user_id=%s",
-        plan.name, plan.slug, sid, current_user.id,
-    )
-
-    return {
-        "message": "Subscription plan created successfully.",
-        "plan": to_plan_read(plan),
-    }
-
-
-# =============================================================================
-# READ
-# =============================================================================
 
 async def read_plans_for_service(
     service_slug: str,
@@ -514,236 +52,66 @@ async def read_plans_for_service(
     return to_plan_list(plans)
 
 
-# =============================================================================
-# UPDATE
-# =============================================================================
 
-async def update_plan(
-    service_slug: str,
-    plan_slug: str,
-    data: PlanUpdate,
-    db: AsyncSession,
-) -> dict:
-    """
-    Update a plan under a service.
 
-    URL: PATCH /services/{service_slug}/plans/{plan_slug}
-    """
-    service = await get_service_by_slug(db, service_slug)
-    sid = service_id_of(service)
-
-    plan = await get_plan_by_service_and_slug(
-        db, service_id=sid, plan_slug=plan_slug,
-    )
-    pid = plan_id_of(plan)
-
-    if all(
-        v is None
-        for v in (
-            data.description, data.duration_months,
-            data.price, data.is_active,
-        )
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one field must be provided for update",
-        )
-
-    updated_fields: list[str] = []
-
-    if data.description is not None and data.description != plan.description:
-        plan.description = data.description
-        updated_fields.append("description")
-
-    if (
-        data.duration_months is not None
-        and data.duration_months != plan.duration_months
-    ):
-        plan.duration_months = data.duration_months
-        updated_fields.append("duration_months")
-
-    if data.price is not None and data.price != plan.price:
-        plan.price = data.price
-        updated_fields.append("price")
-
-    if data.is_active is not None and data.is_active != plan.is_active:
-        plan.is_active = data.is_active
-        updated_fields.append("is_active")
-
-    if not updated_fields:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No changes were made",
-        )
-
-    try:
-        await db.flush()
-    except SQLAlchemyError as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback failed after plan flush error: plan_id=%s", pid,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Failed to update plan. "
-                "Check its state if the database could not be recovered."
-            ),
-        ) from exc
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback failed after unexpected flush error: plan_id=%s",
-                pid,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while updating plan.",
-        ) from exc
-
-    try:
-        await db.commit()
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback attempt failed after commit error: plan_id=%s",
-                pid,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "The plan update could not be confirmed. "
-                "Check its current state before retrying."
-            ),
-        ) from exc
-
-    try:
-        await db.refresh(plan)
-    except Exception:
-        logger.exception(
-            "Failed to refresh plan after update: plan_id=%s", pid,
-        )
-
-    logger.info(
-        "Plan updated: plan_id=%s, fields=%s",
-        pid, ",".join(updated_fields),
+@router.post(
+    "/services",
+    response_model=CreateServiceResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a subscription service (admin only)",
+)
+async def create_service_route(
+    db: DBDep,
+    admin: AdminUser,
+    data: Annotated[ServiceCreate, Form()],
+    service_image: Annotated[UploadFile | None, File()] = None,
+):
+    return await create_service(
+        data=data,
+        service_image=service_image,
+        db=db,
+        current_user=admin,
     )
 
-    return {
-        "message": "Subscription plan updated successfully.",
-        "plan": to_plan_read(plan),
-    }
+vs
 
-
-# =============================================================================
-# DELETE
-# =============================================================================
-
-async def delete_plan(
-    service_slug: str,
-    plan_slug: str,
-    db: AsyncSession,
-) -> dict[str, str]:
+@router.post(
+    "/services",
+    response_model=CreateServiceResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a subscription service (admin only)",
+)
+async def create_service_route(
+    db: DBDep,
+    admin: AdminUser,
+    name: str = Form(...),
+    description: str = Form(...),
+    trial_days: int = Form(30),
+    service_image: UploadFile | None = File(None),
+):
     """
-    Delete a plan under a service.
+    Multipart endpoint.
 
-    URL: DELETE /services/{service_slug}/plans/{plan_slug}
+    FastAPI cannot read a Pydantic body and a file from the same
+    request. So each field is declared individually and re-assembled
+    into `ServiceCreate` before hitting the logic — that way the
+    schema validators still run.
     """
-    service = await get_service_by_slug(db, service_slug)
-    sid = service_id_of(service)
-
-    plan = await get_plan_by_service_and_slug(
-        db, service_id=sid, plan_slug=plan_slug,
+    data = ServiceCreate(
+        name=name,
+        description=description,
+        trial_days=trial_days,
     )
-    pid = plan_id_of(plan)
-    plan_name = plan.name
 
-    count = await count_subscriptions_for_plan(db, pid)
-    if count:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Plan '{plan_name}' cannot be deleted because "
-                f"{count} "
-                f"{'subscription references' if count == 1 else 'subscriptions reference'} "
-                f"it."
-            ),
-        )
+    return await create_service(
+        data=data,
+        service_image=service_image,
+        db=db,
+        current_user=admin,
+    )
 
-    try:
-        await db.delete(plan)
-        await db.flush()
-    except IntegrityError as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback failed after plan IntegrityError: plan_id=%s", pid,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Plan '{plan_name}' now has subscriptions and "
-                f"cannot be deleted. Refresh and try again."
-            ),
-        ) from exc
-    except SQLAlchemyError as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback failed after plan delete flush error: plan_id=%s",
-                pid,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Failed to delete plan. "
-                "Check its state if the database could not be recovered."
-            ),
-        ) from exc
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback failed after unexpected delete flush error: "
-                "plan_id=%s", pid,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while deleting plan.",
-        ) from exc
 
-    try:
-        await db.commit()
-    except Exception as exc:
-        try:
-            await db.rollback()
-        except Exception:
-            logger.exception(
-                "Rollback attempt failed after commit error: plan_id=%s", pid,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "The plan deletion could not be confirmed. "
-                "Check its current state before retrying."
-            ),
-        ) from exc
 
-    logger.info("Plan '%s' (id=%s) deleted", plan_name, pid)
-
-    return {
-        "message": "Subscription plan deleted successfully.",
-        "plan_name": plan_name,
-     }
 
 
 
@@ -958,306 +326,107 @@ from api.subscriptions.schemas import (
 router = APIRouter(tags=["Subscription Plans"])
 
 
-@router.post(
-    "/services/{service_slug}/plans",
-    response_model=CreatePlanResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a plan under a service (admin)",
-)
-async def create(
-    service_slug: str,
-    data: PlanCreate,
-    db: DBDep,
-    current_user: AdminUser,
-):
-    return await create_plan(
-        service_slug=service_slug,
-        data=data, db=db, current_user=current_user,
-    )
 
 
-@router.get(
-    "/services/{service_slug}/plans",
-    response_model=list[PlanRead],
-    summary="List plans for a service (admin)",
-)
-async def list_for_service(
-    service_slug: str,
-    db: DBDep,
-    current_user: AdminUser,
-):
-    return await read_plans_for_service(
-        service_slug=service_slug, db=db, current_user=current_user,
-    )
+# subscription
+
+SubscriptionStatusLabel = Literal[
+    "active",
+    "trial",
+    "trial_expired",
+    "expired",
+    "inactive",
+    "unknown",
+]
 
 
-@router.patch(
-    "/services/{service_slug}/plans/{plan_slug}",
-    response_model=UpdatePlanResponse,
-    summary="Update a plan (admin)",
-)
-async def update(
-    service_slug: str,
-    plan_slug: str,
-    data: PlanUpdate,
-    db: DBDep,
-    current_user: AdminUser,
-):
-    return await update_plan(
-        service_slug=service_slug,
-        plan_slug=plan_slug,
-        data=data, db=db,
-    )
-
-
-@router.delete(
-    "/services/{service_slug}/plans/{plan_slug}",
-    response_model=DeletePlanResponse,
-    summary="Delete a plan (admin)",
-)
-async def delete(
-    service_slug: str,
-    plan_slug: str,
-    db: DBDep,
-    current_user: AdminUser,
-):
-    return await delete_plan(
-        service_slug=service_slug,
-        plan_slug=plan_slug,
-        db=db,
-    )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- 
-
-
-
-
-
-
-    
-
-       
-  
-
-
-
-
-# 5. Endpoint: Automatically fills base_currency from org.country
-@router.post("/organizations", response_model=Organization)
-def create_organization(payload: OrganizationCreate, session: Session = Depends(get_session)):
-    org = Organization(
-        name=payload.name,
-        country=payload.country,
-        base_currency=COUNTRY_BASE_CURRENCY[payload.country],  # Auto-filled!
-    )
-    session.add(org)
-    session.commit()
-    session.refresh(org)
-    return org
-
-
-
-
-
-
-
-
-class SubscriptionPayment(BaseModel, table=True):
+class SubscriptionRead(BaseModel):
     """
-    One payment attempt for an entire subscription order.
+    A single subscription as returned to the frontend.
 
-    An order may contain multiple firms and multiple subscription plans.
+    Derived fields (`is_active`, `is_on_trial`, `days_remaining`,
+    `status_label`, `can_access`) are computed by the builder from
+    the raw row and the current time — the caller never assembles
+    them inline.
     """
+    model_config = ConfigDict(from_attributes=True)
 
-    __tablename__ = "subscription_payments"  # type: ignore
+    id: int
+    firm_id: int
+    service_id: int
+    tier_id: int | None = None
+    plan_id: int | None = None
+    last_payment_id: int | None = None
 
-    __table_args__ = (
-        UniqueConstraint(
-            "order_id",
-            "idempotency_key",
-            name="uq_subscription_payment_order_idempotency",
-        ),
-        CheckConstraint(
-            "amount > 0",
-            name="ck_subscription_payment_amount_positive",
-        ),
-        CheckConstraint(
-            "status IN ('pending', 'paid', 'failed', 'cancelled')",
-            name="ck_subscription_payment_status",
-        ),
-    )
+    is_on_trial: bool
+    trial_started_at: datetime | None = None
+    trial_ends_at: datetime | None = None
 
-    order_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("orders.id", ondelete="RESTRICT"),
-            nullable=False,
-            index=True,
-        )
-    )
+    subscription_started_at: datetime | None = None
+    subscription_ends_at: datetime | None = None
 
-    payment_method_id: int = Field(
-        sa_column=Column(
-            Integer,
-            ForeignKey("paymentmethods.id", ondelete="RESTRICT"),
-            nullable=False,
-            index=True,
-        )
-    )
+    auto_renew: bool
 
-    idempotency_key: str = Field(
-        sa_column=Column(
-            String(100),
-            nullable=False,
-        )
-    )
+    # Derived
+    is_active: bool
+    days_remaining: int | None = None
+    status_label: SubscriptionStatusLabel = "unknown"
+    can_access: bool
 
-    amount: Decimal = Field(
-        sa_column=Column(
-            Numeric(precision=10, scale=2),
-            nullable=False,
-        )
-    )
-
-    currency: str = Field(
-        default="LRD",
-        sa_column=Column(
-            String(3),
-            nullable=False,
-            server_default="LRD",
-        ),
-    )
-
-    payment_reference: str = Field(
-        sa_column=Column(
-            String(100),
-            nullable=False,
-            unique=True,
-            index=True,
-        )
-    )
-
-    provider_reference: str | None = Field(
-        default=None,
-        sa_column=Column(
-            String(150),
-            nullable=True,
-            index=True,
-        ),
-    )
-
-    provider_code: str = Field(
-        sa_column=Column(
-            String(30),
-            nullable=False,
-        )
-    )
-
-    status: str = Field(
-        default="pending",
-        sa_column=Column(
-            String(20),
-            nullable=False,
-            server_default="pending",
-            index=True,
-        ),
-    )
-
-    paid_at: datetime | None = Field(
-        default=None,
-        sa_type=DateTime(timezone=True),
-        sa_column_kwargs={"nullable": True},
-    )
-
-    order: Optional["Order"] = Relationship(
-        back_populates="payments",
-    )
-
-    payment_method: Optional["PaymentMethods"] = Relationship(
-        back_populates="subscription_payments",
-    )
+    created_at: datetime
+    updated_at: datetime
 
 
-
-
-
-
-
-async def require_firm_access(
-    db: AsyncSession,
-    *,
-    firm_id: int,
-    current_user: ReadUser,
-    require_active: bool = True,
-    for_update: bool = False,
-) -> Firm:
+class SubscriptionStatusRead(BaseModel):
     """
-    Load a firm and verify the caller can access it.
-
-    Steps:
-        1. Load the firm.
-        2. Return 404 if it does not exist.
-        3. Verify ownership or admin permission.
-        4. Optionally reject disabled firms.
-        5. Optionally acquire a row-level lock.
-
-    Does not check user state.
+    Compact status payload for the "is my firm subscribed?" widget.
     """
-    from api.core.logging import logger
+    firm_id: int
+    service_id: int
+    service_name: str
+    tier_name: str | None = None
+    plan_name: str | None = None
+    is_active: bool
+    is_on_trial: bool
+    days_remaining: int
+    status_label: SubscriptionStatusLabel = "unknown"
+    can_access: bool
 
-    try:
-        if for_update:
-            result = await db.execute(
-                select(Firm)
-                .where(Firm.id == firm_id)
-                .with_for_update()
-            )
-            firm = result.scalar_one_or_none()
-        else:
-            firm = await db.get(Firm, firm_id)
 
-    except SQLAlchemyError as exc:
-        logger.exception("Failed to load firm id=%s", firm_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load firm. Please try again.",
-        ) from exc
 
-    if firm is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Firm not found.",
-        )
+class SubscriptionActivate(BaseModel):
+    """
+    Admin override: activate/extend a subscription without payment.
+    """
+    model_config = ConfigDict(extra="forbid")
 
-    if not is_admin(current_user) and firm.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not have access to this firm.",
-            headers={"X-Error-Code": "wrong_permission"},
-        )
+    firm_id: int
+    service_id: int
+    tier_id: int
+    plan_id: int
 
-    if require_active:
-        guard_firm_state(firm)
 
-    return firm
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
