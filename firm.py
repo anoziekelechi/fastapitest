@@ -1,3 +1,60 @@
+@router.post(
+    "/services",
+    response_model=CreateServiceResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a subscription service (admin only)",
+)
+async def create_service_route(
+    db: DBDep,
+    admin: AdminUser,
+    data: Annotated[ServiceCreate, Form()],
+    service_image: Annotated[UploadFile | None, File()] = None,
+):
+    return await create_service(
+        data=data,
+        service_image=service_image,
+        db=db,
+        current_user=admin,
+    )
+
+vs
+
+@router.post(
+    "/services",
+    response_model=CreateServiceResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a subscription service (admin only)",
+)
+# async def create_service_route(
+#     db: DBDep,
+#     admin: AdminUser,
+#     name: str = Form(...),
+#     description: str = Form(...),
+#     trial_days: int = Form(30),
+#     service_image: UploadFile | None = File(None),
+# ):
+#     """
+#     Multipart endpoint.
+
+#     FastAPI cannot read a Pydantic body and a file from the same
+#     request. So each field is declared individually and re-assembled
+#     into `ServiceCreate` before hitting the logic — that way the
+#     schema validators still run.
+#     """
+#     data = ServiceCreate(
+#         name=name,
+#         description=description,
+#         trial_days=trial_days,
+#     )
+
+#     return await create_service(
+#         data=data,
+#         service_image=service_image,
+#         db=db,
+#         current_user=admin,
+#     )
+
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
